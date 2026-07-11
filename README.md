@@ -16,7 +16,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - Admins create either `/create-free` or `/create-paid` servers with custom time, nest, egg, node, RAM, disk, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`.
 - `/purge` deletes tracked free servers only; paid and whitelisted servers are skipped.
-- Created users receive a styled ZeroX Host DM embed with specs, panel URL, node, extras, and expiration.
+- Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
 - Expired tracked servers are automatically suspended by the background task.
 
 ## Files
@@ -40,7 +40,7 @@ python bot.py
 
 - `/create-free` - admin-only free server creation with linked Discord user, name, specs, nest, egg, node, days, and optional feature limits.
 - `/create-paid` - admin-only paid server creation with duration, nest/egg/spec customization, automatic whitelist, and paid logging.
-- `/admin list` - admin-only list fetched live from the Pterodactyl panel, showing linked Discord user/email when available.
+- `/admin list` - admin-only organized embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
 - `/list` - users list their own servers; admins see all tracked servers.
 - `/power` - users or admins start, stop, or restart an owned/tracked server.
 - `/reinstall` - users or admins reinstall an owned/tracked server.

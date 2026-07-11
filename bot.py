@@ -393,6 +393,25 @@ def specs_embed(plan: str, name: str, ram: int, disk: int, cpu: int, node_name: 
     return embed
 
 
+def trustpilot_embed() -> discord.Embed:
+    embed = branded_embed(
+        "Thanks For Using Our Service",
+        "Make sure to drop a positive review on our [Trustpilot](https://www.trustpilot.com/review/status.zeroxhost.space).\n\nYour review means a lot to our service — it helps us improve and keeps the team motivated.",
+        0x00c781,
+    )
+    embed.add_field(name="⭐ Review Link", value="https://www.trustpilot.com/review/status.zeroxhost.space", inline=False)
+    return embed
+
+
+def panel_server_embed(server: dict[str, Any], email: str, discord_label: str) -> discord.Embed:
+    embed = branded_embed("Panel Server", f"**{server['name']}**", 0x5865f2)
+    embed.add_field(name="Server ID", value=f"`{server['id']}`", inline=True)
+    embed.add_field(name="UUID", value=f"`{server.get('uuid', 'no-uuid')}`", inline=False)
+    embed.add_field(name="Panel Email", value=f"`{email}`", inline=True)
+    embed.add_field(name="Discord User", value=discord_label, inline=True)
+    return embed
+
+
 async def node_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     nodes = ptero.node_cache or await ptero.list_nodes()
     matches = [node for node in nodes if current.lower() in f"{node['id']} {node['name']}".lower()]
@@ -556,7 +575,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     dm_embed = specs_embed(plan, name, ram, disk, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
     try:
         await user.send(embed=dm_embed)
-        await user.send("**Thanks For Using Our Service   .\nMake Sure To Drop Some Positive Review On Our [Trustpilot](https://www.trustpilot.com/review/status.zeroxhost.space)\nYour Review Means A Lot To Our Service It Help Us Improve And Cheer Us**")
+        await user.send(embed=trustpilot_embed())
     except discord.Forbidden:
         pass
 
@@ -601,15 +620,25 @@ async def admin_list(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     servers = await ptero.list_servers()
     links = fetch_links_by_panel_user()
-    lines = []
-    for server in servers[:25]:
+    if not servers:
+        await interaction.followup.send(embed=branded_embed("Panel Servers", "No panel servers found."), ephemeral=True)
+        return
+
+    embed = branded_embed("Panel Servers", "Live data from the Pterodactyl panel. Emails are shown even when a Discord user is not linked.")
+    for server in servers[:10]:
         panel_user_id = int(server.get("user") or 0)
         link = links.get(panel_user_id)
         panel_user = await ptero.get_user(panel_user_id) if panel_user_id else None
         email = link["email"] if link else panel_user.get("email") if panel_user else "unknown-email"
-        linked = f"<@{link['discord_user_id']}> • `{email}`" if link else f"`{email}` • unlinked"
-        lines.append(f"`{server['id']}` • **{server['name']}** • `{server.get('uuid', 'no-uuid')}` • {linked}")
-    await interaction.followup.send(embed=branded_embed("Panel Servers", "\n".join(lines) or "No panel servers found."), ephemeral=True)
+        discord_label = f"<@{link['discord_user_id']}>" if link else "Not linked"
+        embed.add_field(
+            name=f"#{server['id']} • {server['name']}",
+            value=f"**UUID:** `{server.get('uuid', 'no-uuid')}`\n**Email:** `{email}`\n**Discord:** {discord_label}",
+            inline=False,
+        )
+    if len(servers) > 10:
+        embed.set_footer(text=f"{BRAND} • Showing 10 of {len(servers)} panel servers • Developer: {DEVELOPER}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 tree.add_command(admin_group)
