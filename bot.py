@@ -125,6 +125,11 @@ def is_whitelisted(server_id: str) -> bool:
         return connection.execute("SELECT 1 FROM whitelist WHERE server_id = ?", (server_id,)).fetchone() is not None
 
 
+def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
+    with db() as connection:
+        return connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
+
+
 init_db()
 
 
@@ -211,6 +216,7 @@ class PterodactylClient:
         startup = egg.get("startup")
         if not docker_image or not startup:
             raise RuntimeError("Selected egg is missing a startup command or Docker image on the panel.")
+        allocation_id = await self.get_free_allocation(node_id)
         payload = {
             "name": name,
             "user": panel_user_id,
@@ -220,7 +226,7 @@ class PterodactylClient:
             "environment": await self.egg_environment(nest_id, egg_id),
             "limits": {"memory": ram, "swap": 0, "disk": disk, "io": 500, "cpu": cpu},
             "feature_limits": {"databases": databases, "allocations": allocations, "backups": backups},
-            "deploy": {"locations": [node_id], "dedicated_ip": False, "port_range": []},
+            "allocation": {"default": allocation_id},
             "start_on_completion": True,
         }
         data = await self.request("POST", "servers", payload)
@@ -246,6 +252,14 @@ class PterodactylClient:
         data = await self.request("GET", "servers?per_page=100")
         self.server_cache = [item["attributes"] for item in data.get("data", [])]
         return self.server_cache
+
+    async def get_free_allocation(self, node_id: int) -> int:
+        data = await self.request("GET", f"nodes/{node_id}/allocations?per_page=100")
+        for item in data.get("data", []):
+            attributes = item.get("attributes", {})
+            if not attributes.get("assigned"):
+                return int(attributes["id"])
+        raise RuntimeError(f"No free allocations were found on node {node_id}.")
 
     async def delete_server(self, server_id: str) -> None:
         await self.request("DELETE", f"servers/{server_id}")
@@ -434,7 +448,7 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
         await interaction.followup.send(embed=branded_embed("Server Resized", f"**{row['name']}** is now {ram}MB RAM / {disk}MB disk / {cpu}% CPU."), ephemeral=True)
 
 
-async def create_plan(interaction: discord.Interaction, plan: str, user: discord.Member, panel_email: str, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int, allocations: int, backups: int) -> None:
+async def create_plan(interaction: discord.Interaction, plan: str, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int, allocations: int, backups: int) -> None:
     await interaction.response.defer(ephemeral=True)
     node_id = parse_id(node)
     nest_id = parse_id(nest)
@@ -445,7 +459,11 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     if nest_id <= 0 or egg_id <= 0:
         await interaction.followup.send(embed=branded_embed("Nest And Egg Required", "Select a real nest first, then select an egg from that nest.", 0xff4d4d), ephemeral=True)
         return
-    panel_user = await ptero.get_required_panel_user(panel_email)
+    link = fetch_link(user.id)
+    if not link:
+        raise RuntimeError("Discord user is not linked. Use /link first.")
+    panel_email = link["email"]
+    panel_user = {"id": link["panel_user_id"]}
     expires_at = utc_now() + timedelta(days=days)
     server = await ptero.create_server(panel_user_id=panel_user["id"], name=name, ram=ram, disk=disk, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
     server_id = str(server["id"])
@@ -501,21 +519,21 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         await channel.send(embed=branded_embed("Paid Server Created", f"Discord User: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nServer: **{name}** (`{server_id}`)\nSpecs: {ram}MB RAM / {disk}MB Disk / {cpu}% CPU\nExtras: DB {databases} / Alloc {allocations} / Backups {backups}\nNode: {node_name}\nNext renewal: <t:{int(expires_at.timestamp())}:F>", 0xf1c40f))
 
 
-@tree.command(name="create-free", description="Admin: create a free ZeroX Host server")
+@tree.command(name="create-free", description="Create free server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-async def create_free(interaction: discord.Interaction, user: discord.Member, panel_email: str, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int = 30, databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
-    await create_plan(interaction, "free", user, panel_email, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
+async def create_free(interaction: discord.Interaction, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int = 30, databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
+    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
 
 
-@tree.command(name="create-paid", description="Admin: create a paid ZeroX Host server and send paid logs")
+@tree.command(name="create-paid", description="Create paid server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-async def create_paid(interaction: discord.Interaction, user: discord.Member, panel_email: str, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
-    await create_plan(interaction, "paid", user, panel_email, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
+async def create_paid(interaction: discord.Interaction, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
+    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
 
 
-@tree.command(name="link", description="Admin: link an existing panel email to a Discord user")
+@tree.command(name="link", description="Link panel email")
 @admin_only()
 async def link(interaction: discord.Interaction, user: discord.Member, panel_email: str) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -528,25 +546,26 @@ async def link(interaction: discord.Interaction, user: discord.Member, panel_ema
 admin_group = app_commands.Group(name="admin", description="ZeroX Host admin tools")
 
 
-@admin_group.command(name="list", description="List all tracked servers")
+@admin_group.command(name="list", description="List panel servers")
 @admin_only()
 async def admin_list(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    rows = fetch_all_servers()
-    await interaction.followup.send(embed=branded_embed("All Tracked Servers", "\n".join(server_row_to_line(row) for row in rows[:25]) or "No tracked servers."), ephemeral=True)
+    servers = await ptero.list_servers()
+    lines = [f"`{server['id']}` • **{server['name']}** • `{server.get('uuid', 'no-uuid')}`" for server in servers[:25]]
+    await interaction.followup.send(embed=branded_embed("Panel Servers", "\n".join(lines) or "No panel servers found."), ephemeral=True)
 
 
 tree.add_command(admin_group)
 
 
-@tree.command(name="list", description="List your ZeroX Host servers")
+@tree.command(name="list", description="List your servers")
 async def list_mine(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     rows = fetch_all_servers() if isinstance(interaction.user, discord.Member) and is_admin(interaction.user) else fetch_user_servers(interaction.user.id)
     await interaction.followup.send(embed=branded_embed("Your Servers", "\n".join(server_row_to_line(row) for row in rows[:25]) or "No servers found."), ephemeral=True)
 
 
-@tree.command(name="power", description="Start, stop, or restart one of your servers")
+@tree.command(name="power", description="Power server")
 @app_commands.autocomplete(server=server_autocomplete)
 @app_commands.choices(action=[app_commands.Choice(name="start", value="start"), app_commands.Choice(name="stop", value="stop"), app_commands.Choice(name="restart", value="restart")])
 async def power(interaction: discord.Interaction, server: str, action: app_commands.Choice[str]) -> None:
@@ -558,7 +577,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
     await interaction.followup.send(embed=branded_embed("Power Signal Sent", f"Sent **{action.value}** to **{row['name']}**."), ephemeral=True)
 
 
-@tree.command(name="reinstall", description="Reinstall one of your servers")
+@tree.command(name="reinstall", description="Reinstall server")
 @app_commands.autocomplete(server=server_autocomplete)
 async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -567,14 +586,14 @@ async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{row['name']}**."), ephemeral=True)
 
 
-@tree.command(name="resize", description="Open a resize GUI for a server")
+@tree.command(name="resize", description="Resize server")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
 async def resize(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.send_modal(ResizeModal(server))
 
 
-@tree.command(name="suspend", description="Admin: suspend a server")
+@tree.command(name="suspend", description="Suspend server")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
 async def suspend(interaction: discord.Interaction, server: str) -> None:
@@ -585,7 +604,7 @@ async def suspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended server `{server}`."), ephemeral=True)
 
 
-@tree.command(name="unsuspend", description="Admin: unsuspend a server")
+@tree.command(name="unsuspend", description="Unsuspend server")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
 async def unsuspend(interaction: discord.Interaction, server: str) -> None:
@@ -596,7 +615,7 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.followup.send(embed=branded_embed("Server Unsuspended", f"Unsuspended server `{server}`."), ephemeral=True)
 
 
-@tree.command(name="stopall", description="Admin: stop all tracked servers except whitelist")
+@tree.command(name="stopall", description="Stop all except whitelist")
 @admin_only()
 async def stopall(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -609,7 +628,7 @@ async def stopall(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=branded_embed("Stop All Complete", f"Stopped **{stopped}** server(s). Whitelisted servers were skipped."), ephemeral=True)
 
 
-@tree.command(name="autobackup-enable", description="Enable automatic backups for a server")
+@tree.command(name="autobackup-enable", description="Enable autobackups")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
 async def autobackup_enable(interaction: discord.Interaction, server: str, every: str) -> None:
@@ -621,7 +640,7 @@ async def autobackup_enable(interaction: discord.Interaction, server: str, every
     await interaction.followup.send(embed=branded_embed("Autobackup Enabled", f"Server `{server}` will back up every **{every}**."), ephemeral=True)
 
 
-@tree.command(name="nodes", description="Admin: show deployment node names")
+@tree.command(name="nodes", description="Show nodes")
 @admin_only()
 async def nodes(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -679,7 +698,7 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
     await interaction.followup.send(embed=branded_embed("Free Server Purge Complete", description, 0xe74c3c), ephemeral=True)
 
 
-@tree.command(name="autosuspend", description="Admin: turn automatic expiration suspension on or off for a server")
+@tree.command(name="autosuspend", description="Toggle autosuspend")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
 @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
@@ -694,7 +713,7 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
     await interaction.followup.send(embed=branded_embed("Autosuspend Updated", f"Automatic expiration suspension for **{row['name']}** is now **{state.value.upper()}**."), ephemeral=True)
 
 
-@tree.command(name="server-expirations", description="Admin: show tracked server expirations")
+@tree.command(name="server-expirations", description="Show expirations")
 @admin_only()
 async def server_expirations(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -759,9 +778,6 @@ async def on_ready() -> None:
         await ptero.start()
     if not client_api.session:
         await client_api.start()
-    await ptero.list_nodes()
-    await ptero.list_nests()
-    await ptero.list_servers()
     guild = discord.Object(id=int(config["guild_id"]))
     tree.copy_global_to(guild=guild)
     await tree.sync(guild=guild)

@@ -13,7 +13,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - No panel user creation: the Pterodactyl user must already exist, and admins provide the panel email during creation.
 - Only configured owners/admin roles can create, purge, whitelist, or view management data.
 - Admins select a deployment node by name/ID with slash-command autocomplete.
-- Admins create either `/create-free` or `/create-paid` servers with custom time, nest, egg, node, RAM, disk, CPU, databases, allocations, and backups.
+- Admins create either `/create-free` or `/create-paid` servers with custom time, nest, egg, node, RAM, disk, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`.
 - `/purge` deletes tracked free servers only; paid and whitelisted servers are skipped.
 - Created users receive a styled ZeroX Host DM embed with specs, panel URL, node, extras, and expiration.
@@ -38,9 +38,9 @@ python bot.py
 
 ## Slash commands
 
-- `/create-free` - admin-only free server creation with user, panel email, name, specs, nest, egg, node, days, and optional feature limits.
+- `/create-free` - admin-only free server creation with linked Discord user, name, specs, nest, egg, node, days, and optional feature limits.
 - `/create-paid` - admin-only paid server creation with duration, nest/egg/spec customization, automatic whitelist, and paid logging.
-- `/admin list` - admin-only list of all tracked servers.
+- `/admin list` - admin-only list fetched live from the Pterodactyl panel, not local cache.
 - `/list` - users list their own servers; admins see all tracked servers.
 - `/power` - users or admins start, stop, or restart an owned/tracked server.
 - `/reinstall` - users or admins reinstall an owned/tracked server.
@@ -59,7 +59,7 @@ python bot.py
 
 Use a Pterodactyl **Application API** key in `panel_api_key` and a **Client API** key in `client_api_key`. The Application key handles search/create/resize/suspend/delete/list operations; the Client key handles power signals and backups for tracked server identifiers.
 
-The bot does **not** create panel users and does **not** use default eggs. If `/create-free` or `/create-paid` cannot find `panel_email`, it stops with an admin-visible error. Admins must select a nest first, then select an egg from that nest; startup, Docker image, and default egg variables are read from the Pterodactyl panel.
+The bot does **not** create panel users and does **not** use default eggs. Admins must run `/link` for the Discord user first; if `/create-free` or `/create-paid` is used for an unlinked Discord user, the bot stops with an admin-visible error. Admins must select a nest first, then select an egg from that nest; startup, Docker image, and default egg variables are read from the Pterodactyl panel. Server creation uses an available allocation from the selected node instead of blind automatic deployment.
 
 ## Branding
 
