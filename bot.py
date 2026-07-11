@@ -130,6 +130,17 @@ def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
         return connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
 
 
+def fetch_links_by_panel_user() -> dict[int, sqlite3.Row]:
+    with db() as connection:
+        rows = connection.execute("SELECT * FROM links").fetchall()
+    return {int(row["panel_user_id"]): row for row in rows}
+
+
+def fetch_servers_by_email(email: str) -> list[sqlite3.Row]:
+    with db() as connection:
+        return connection.execute("SELECT * FROM servers WHERE panel_email = ? AND deleted = 0 ORDER BY created_at DESC", (email,)).fetchall()
+
+
 init_db()
 
 
@@ -448,6 +459,33 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
         await interaction.followup.send(embed=branded_embed("Server Resized", f"**{row['name']}** is now {ram}MB RAM / {disk}MB disk / {cpu}% CPU."), ephemeral=True)
 
 
+class SuspendSelect(discord.ui.View):
+    def __init__(self, rows: list[sqlite3.Row]) -> None:
+        super().__init__(timeout=120)
+        options = [
+            discord.SelectOption(
+                label=row["name"][:100],
+                value=row["server_id"],
+                description=f"{row['plan']} • {row['panel_email']}"[:100],
+            )
+            for row in rows[:25]
+        ]
+        self.select = discord.ui.Select(placeholder="Select a server to suspend", min_values=1, max_values=1, options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction) -> None:
+        server_id = self.select.values[0]
+        row = fetch_server(server_id)
+        if not row:
+            await interaction.response.send_message(embed=branded_embed("Missing Server", "That tracked server was not found anymore.", 0xff4d4d), ephemeral=True)
+            return
+        await ptero.suspend_server(server_id)
+        with db() as connection:
+            connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
+        await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
+
+
 async def create_plan(interaction: discord.Interaction, plan: str, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int, allocations: int, backups: int) -> None:
     await interaction.response.defer(ephemeral=True)
     node_id = parse_id(node)
@@ -551,7 +589,13 @@ admin_group = app_commands.Group(name="admin", description="ZeroX Host admin too
 async def admin_list(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     servers = await ptero.list_servers()
-    lines = [f"`{server['id']}` • **{server['name']}** • `{server.get('uuid', 'no-uuid')}`" for server in servers[:25]]
+    links = fetch_links_by_panel_user()
+    lines = []
+    for server in servers[:25]:
+        panel_user_id = int(server.get("user") or 0)
+        link = links.get(panel_user_id)
+        linked = f"<@{link['discord_user_id']}> • `{link['email']}`" if link else "unlinked"
+        lines.append(f"`{server['id']}` • **{server['name']}** • `{server.get('uuid', 'no-uuid')}` • {linked}")
     await interaction.followup.send(embed=branded_embed("Panel Servers", "\n".join(lines) or "No panel servers found."), ephemeral=True)
 
 
@@ -596,12 +640,33 @@ async def resize(interaction: discord.Interaction, server: str) -> None:
 @tree.command(name="suspend", description="Suspend server")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
-async def suspend(interaction: discord.Interaction, server: str) -> None:
+async def suspend(interaction: discord.Interaction, server: str | None = None, user: discord.Member | None = None, email: str | None = None, all_except_whitelist_paid: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
-    await ptero.suspend_server(server)
-    with db() as connection:
-        connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
-    await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended server `{server}`."), ephemeral=True)
+    if all_except_whitelist_paid:
+        suspended = 0
+        for row in fetch_all_servers():
+            if row["plan"] == "paid" or is_whitelisted(row["server_id"]):
+                continue
+            await ptero.suspend_server(row["server_id"])
+            with db() as connection:
+                connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (row["server_id"],))
+            suspended += 1
+        await interaction.followup.send(embed=branded_embed("Bulk Suspend Complete", f"Suspended **{suspended}** non-paid, non-whitelisted server(s)."), ephemeral=True)
+        return
+
+    if server:
+        row = fetch_server(server)
+        await ptero.suspend_server(server)
+        with db() as connection:
+            connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
+        await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended **{row['name'] if row else server}**."), ephemeral=True)
+        return
+
+    rows = fetch_user_servers(user.id) if user else fetch_servers_by_email(email) if email else []
+    if not rows:
+        await interaction.followup.send(embed=branded_embed("No Servers Found", "Provide `server`, `user`, `email`, or `all_except_whitelist_paid:True`.", 0xffcc00), ephemeral=True)
+        return
+    await interaction.followup.send(embed=branded_embed("Select Server To Suspend", "Choose one of the matched servers below."), view=SuspendSelect(rows), ephemeral=True)
 
 
 @tree.command(name="unsuspend", description="Unsuspend server")

@@ -40,12 +40,12 @@ python bot.py
 
 - `/create-free` - admin-only free server creation with linked Discord user, name, specs, nest, egg, node, days, and optional feature limits.
 - `/create-paid` - admin-only paid server creation with duration, nest/egg/spec customization, automatic whitelist, and paid logging.
-- `/admin list` - admin-only list fetched live from the Pterodactyl panel, not local cache.
+- `/admin list` - admin-only list fetched live from the Pterodactyl panel, showing linked Discord user/email when available.
 - `/list` - users list their own servers; admins see all tracked servers.
 - `/power` - users or admins start, stop, or restart an owned/tracked server.
 - `/reinstall` - users or admins reinstall an owned/tracked server.
 - `/resize` - admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.
-- `/suspend` and `/unsuspend` - admin-only suspension controls.
+- `/suspend` and `/unsuspend` - admin-only suspension controls. `/suspend` can suspend a direct server, show a selectable menu by Discord user/email, or bulk suspend all except paid/whitelisted servers.
 - `/stopall` - admin-only stop for all tracked servers except whitelisted servers.
 - `/autobackup-enable` - owner/admin-only automatic backup scheduler using durations like `2d`, `4h`, or `12h`.
 - `/link` - admin-only link of an existing panel email to a Discord user.
