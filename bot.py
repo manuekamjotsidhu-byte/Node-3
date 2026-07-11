@@ -163,6 +163,7 @@ class PterodactylClient:
         self.server_cache: list[dict[str, Any]] = []
         self.nest_cache: list[dict[str, Any]] = []
         self.egg_cache: dict[int, list[dict[str, Any]]] = {}
+        self.user_cache: dict[int, dict[str, Any]] = {}
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(headers={
@@ -187,6 +188,16 @@ class PterodactylClient:
                 detail = data.get("errors", [{}])[0].get("detail", data)
                 raise RuntimeError(f"Pterodactyl API error {response.status}: {detail}")
             return data
+
+    async def get_user(self, user_id: int) -> dict[str, Any] | None:
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        try:
+            data = await self.request("GET", f"users/{user_id}")
+        except RuntimeError:
+            return None
+        self.user_cache[user_id] = data["attributes"]
+        return self.user_cache[user_id]
 
     async def find_user_by_email(self, email: str) -> dict[str, Any] | None:
         data = await self.request("GET", f"users?filter[email]={email}")
@@ -594,7 +605,9 @@ async def admin_list(interaction: discord.Interaction) -> None:
     for server in servers[:25]:
         panel_user_id = int(server.get("user") or 0)
         link = links.get(panel_user_id)
-        linked = f"<@{link['discord_user_id']}> • `{link['email']}`" if link else "unlinked"
+        panel_user = await ptero.get_user(panel_user_id) if panel_user_id else None
+        email = link["email"] if link else panel_user.get("email") if panel_user else "unknown-email"
+        linked = f"<@{link['discord_user_id']}> • `{email}`" if link else f"`{email}` • unlinked"
         lines.append(f"`{server['id']}` • **{server['name']}** • `{server.get('uuid', 'no-uuid')}` • {linked}")
     await interaction.followup.send(embed=branded_embed("Panel Servers", "\n".join(lines) or "No panel servers found."), ephemeral=True)
 
