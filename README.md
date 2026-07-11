@@ -11,7 +11,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - No invite system.
 - No SMTP flow.
 - No panel user creation: the Pterodactyl user must already exist, and admins provide the panel email during creation.
-- Only configured owners/admin roles can create, purge, whitelist, or view management data.
+- Only configured owners/admin roles can create, purge, whitelist, or view management data. In DMs, admin checks use `owner_ids` because Discord roles are unavailable outside a guild.
 - Admins select a deployment node by name/ID with slash-command autocomplete.
 - Admins create either `/create-free` or `/create-paid` servers with custom time, nest, egg, node, RAM, disk, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`.
@@ -28,11 +28,15 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
+Commands are synced both globally (for bot DMs) and to your configured guild (for instant server visibility). If commands do not appear, restart the bot after updating `config.json`; the startup log prints how many global/DM and guild commands synced.
+
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json
+# Fill owner_ids with real Discord user IDs for DM admin access.
 python bot.py
 ```
 

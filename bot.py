@@ -151,9 +151,6 @@ def require_config() -> None:
         raise RuntimeError(f"Missing config.json values: {', '.join(missing)}")
 
 
-require_config()
-
-
 class PterodactylClient:
     def __init__(self, panel_url: str, api_key: str) -> None:
         self.panel_url = panel_url.rstrip("/")
@@ -345,19 +342,33 @@ class PterodactylClientApi:
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-ptero = PterodactylClient(config.get("panel_url", PANEL_URL), config["panel_api_key"])
-client_api = PterodactylClientApi(config.get("panel_url", PANEL_URL), config["client_api_key"])
+ptero = PterodactylClient(config.get("panel_url", PANEL_URL), config.get("panel_api_key", ""))
+client_api = PterodactylClientApi(config.get("panel_url", PANEL_URL), config.get("client_api_key", ""))
 
 
-def is_admin(member: discord.Member) -> bool:
-    owner_ids = {int(item) for item in config.get("owner_ids", [])}
-    admin_roles = {ADMIN_ROLE_ID, OWNER_ROLE_ID, *(int(item) for item in config.get("admin_role_ids", []))}
-    return member.id in owner_ids or any(role.id in admin_roles for role in member.roles)
+
+def int_set(values: list[Any]) -> set[int]:
+    result: set[int] = set()
+    for value in values:
+        try:
+            result.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+def is_admin(member: discord.abc.User) -> bool:
+    owner_ids = int_set(config.get("owner_ids", []))
+    if member.id in owner_ids:
+        return True
+    if not isinstance(member, discord.Member):
+        return False
+    admin_roles = {ADMIN_ROLE_ID, OWNER_ROLE_ID, *int_set(config.get("admin_role_ids", []))}
+    return any(role.id in admin_roles for role in member.roles)
 
 
 def admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
-        if isinstance(interaction.user, discord.Member) and is_admin(interaction.user):
+        if is_admin(interaction.user):
             return True
         raise app_commands.CheckFailure("Only ZeroX Host admins can use this command.")
     return app_commands.check(predicate)
@@ -459,7 +470,7 @@ async def ensure_server_access(interaction: discord.Interaction, server_id: str)
     row = fetch_server(server_id)
     if not row or row["deleted"]:
         raise RuntimeError("Unknown tracked server.")
-    if isinstance(interaction.user, discord.Member) and is_admin(interaction.user):
+    if is_admin(interaction.user):
         return row
     if str(interaction.user.id) != row["discord_user_id"]:
         raise RuntimeError("You can only control your own servers.")
@@ -516,7 +527,7 @@ class SuspendSelect(discord.ui.View):
         await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
 
 
-async def create_plan(interaction: discord.Interaction, plan: str, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int, allocations: int, backups: int) -> None:
+async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int, allocations: int, backups: int) -> None:
     await interaction.response.defer(ephemeral=True)
     node_id = parse_id(node)
     nest_id = parse_id(nest)
@@ -590,20 +601,20 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
 @tree.command(name="create-free", description="Create free server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-async def create_free(interaction: discord.Interaction, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int = 30, databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
+async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int = 30, databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
     await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
 
 
 @tree.command(name="create-paid", description="Create paid server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-async def create_paid(interaction: discord.Interaction, user: discord.Member, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
+async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
     await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
 
 
 @tree.command(name="link", description="Link panel email")
 @admin_only()
-async def link(interaction: discord.Interaction, user: discord.Member, panel_email: str) -> None:
+async def link(interaction: discord.Interaction, user: discord.User, panel_email: str) -> None:
     await interaction.response.defer(ephemeral=True)
     panel_user = await ptero.get_required_panel_user(panel_email)
     with db() as connection:
@@ -647,7 +658,7 @@ tree.add_command(admin_group)
 @tree.command(name="list", description="List your servers")
 async def list_mine(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    rows = fetch_all_servers() if isinstance(interaction.user, discord.Member) and is_admin(interaction.user) else fetch_user_servers(interaction.user.id)
+    rows = fetch_all_servers() if is_admin(interaction.user) else fetch_user_servers(interaction.user.id)
     await interaction.followup.send(embed=branded_embed("Your Servers", "\n".join(server_row_to_line(row) for row in rows[:25]) or "No servers found."), ephemeral=True)
 
 
@@ -682,7 +693,7 @@ async def resize(interaction: discord.Interaction, server: str) -> None:
 @tree.command(name="suspend", description="Suspend server")
 @admin_only()
 @app_commands.autocomplete(server=server_autocomplete)
-async def suspend(interaction: discord.Interaction, server: str | None = None, user: discord.Member | None = None, email: str | None = None, all_except_whitelist_paid: bool = False) -> None:
+async def suspend(interaction: discord.Interaction, server: str | None = None, user: discord.User | None = None, email: str | None = None, all_except_whitelist_paid: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     if all_except_whitelist_paid:
         suspended = 0
@@ -869,6 +880,24 @@ async def run_autobackups() -> None:
             connection.execute("UPDATE autobackups SET next_run_at=? WHERE server_id=?", ((now + timedelta(seconds=backup["interval_seconds"])).isoformat(), backup["server_id"]))
 
 
+
+
+def configure_command_visibility() -> None:
+    """Make commands available in guilds and bot DMs before syncing."""
+    contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
+    installs = app_commands.AppInstallationType(guild=True, user=True)
+
+    def apply(command: app_commands.Command[Any, ..., Any] | app_commands.Group) -> None:
+        command.allowed_contexts = contexts
+        command.allowed_installs = installs
+        if isinstance(command, app_commands.Group):
+            for child in command.commands:
+                apply(child)
+
+    for command in tree.get_commands():
+        apply(command)
+
+
 @tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     message = str(error.original) if isinstance(error, app_commands.CommandInvokeError) else str(error)
@@ -885,9 +914,16 @@ async def on_ready() -> None:
         await ptero.start()
     if not client_api.session:
         await client_api.start()
-    guild = discord.Object(id=int(config["guild_id"]))
-    tree.copy_global_to(guild=guild)
-    await tree.sync(guild=guild)
+    configure_command_visibility()
+    global_commands = await tree.sync()
+    guild_id = config.get("guild_id")
+    if guild_id:
+        guild = discord.Object(id=int(guild_id))
+        tree.copy_global_to(guild=guild)
+        guild_commands = await tree.sync(guild=guild)
+        print(f"Synced {len(guild_commands)} guild commands and {len(global_commands)} global/DM commands.")
+    else:
+        print(f"Synced {len(global_commands)} global/DM commands.")
     if not suspend_expired_servers.is_running():
         suspend_expired_servers.start()
     if not run_autobackups.is_running():
@@ -896,6 +932,7 @@ async def on_ready() -> None:
 
 
 async def main() -> None:
+    require_config()
     try:
         await client.start(config["discord_token"])
     finally:

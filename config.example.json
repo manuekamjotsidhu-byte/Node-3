@@ -1,7 +1,7 @@
 {
   "discord_token": "YOUR_DISCORD_BOT_TOKEN",
   "guild_id": "YOUR_DISCORD_GUILD_ID",
-  "owner_ids": ["1504092176492265553"],
+  "owner_ids": ["YOUR_DISCORD_USER_ID_FOR_DM_ADMIN_ACCESS"],
   "admin_role_ids": ["1504092228778459226"],
   "panel_url": "https://gp.zeroxhost.space",
   "panel_api_key": "ptla_YOUR_PTERODACTYL_APPLICATION_API_KEY",
