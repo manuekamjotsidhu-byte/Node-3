@@ -3,14 +3,16 @@ import { RateLimiter } from './rateLimiter.js';
 import { validateGamePacket } from './gameProtocols.js';
 
 export class UdpDdosGuard {
-  constructor({ protocol = 'genericUdp', limiter = new RateLimiter({ capacity: 80, refillRatePerSec: 40 }), onAllow = () => {}, onDeny = () => {} } = {}) {
+  constructor({ protocol = 'genericUdp', limiter = new RateLimiter({ capacity: 80, refillRatePerSec: 40 }), subnetBlocker = null, onAllow = () => {}, onDeny = () => {} } = {}) {
     this.protocol = protocol;
     this.limiter = limiter;
+    this.subnetBlocker = subnetBlocker;
     this.onAllow = onAllow;
     this.onDeny = onDeny;
   }
 
   inspect(packet, rinfo) {
+    if (this.subnetBlocker?.isBlocked?.(rinfo.address)) return this.deny(packet, rinfo, 'subnet_blocked');
     const key = `${rinfo.address}:${rinfo.port}`;
     const validation = validateGamePacket(packet, this.protocol);
     if (!validation.allowed) return this.deny(packet, rinfo, validation.reason);
@@ -20,6 +22,7 @@ export class UdpDdosGuard {
   }
 
   deny(packet, rinfo, reason) {
+    this.subnetBlocker?.record?.(rinfo.address, reason);
     this.onDeny(packet, rinfo, reason);
     return { allowed: false, reason };
   }

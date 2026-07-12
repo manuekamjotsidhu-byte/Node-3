@@ -10,6 +10,9 @@ Production-oriented Layer 4 and Layer 7 DDoS protection primitives for Node.js s
 - **Game protocol filtering** for Source Engine A2S queries, Minecraft server pings/handshakes, and a generic UDP baseline.
 - **Layer 7 HTTP guard** with method allow-listing, path/user-agent deny rules, body-size limits, trusted proxy IP extraction, and per-IP/path rate limiting.
 - **Dependency-free core** using Node.js built-ins for easier auditability and deployment.
+- **Full-host visibility** through `/proc/net` scanning so the guard logs all listening TCP/UDP ports and the process that owns each port.
+- **Temporary subnet blocking** when repeated Layer 4 or Layer 7 attacks originate from the same `/24`, with optional `ipset` firewall enforcement.
+- **No-downtime posture** by using dynamic in-process block updates and systemd `Restart=always` instead of requiring restarts for every temporary block.
 
 ## Quick start
 
@@ -40,6 +43,19 @@ sudo ./uninstall.sh
 ```
 
 The installer writes `/etc/node-3-ddos-guard.env`, installs the app under `/opt/node-3-ddos-guard`, and creates a `node-3-ddos-guard.service` unit with `Restart=always`.
+
+
+## Full VPS port visibility and temporary subnet blocking
+
+The runtime automatically scans Linux `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/net/udp`, and `/proc/net/udp6` so operators can see every listening TCP/UDP port and which process owns it. This gives you full-VPS visibility instead of only checking the demo HTTP/UDP ports.
+
+Layer 4 and Layer 7 denials feed the same temporary subnet blocker. If many bad requests or invalid game packets come from the same `/24`, the subnet is temporarily blocked in memory. Set `FIREWALL_ENABLED=true` when running as root on a host with `ipset` to push those temporary subnet blocks into the system firewall as well.
+
+```bash
+sudo FIREWALL_ENABLED=true ./install-or-run.sh install
+```
+
+Temporary blocks are applied without restarting the Node.js process, which helps preserve the no-downtime policy while active attacks are being mitigated.
 
 ## Layer 7 usage
 

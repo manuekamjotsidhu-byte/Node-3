@@ -17,6 +17,7 @@ export function createLayer7Guard({
   badPaths = DEFAULT_BAD_PATHS,
   badUserAgents = DEFAULT_BAD_USER_AGENTS,
   allowedMethods = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  subnetBlocker = null,
 } = {}) {
   const methodSet = new Set(allowedMethods);
   return function layer7Guard(req, res, next) {
@@ -25,15 +26,21 @@ export function createLayer7Guard({
     const ua = String(req.headers['user-agent'] || '');
     const contentLength = Number(req.headers['content-length'] || 0);
 
-    if (!methodSet.has(req.method)) return deny(res, 405, 'method_not_allowed');
-    if (contentLength > maxBodyBytes) return deny(res, 413, 'payload_too_large');
-    if (badPaths.some(rx => rx.test(url.pathname))) return deny(res, 403, 'blocked_path');
-    if (badUserAgents.some(rx => rx.test(ua))) return deny(res, 403, 'blocked_user_agent');
-    if (!limiter.allow(`${ip}:${req.method}:${url.pathname}`)) return deny(res, 429, 'rate_limited');
+    if (subnetBlocker?.isBlocked?.(ip)) return deny(res, 403, 'subnet_blocked');
+    if (!methodSet.has(req.method)) return block(subnetBlocker, ip, res, 405, 'method_not_allowed');
+    if (contentLength > maxBodyBytes) return block(subnetBlocker, ip, res, 413, 'payload_too_large');
+    if (badPaths.some(rx => rx.test(url.pathname))) return block(subnetBlocker, ip, res, 403, 'blocked_path');
+    if (badUserAgents.some(rx => rx.test(ua))) return block(subnetBlocker, ip, res, 403, 'blocked_user_agent');
+    if (!limiter.allow(`${ip}:${req.method}:${url.pathname}`)) return block(subnetBlocker, ip, res, 429, 'rate_limited');
 
     res.setHeader('x-ddos-guard', 'pass');
     return next();
   };
+}
+
+function block(subnetBlocker, ip, res, statusCode, reason) {
+  subnetBlocker?.record?.(ip, reason);
+  return deny(res, statusCode, reason);
 }
 
 function deny(res, statusCode, reason) {
