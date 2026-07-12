@@ -92,6 +92,15 @@ def init_db() -> None:
             next_run_at TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS scheduled_restarts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id TEXT NOT NULL,
+            discord_user_id TEXT NOT NULL,
+            interval_seconds INTEGER NOT NULL,
+            next_run_at TEXT NOT NULL,
+            all_servers INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1
+        );
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
@@ -338,6 +347,16 @@ class PterodactylClientApi:
     async def backup(self, identifier: str, name: str) -> None:
         await self.request("POST", identifier, "backups", {"name": name})
 
+    async def resources(self, identifier: str) -> dict[str, Any]:
+        data = await self.request("GET", identifier, "resources")
+        return data.get("attributes", {})
+
+    async def command(self, identifier: str, command: str) -> None:
+        await self.request("POST", identifier, "command", {"command": command})
+
+    async def rename(self, identifier: str, name: str) -> None:
+        await self.request("POST", identifier, "settings/rename", {"name": name})
+
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
@@ -368,6 +387,8 @@ def is_admin(member: discord.abc.User) -> bool:
 
 def admin_only():
     async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.CheckFailure("Admin commands only work inside the ZeroX Host Discord server, not in DMs.")
         if is_admin(interaction.user):
             return True
         raise app_commands.CheckFailure("Only ZeroX Host admins can use this command.")
@@ -451,6 +472,13 @@ async def server_autocomplete(interaction: discord.Interaction, current: str) ->
     return [app_commands.Choice(name=f"{server['name']} • {server.get('uuid', server['id'])}", value=str(server["id"])) for server in matches[:25]]
 
 
+async def tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    rows = fetch_all_servers() if interaction.guild is not None and is_admin(interaction.user) else fetch_user_servers(interaction.user.id)
+    lowered = current.lower()
+    matches = [row for row in rows if lowered in f"{row['server_id']} {row['name']} {row['uuid'] or ''} {row['identifier'] or ''}".lower()]
+    return [app_commands.Choice(name=f"{row['name']} • {row['server_id']}", value=row["server_id"]) for row in matches[:25]]
+
+
 def parse_duration(value: str) -> int:
     total = 0
     for amount, unit in re.findall(r"(\d+)\s*([dhm])", value.lower()):
@@ -470,11 +498,95 @@ async def ensure_server_access(interaction: discord.Interaction, server_id: str)
     row = fetch_server(server_id)
     if not row or row["deleted"]:
         raise RuntimeError("Unknown tracked server.")
-    if is_admin(interaction.user):
+    if interaction.guild is not None and is_admin(interaction.user):
         return row
     if str(interaction.user.id) != row["discord_user_id"]:
         raise RuntimeError("You can only control your own servers.")
     return row
+
+
+def format_mb(value: float) -> str:
+    return f"{value:,.1f} MB"
+
+
+def manage_embed(row: sqlite3.Row, resources: dict[str, Any]) -> discord.Embed:
+    raw = resources.get("resources", {}) if resources else {}
+    state = resources.get("current_state", "unknown") if resources else "unknown"
+    memory_mb = float(raw.get("memory_bytes") or 0) / 1024 / 1024
+    disk_mb = float(raw.get("disk_bytes") or 0) / 1024 / 1024
+    cpu_usage = float(raw.get("cpu_absolute") or 0)
+    uptime_seconds = int(raw.get("uptime") or 0) // 1000
+    uptime = str(timedelta(seconds=uptime_seconds)) if uptime_seconds else "offline/unknown"
+    expires = int(datetime.fromisoformat(row["expires_at"]).timestamp())
+    embed = branded_embed("Server Manager", f"**{row['name']}** (`{row['server_id']}`)", 0x2ecc71)
+    embed.add_field(name="State", value=f"`{state}`", inline=True)
+    embed.add_field(name="Uptime", value=f"`{uptime}`", inline=True)
+    embed.add_field(name="CPU", value=f"**{cpu_usage:.2f}%** / {row['cpu']}%", inline=True)
+    embed.add_field(name="RAM", value=f"**{format_mb(memory_mb)}** / {row['ram']:,} MB", inline=True)
+    embed.add_field(name="Disk", value=f"**{format_mb(disk_mb)}** / {row['disk']:,} MB", inline=True)
+    embed.add_field(name="Panel", value=config.get("panel_url", PANEL_URL).rstrip("/"), inline=True)
+    embed.add_field(name="Expires", value=f"<t:{expires}:R>", inline=False)
+    return embed
+
+
+async def send_view_error(interaction: discord.Interaction, error: Exception) -> None:
+    embed = branded_embed("Action Failed", clean(str(error), 3500), 0xff4d4d)
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class ManageView(discord.ui.View):
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        await send_view_error(interaction, error)
+
+    def __init__(self, server_id: str) -> None:
+        super().__init__(timeout=300)
+        self.server_id = server_id
+        self.add_item(discord.ui.Button(label="Open Panel", style=discord.ButtonStyle.link, url=config.get("panel_url", PANEL_URL).rstrip("/"), emoji="🔗", row=2))
+
+    async def row(self, interaction: discord.Interaction) -> sqlite3.Row:
+        return await ensure_server_access(interaction, self.server_id)
+
+    async def refresh_message(self, interaction: discord.Interaction, note: str) -> None:
+        row = await self.row(interaction)
+        resources = await client_api.resources(row["identifier"]) if row["identifier"] else {}
+        embed = manage_embed(row, resources)
+        embed.description = f"{embed.description}\n\n{note}"
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Start", style=discord.ButtonStyle.success, emoji="▶️", row=0)
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        row = await self.row(interaction)
+        if not row["identifier"]:
+            raise RuntimeError("This tracked server is missing its client identifier.")
+        await client_api.power(row["identifier"], "start")
+        await self.refresh_message(interaction, "✅ Start signal sent.")
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=0)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        row = await self.row(interaction)
+        if not row["identifier"]:
+            raise RuntimeError("This tracked server is missing its client identifier.")
+        await client_api.power(row["identifier"], "stop")
+        await self.refresh_message(interaction, "✅ Stop signal sent.")
+
+    @discord.ui.button(label="Restart", style=discord.ButtonStyle.primary, emoji="🔁", row=0)
+    async def restart_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        row = await self.row(interaction)
+        if not row["identifier"]:
+            raise RuntimeError("This tracked server is missing its client identifier.")
+        await client_api.power(row["identifier"], "restart")
+        await self.refresh_message(interaction, "✅ Restart signal sent.")
+
+    @discord.ui.button(label="Kill", style=discord.ButtonStyle.danger, emoji="💀", row=0)
+    async def kill_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        row = await self.row(interaction)
+        if not row["identifier"]:
+            raise RuntimeError("This tracked server is missing its client identifier.")
+        await client_api.power(row["identifier"], "kill")
+        await self.refresh_message(interaction, "✅ Kill signal sent.")
 
 
 class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
@@ -662,8 +774,90 @@ async def list_mine(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=branded_embed("Your Servers", "\n".join(server_row_to_line(row) for row in rows[:25]) or "No servers found."), ephemeral=True)
 
 
+@tree.command(name="manage", description="Open server manager")
+@app_commands.autocomplete(server=tracked_server_autocomplete)
+async def manage(interaction: discord.Interaction, server: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await ensure_server_access(interaction, server)
+    resources = await client_api.resources(row["identifier"]) if row["identifier"] else {}
+    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server), ephemeral=True)
+
+
+@tree.command(name="console", description="Send console command")
+@app_commands.autocomplete(server=tracked_server_autocomplete)
+async def console(interaction: discord.Interaction, server: str, command: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await ensure_server_access(interaction, server)
+    if not row["identifier"]:
+        raise RuntimeError("This tracked server is missing its client identifier.")
+    await client_api.command(row["identifier"], command)
+    await interaction.followup.send(embed=branded_embed("Console Command Sent", f"Sent command to **{row['name']}**.\n```{clean(command, 1000)}```"), ephemeral=True)
+
+
+@tree.command(name="rename", description="Rename server")
+@app_commands.autocomplete(server=tracked_server_autocomplete)
+async def rename(interaction: discord.Interaction, server: str, new_name: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await ensure_server_access(interaction, server)
+    if not row["identifier"]:
+        raise RuntimeError("This tracked server is missing its client identifier.")
+    await client_api.rename(row["identifier"], new_name)
+    with db() as connection:
+        connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
+    await interaction.followup.send(embed=branded_embed("Server Renamed", f"`{row['name']}` is now **{new_name}**."), ephemeral=True)
+
+
+@tree.command(name="schedule-restart", description="Schedule restarts")
+@app_commands.autocomplete(server=tracked_server_autocomplete)
+async def schedule_restart(interaction: discord.Interaction, time: str, server: str | None = None, all_servers: bool = False) -> None:
+    await interaction.response.defer(ephemeral=True)
+    seconds = parse_duration(time)
+    next_run = (utc_now() + timedelta(seconds=seconds)).isoformat()
+    if all_servers:
+        if interaction.guild is None or not is_admin(interaction.user):
+            raise RuntimeError("Scheduling restarts for all servers is admin-only and cannot be used in DMs.")
+        rows = fetch_all_servers()
+        with db() as connection:
+            for row in rows:
+                connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,1,1)", (row["server_id"], str(interaction.user.id), seconds, next_run))
+        await interaction.followup.send(embed=branded_embed("All Server Restarts Scheduled", f"Scheduled **{len(rows)}** tracked server(s) to restart every **{time}**."), ephemeral=True)
+        return
+    if not server:
+        raise RuntimeError("Select one server, or admins can set all_servers:True inside the Discord server.")
+    row = await ensure_server_access(interaction, server)
+    with db() as connection:
+        connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,0,1)", (server, str(interaction.user.id), seconds, next_run))
+    await interaction.followup.send(embed=branded_embed("Restart Scheduled", f"**{row['name']}** will restart every **{time}**."), ephemeral=True)
+
+
+@tree.command(name="renew", description="Admin renew server")
+@admin_only()
+@app_commands.autocomplete(server=tracked_server_autocomplete)
+async def renew(interaction: discord.Interaction, server: str, time: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = fetch_server(server)
+    if not row:
+        raise RuntimeError("Unknown tracked server.")
+    seconds = parse_duration(time)
+    current_expiry = datetime.fromisoformat(row["expires_at"])
+    base = current_expiry if current_expiry > utc_now() else utc_now()
+    new_expiry = base + timedelta(seconds=seconds)
+    with db() as connection:
+        connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1 WHERE server_id=?", (new_expiry.isoformat(), server))
+    try:
+        await ptero.unsuspend_server(server)
+    except RuntimeError:
+        pass
+    try:
+        user = await client.fetch_user(int(row["discord_user_id"]))
+        await user.send(embed=branded_embed("Service Renewed", f"Your server **{row['name']}** was renewed until <t:{int(new_expiry.timestamp())}:F>."))
+    except Exception:
+        pass
+    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{row['name']}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>"), ephemeral=True)
+
+
 @tree.command(name="power", description="Power server")
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 @app_commands.choices(action=[app_commands.Choice(name="start", value="start"), app_commands.Choice(name="stop", value="stop"), app_commands.Choice(name="restart", value="restart")])
 async def power(interaction: discord.Interaction, server: str, action: app_commands.Choice[str]) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -675,7 +869,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
 
 
 @tree.command(name="reinstall", description="Reinstall server")
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await ensure_server_access(interaction, server)
@@ -685,14 +879,14 @@ async def reinstall(interaction: discord.Interaction, server: str) -> None:
 
 @tree.command(name="resize", description="Resize server")
 @admin_only()
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 async def resize(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.send_modal(ResizeModal(server))
 
 
 @tree.command(name="suspend", description="Suspend server")
 @admin_only()
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 async def suspend(interaction: discord.Interaction, server: str | None = None, user: discord.User | None = None, email: str | None = None, all_except_whitelist_paid: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     if all_except_whitelist_paid:
@@ -724,7 +918,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
 
 @tree.command(name="unsuspend", description="Unsuspend server")
 @admin_only()
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     await ptero.unsuspend_server(server)
@@ -748,7 +942,7 @@ async def stopall(interaction: discord.Interaction) -> None:
 
 @tree.command(name="autobackup-enable", description="Enable autobackups")
 @admin_only()
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 async def autobackup_enable(interaction: discord.Interaction, server: str, every: str) -> None:
     await interaction.response.defer(ephemeral=True)
     seconds = parse_duration(every)
@@ -768,7 +962,7 @@ async def nodes(interaction: discord.Interaction) -> None:
 
 @tree.command(name="whitelist", description="Admin: whitelist or unwhitelist a server by name/UUID")
 @admin_only()
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 @app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove")])
 async def whitelist(interaction: discord.Interaction, server: str, action: app_commands.Choice[str]) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -818,7 +1012,7 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
 
 @tree.command(name="autosuspend", description="Toggle autosuspend")
 @admin_only()
-@app_commands.autocomplete(server=server_autocomplete)
+@app_commands.autocomplete(server=tracked_server_autocomplete)
 @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
 async def autosuspend(interaction: discord.Interaction, server: str, state: app_commands.Choice[str]) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -864,6 +1058,23 @@ async def suspend_expired_servers() -> None:
 
 
 @tasks.loop(minutes=1)
+async def run_scheduled_restarts() -> None:
+    now = utc_now()
+    with db() as connection:
+        restarts = connection.execute("SELECT * FROM scheduled_restarts WHERE enabled=1 AND next_run_at <= ?", (now.isoformat(),)).fetchall()
+    for restart in restarts:
+        row = fetch_server(restart["server_id"])
+        if not row or not row["identifier"] or row["deleted"] or row["suspended"]:
+            continue
+        try:
+            await client_api.power(row["identifier"], "restart")
+        except Exception as error:
+            print(f"Failed to scheduled-restart {restart['server_id']}: {error}")
+        with db() as connection:
+            connection.execute("UPDATE scheduled_restarts SET next_run_at=? WHERE id=?", ((now + timedelta(seconds=restart["interval_seconds"])).isoformat(), restart["id"]))
+
+
+@tasks.loop(minutes=1)
 async def run_autobackups() -> None:
     now = utc_now()
     with db() as connection:
@@ -883,19 +1094,24 @@ async def run_autobackups() -> None:
 
 
 def configure_command_visibility() -> None:
-    """Make commands available in guilds and bot DMs before syncing."""
-    contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
+    """Sync user commands to DMs while keeping admin commands guild-only."""
+    user_contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
+    admin_contexts = app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)
     installs = app_commands.AppInstallationType(guild=True, user=True)
+    admin_command_names = {
+        "admin", "create-free", "create-paid", "link", "resize", "suspend", "unsuspend", "stopall",
+        "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew",
+    }
 
-    def apply(command: app_commands.Command[Any, ..., Any] | app_commands.Group) -> None:
-        command.allowed_contexts = contexts
+    def apply(command: app_commands.Command[Any, ..., Any] | app_commands.Group, admin_only_command: bool = False) -> None:
+        command.allowed_contexts = admin_contexts if admin_only_command else user_contexts
         command.allowed_installs = installs
         if isinstance(command, app_commands.Group):
             for child in command.commands:
-                apply(child)
+                apply(child, admin_only_command=True)
 
     for command in tree.get_commands():
-        apply(command)
+        apply(command, admin_only_command=command.name in admin_command_names)
 
 
 @tree.error
@@ -928,6 +1144,8 @@ async def on_ready() -> None:
         suspend_expired_servers.start()
     if not run_autobackups.is_running():
         run_autobackups.start()
+    if not run_scheduled_restarts.is_running():
+        run_scheduled_restarts.start()
     print(f"{BRAND} bot online as {client.user} | Developer: {DEVELOPER}")
 
 

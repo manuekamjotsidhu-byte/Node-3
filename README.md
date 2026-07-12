@@ -11,7 +11,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - No invite system.
 - No SMTP flow.
 - No panel user creation: the Pterodactyl user must already exist, and admins provide the panel email during creation.
-- Only configured owners/admin roles can create, purge, whitelist, or view management data. In DMs, admin checks use `owner_ids` because Discord roles are unavailable outside a guild.
+- Only configured owners/admin roles can create, purge, whitelist, or view management data. Admin commands are guild-only and are intentionally hidden/blocked in DMs; DMs only expose user-safe commands for linked servers.
 - Admins select a deployment node by name/ID with slash-command autocomplete.
 - Admins create either `/create-free` or `/create-paid` servers with custom time, nest, egg, node, RAM, disk, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`.
@@ -28,7 +28,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
-Commands are synced both globally (for bot DMs) and to your configured guild (for instant server visibility). If commands do not appear, restart the bot after updating `config.json`; the startup log prints how many global/DM and guild commands synced.
+Commands are synced globally for user-safe DM commands and to your configured guild for admin commands. If commands do not appear, restart the bot after updating `config.json`; the startup log prints how many global/DM and guild commands synced.
 
 
 ```bash
@@ -45,10 +45,15 @@ python bot.py
 - `/create-free` - admin-only free server creation with linked Discord user, name, specs, nest, egg, node, days, and optional feature limits.
 - `/create-paid` - admin-only paid server creation with duration, nest/egg/spec customization, automatic whitelist, and paid logging.
 - `/admin list` - admin-only organized embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
-- `/list` - users list their own servers; admins see all tracked servers.
+- `/list` - users list their own servers; admins see all tracked servers in guilds.
+- `/manage` - users open a premium control panel for one linked server with live resource usage and start/stop/restart/kill buttons.
 - `/power` - users or admins start, stop, or restart an owned/tracked server.
 - `/reinstall` - users or admins reinstall an owned/tracked server.
-- `/resize` - admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.
+- `/console` - users send a console command to their own linked server.
+- `/rename` - users rename their own linked server.
+- `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.
+- `/renew` - guild admin-only renewal command that extends server expiration by a time such as `30d`.
+- `/resize` - guild admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.
 - `/suspend` and `/unsuspend` - admin-only suspension controls. `/suspend` can suspend a direct server, show a selectable menu by Discord user/email, or bulk suspend all except paid/whitelisted servers.
 - `/stopall` - admin-only stop for all tracked servers except whitelisted servers.
 - `/autobackup-enable` - owner/admin-only automatic backup scheduler using durations like `2d`, `4h`, or `12h`.
