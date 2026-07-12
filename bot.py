@@ -14,7 +14,7 @@ from discord.ext import tasks
 CONFIG_PATH = Path("config.json")
 DB_PATH = Path("data/zerox_host_db.json")
 SQLITE_PATH = Path("data/zerox_host.db")
-DEVELOPER = "ekamsidhu07 ekam"
+DEVELOPER = "ekamsidhu07"
 BRAND = "ZeroX Host"
 PAID_LOG_CHANNEL_ID = 1504092779700289536
 ADMIN_ROLE_ID = 1504092228778459226
