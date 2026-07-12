@@ -472,11 +472,20 @@ async def server_autocomplete(interaction: discord.Interaction, current: str) ->
     return [app_commands.Choice(name=f"{server['name']} • {server.get('uuid', server['id'])}", value=str(server["id"])) for server in matches[:25]]
 
 
-async def tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    rows = fetch_all_servers() if interaction.guild is not None and is_admin(interaction.user) else fetch_user_servers(interaction.user.id)
+def row_server_choices(current: str, rows: list[sqlite3.Row]) -> list[app_commands.Choice[str]]:
     lowered = current.lower()
     matches = [row for row in rows if lowered in f"{row['server_id']} {row['name']} {row['uuid'] or ''} {row['identifier'] or ''}".lower()]
     return [app_commands.Choice(name=f"{row['name']} • {row['server_id']}", value=row["server_id"]) for row in matches[:25]]
+
+
+async def tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    return row_server_choices(current, fetch_user_servers(interaction.user.id))
+
+
+async def admin_tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if interaction.guild is None or not is_admin(interaction.user):
+        return []
+    return row_server_choices(current, fetch_all_servers())
 
 
 def parse_duration(value: str) -> int:
@@ -494,14 +503,14 @@ def server_row_to_line(row: sqlite3.Row) -> str:
     return f"`{row['server_id']}` • **{row['name']}** • {row['plan']} • <t:{expires}:R>"
 
 
-async def ensure_server_access(interaction: discord.Interaction, server_id: str) -> sqlite3.Row:
+async def ensure_server_access(interaction: discord.Interaction, server_id: str, *, allow_admin: bool = False) -> sqlite3.Row:
     row = fetch_server(server_id)
     if not row or row["deleted"]:
         raise RuntimeError("Unknown tracked server.")
-    if interaction.guild is not None and is_admin(interaction.user):
+    if allow_admin and interaction.guild is not None and is_admin(interaction.user):
         return row
     if str(interaction.user.id) != row["discord_user_id"]:
-        raise RuntimeError("You can only control your own servers.")
+        raise RuntimeError("You can only control your own servers. Use `/admin manage` for staff access to other users' servers.")
     return row
 
 
@@ -538,16 +547,17 @@ async def send_view_error(interaction: discord.Interaction, error: Exception) ->
 
 
 class ManageView(discord.ui.View):
+    def __init__(self, server_id: str, *, allow_admin: bool = False) -> None:
+        super().__init__(timeout=300)
+        self.server_id = server_id
+        self.allow_admin = allow_admin
+        self.add_item(discord.ui.Button(label="Open Panel", style=discord.ButtonStyle.link, url=config.get("panel_url", PANEL_URL).rstrip("/"), emoji="🔗", row=2))
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
         await send_view_error(interaction, error)
 
-    def __init__(self, server_id: str) -> None:
-        super().__init__(timeout=300)
-        self.server_id = server_id
-        self.add_item(discord.ui.Button(label="Open Panel", style=discord.ButtonStyle.link, url=config.get("panel_url", PANEL_URL).rstrip("/"), emoji="🔗", row=2))
-
     async def row(self, interaction: discord.Interaction) -> sqlite3.Row:
-        return await ensure_server_access(interaction, self.server_id)
+        return await ensure_server_access(interaction, self.server_id, allow_admin=self.allow_admin)
 
     async def refresh_message(self, interaction: discord.Interaction, note: str) -> None:
         row = await self.row(interaction)
@@ -595,13 +605,14 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
     cpu = discord.ui.TextInput(label="CPU %", placeholder="100", required=True)
     extras = discord.ui.TextInput(label="DB, Allocations, Backups", placeholder="1,1,1", required=False, default="1,1,1")
 
-    def __init__(self, server_id: str) -> None:
+    def __init__(self, server_id: str, *, allow_admin: bool = False) -> None:
         super().__init__()
         self.server_id = server_id
+        self.allow_admin = allow_admin
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
-        row = await ensure_server_access(interaction, self.server_id)
+        row = await ensure_server_access(interaction, self.server_id, allow_admin=self.allow_admin)
         databases, allocations, backups = [int(part.strip()) for part in str(self.extras.value).split(",")]
         ram = int(str(self.ram.value))
         disk = int(str(self.disk.value))
@@ -777,6 +788,42 @@ async def admin_list(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+@admin_group.command(name="manage", description="Manage any tracked server")
+@admin_only()
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
+async def admin_manage(interaction: discord.Interaction, server: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await ensure_server_access(interaction, server, allow_admin=True)
+    resources = await client_api.resources(row["identifier"]) if row["identifier"] else {}
+    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=True), ephemeral=True)
+
+
+@admin_group.command(name="console", description="Send console command to any tracked server")
+@admin_only()
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
+async def admin_console(interaction: discord.Interaction, server: str, command: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await ensure_server_access(interaction, server, allow_admin=True)
+    if not row["identifier"]:
+        raise RuntimeError("This tracked server is missing its client identifier.")
+    await client_api.command(row["identifier"], command)
+    await interaction.followup.send(embed=branded_embed("Admin Console Command Sent", f"Sent command to **{row['name']}**.\n```{clean(command, 1000)}```"), ephemeral=True)
+
+
+@admin_group.command(name="rename", description="Rename any tracked server")
+@admin_only()
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
+async def admin_rename(interaction: discord.Interaction, server: str, new_name: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await ensure_server_access(interaction, server, allow_admin=True)
+    if not row["identifier"]:
+        raise RuntimeError("This tracked server is missing its client identifier.")
+    await client_api.rename(row["identifier"], new_name)
+    with db() as connection:
+        connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
+    await interaction.followup.send(embed=branded_embed("Admin Server Renamed", f"`{row['name']}` is now **{new_name}**."), ephemeral=True)
+
+
 tree.add_command(admin_group)
 
 
@@ -845,7 +892,7 @@ async def schedule_restart(interaction: discord.Interaction, time: str, server: 
 
 @tree.command(name="renew", description="Admin renew server")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def renew(interaction: discord.Interaction, server: str, time: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = fetch_server(server)
@@ -871,7 +918,7 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
 
 @tree.command(name="delete", description="Admin delete one server")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def delete(interaction: discord.Interaction, server: str, confirm: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     row = fetch_server(server)
@@ -911,14 +958,14 @@ async def reinstall(interaction: discord.Interaction, server: str) -> None:
 
 @tree.command(name="resize", description="Resize server")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def resize(interaction: discord.Interaction, server: str) -> None:
-    await interaction.response.send_modal(ResizeModal(server))
+    await interaction.response.send_modal(ResizeModal(server, allow_admin=True))
 
 
 @tree.command(name="suspend", description="Suspend server")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def suspend(interaction: discord.Interaction, server: str | None = None, user: discord.User | None = None, email: str | None = None, all_except_whitelist_paid: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     if all_except_whitelist_paid:
@@ -950,7 +997,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
 
 @tree.command(name="unsuspend", description="Unsuspend server")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     await ptero.unsuspend_server(server)
@@ -974,7 +1021,7 @@ async def stopall(interaction: discord.Interaction) -> None:
 
 @tree.command(name="autobackup-enable", description="Enable autobackups")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def autobackup_enable(interaction: discord.Interaction, server: str, every: str) -> None:
     await interaction.response.defer(ephemeral=True)
     seconds = parse_duration(every)
