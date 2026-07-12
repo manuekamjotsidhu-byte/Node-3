@@ -17,6 +17,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`.
 - `/purge` deletes tracked free servers only; paid and whitelisted servers are skipped.
 - Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
+- Tracked server details are refreshed from the live Pterodactyl panel before user lists and management actions, so renamed/resized/deleted panel servers do not rely on stale local DB values.
 - Expired tracked servers are automatically suspended by the background task.
 
 ## Files

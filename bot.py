@@ -124,6 +124,46 @@ def fetch_user_servers(discord_user_id: int) -> list[sqlite3.Row]:
         return connection.execute("SELECT * FROM servers WHERE discord_user_id = ? AND deleted = 0 ORDER BY created_at DESC", (str(discord_user_id),)).fetchall()
 
 
+def mark_server_deleted(server_id: str) -> None:
+    with db() as connection:
+        connection.execute("UPDATE servers SET deleted = 1 WHERE server_id = ?", (str(server_id),))
+    if str(server_id) in database.get("servers", {}):
+        database["servers"][str(server_id)]["deleted"] = True
+        save_database()
+
+
+def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any], panel_email: str | None = None) -> None:
+    limits = panel_server.get("limits") or {}
+    feature_limits = panel_server.get("feature_limits") or {}
+    updates = {
+        "identifier": panel_server.get("identifier"),
+        "uuid": panel_server.get("uuid"),
+        "name": panel_server.get("name", f"Server {server_id}"),
+        "panel_user_id": int(panel_server.get("user") or 0),
+        "panel_email": panel_email,
+        "ram": int(limits.get("memory") or 0),
+        "disk": int(limits.get("disk") or 0),
+        "cpu": int(limits.get("cpu") or 0),
+        "databases": int(feature_limits.get("databases") or 0),
+        "allocations": int(feature_limits.get("allocations") or 0),
+        "backups": int(feature_limits.get("backups") or 0),
+        "deleted": 0,
+    }
+    with db() as connection:
+        connection.execute(
+            """
+            UPDATE servers
+            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, deleted=?
+            WHERE server_id=?
+            """,
+            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["deleted"], str(server_id)),
+        )
+    if str(server_id) in database.get("servers", {}):
+        mirror_updates = {key: value for key, value in updates.items() if value is not None}
+        database["servers"][str(server_id)].update(mirror_updates)
+        save_database()
+
+
 def fetch_all_servers() -> list[sqlite3.Row]:
     with db() as connection:
         return connection.execute("SELECT * FROM servers WHERE deleted = 0 ORDER BY created_at DESC").fetchall()
@@ -538,6 +578,36 @@ def parse_duration(value: str) -> int:
     return total
 
 
+def is_not_found_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return " 404" in message or "not found" in message or "could not be found" in message
+
+
+async def refresh_tracked_server(row: sqlite3.Row) -> sqlite3.Row | None:
+    """Refresh a tracked DB server from the panel so local state never wins over live panel data."""
+    server_id = str(row["server_id"])
+    try:
+        panel_server = await ptero.get_server(server_id)
+    except RuntimeError as error:
+        if is_not_found_error(error):
+            mark_server_deleted(server_id)
+            return None
+        raise
+    panel_user_id = int(panel_server.get("user") or 0)
+    panel_user = await ptero.get_user(panel_user_id) if panel_user_id else None
+    update_tracked_server_from_panel(server_id, panel_server, panel_user.get("email") if panel_user else None)
+    return fetch_server(server_id)
+
+
+async def refresh_user_servers(discord_user_id: int) -> list[sqlite3.Row]:
+    refreshed: list[sqlite3.Row] = []
+    for row in fetch_user_servers(discord_user_id):
+        live_row = await refresh_tracked_server(row)
+        if live_row and str(live_row["discord_user_id"]) == str(discord_user_id):
+            refreshed.append(live_row)
+    return refreshed
+
+
 def server_row_to_line(row: sqlite3.Row) -> str:
     expires = int(datetime.fromisoformat(row["expires_at"]).timestamp())
     return f"`{row['server_id']}` • **{row['name']}** • {row['plan']} • <t:{expires}:R>"
@@ -546,10 +616,13 @@ def server_row_to_line(row: sqlite3.Row) -> str:
 async def ensure_server_access(interaction: discord.Interaction, server_id: str, *, allow_admin: bool = False) -> sqlite3.Row | dict[str, Any]:
     row = fetch_server(server_id)
     if row and not row["deleted"]:
+        live_row = await refresh_tracked_server(row)
+        if not live_row:
+            raise RuntimeError("This server no longer exists on the Pterodactyl panel, so it was removed from active bot lists.")
         if allow_admin and interaction.guild is not None and is_admin(interaction.user):
-            return row
-        if str(interaction.user.id) == row["discord_user_id"]:
-            return row
+            return live_row
+        if str(interaction.user.id) == live_row["discord_user_id"]:
+            return live_row
         raise RuntimeError("You can only control your own servers. Use `/admin manage` for staff access to other users' servers.")
     if allow_admin and interaction.guild is not None and is_admin(interaction.user):
         try:
@@ -912,7 +985,7 @@ tree.add_command(admin_group)
 @tree.command(name="list", description="List your servers")
 async def list_mine(interaction: discord.Interaction) -> None:
     await interaction.response.defer()
-    rows = fetch_user_servers(interaction.user.id)
+    rows = await refresh_user_servers(interaction.user.id)
     if not rows:
         await interaction.followup.send(embed=branded_embed("Your Servers", "No servers found."))
         return
