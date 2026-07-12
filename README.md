@@ -57,6 +57,20 @@ sudo FIREWALL_ENABLED=true ./install-or-run.sh install
 
 Temporary blocks are applied without restarting the Node.js process, which helps preserve the no-downtime policy while active attacks are being mitigated.
 
+
+## Standalone Python all-in-one guard
+
+`ddos_guard.py` is a single-file stdlib-only runner/installer/uninstaller for servers where you want one file to do everything:
+
+```bash
+python3 ddos_guard.py ports
+sudo python3 ddos_guard.py install --game-protocol auto --firewall
+python3 ddos_guard.py run --game-protocol auto
+sudo python3 ddos_guard.py uninstall
+```
+
+The Python guard auto-detects the default IPv4 interface and public IPv4 address using `ip route`/`ip addr`. If it cannot detect one and is running interactively, it asks for the interface name; otherwise it safely binds to `0.0.0.0`. Its game filter supports `auto`, `source`, `minecraft`, `raknet`/`bedrock`, `samp`, `fivem`, `teamspeak3`, and `genericudp`.
+
 ## Layer 7 usage
 
 ```js

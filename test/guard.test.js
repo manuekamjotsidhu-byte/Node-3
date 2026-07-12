@@ -55,3 +55,11 @@ test('temporary subnet blocker blocks and expires attacking subnets', () => {
   assert.equal(blocker.isBlocked('203.0.113.99'), false);
   assert.deepEqual(actions, [['block', '203.0.113.0/24'], ['unblock', '203.0.113.0/24']]);
 });
+
+
+test('expanded game protocol filters accept common game query families', () => {
+  assert.equal(validateGamePacket(Buffer.concat([Buffer.from([0x05]), Buffer.alloc(15), Buffer.from('00ffff00fefefefefdfdfdfd12345678', 'hex')]), 'raknet').allowed, true);
+  assert.equal(validateGamePacket(Buffer.concat([Buffer.from('SAMP'), Buffer.alloc(7)]), 'samp').allowed, true);
+  assert.equal(validateGamePacket(Buffer.from('getinfo xxx'), 'fivem').allowed, true);
+  assert.equal(validateGamePacket(Buffer.from('TS3INIT1'), 'teamspeak3').allowed, true);
+});

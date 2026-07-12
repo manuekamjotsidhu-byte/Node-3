@@ -1,6 +1,10 @@
 const A2S_INFO_PREFIX = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x54]);
 const A2S_PLAYER_PREFIX = Buffer.from([0xff, 0xff, 0xff, 0xff, 0x55]);
 const MINECRAFT_LEGACY_PING = Buffer.from([0xfe, 0x01]);
+const RAKNET_MAGIC = Buffer.from('00ffff00fefefefefdfdfdfd12345678', 'hex');
+const SAMP_PREFIX = Buffer.from('SAMP');
+const FIVEM_INFO = Buffer.from('getinfo xxx');
+const TEAMSPEAK3_PREFIX = Buffer.from('TS3INIT1');
 
 export const GAME_PROTOCOLS = {
   source: {
@@ -16,6 +20,36 @@ export const GAME_PROTOCOLS = {
     validate(packet) {
       return startsWith(packet, MINECRAFT_LEGACY_PING) || isLikelyMinecraftHandshake(packet);
     },
+  },
+  raknet: {
+    minBytes: 17,
+    maxBytes: 1500,
+    validate(packet) { return [0x05, 0x06, 0x07, 0x1c].includes(packet[0]) && packet.subarray(0, 40).includes(RAKNET_MAGIC); },
+  },
+  bedrock: {
+    minBytes: 17,
+    maxBytes: 1500,
+    validate(packet) { return GAME_PROTOCOLS.raknet.validate(packet); },
+  },
+  samp: {
+    minBytes: 11,
+    maxBytes: 512,
+    validate(packet) { return startsWith(packet, SAMP_PREFIX); },
+  },
+  fivem: {
+    minBytes: 8,
+    maxBytes: 1400,
+    validate(packet) { return startsWith(Buffer.from(packet.toString('utf8').toLowerCase()), FIVEM_INFO) || startsWith(packet, Buffer.from([0xff, 0xff, 0xff, 0xff, 0x67])); },
+  },
+  teamspeak3: {
+    minBytes: 4,
+    maxBytes: 512,
+    validate(packet) { return startsWith(packet, TEAMSPEAK3_PREFIX) || startsWith(packet, Buffer.from([0x05, 0xca, 0x7f, 0x16])); },
+  },
+  auto: {
+    minBytes: 1,
+    maxBytes: 1500,
+    validate(packet) { return ['source', 'minecraft', 'raknet', 'samp', 'fivem', 'teamspeak3'].some(name => GAME_PROTOCOLS[name].validate(packet)); },
   },
   genericUdp: {
     minBytes: 1,
