@@ -13,7 +13,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - No panel user creation: the Pterodactyl user must already exist, and admins provide the panel email during creation.
 - Only configured owners/admin roles can create, purge, whitelist, or view management data. Admin commands are guild-only and are intentionally hidden/blocked in DMs; DMs only expose user-safe commands for linked servers.
 - Admins select a deployment node by name/ID with slash-command autocomplete.
-- Admins create either `/create-free` or `/create-paid` servers with custom time, nest, egg, node, RAM, disk, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
+- Admins create either `/create-free` or `/create-paid` servers with custom `time`, nest, egg, node, RAM/Disk entered in GB, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`.
 - `/purge` deletes tracked free servers only; paid and whitelisted servers are skipped.
 - Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
@@ -28,7 +28,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
-Commands are synced globally for user-safe DM commands and to your configured guild for admin commands. If commands do not appear, restart the bot after updating `config.json`; the startup log prints how many global/DM and guild commands synced.
+Commands are synced globally once for both guild and DM visibility, and the bot clears old guild-only copies to prevent duplicate slash commands. If old duplicates remain, restart the bot once and wait for Discord global command propagation.
 
 
 ```bash
@@ -42,8 +42,8 @@ python bot.py
 
 ## Slash commands
 
-- `/create-free` - admin-only free server creation with linked Discord user, name, specs, nest, egg, node, days, and optional feature limits.
-- `/create-paid` - admin-only paid server creation with duration, nest/egg/spec customization, automatic whitelist, and paid logging.
+- `/create-free` - admin-only free server creation with linked Discord user, name, RAM/Disk in GB, specs, nest, egg, node, `time` duration, and optional feature limits.
+- `/create-paid` - admin-only paid server creation with `time` duration, RAM/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging.
 - `/admin list` - admin-only organized embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
 - `/list` - users list their own servers; admins see all tracked servers in guilds.
 - `/manage` - users open a premium control panel for one linked server with live resource usage and start/stop/restart/kill buttons.
@@ -53,6 +53,7 @@ python bot.py
 - `/rename` - users rename their own linked server.
 - `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.
 - `/renew` - guild admin-only renewal command that extends server expiration by a time such as `30d`.
+- `/delete` - guild admin-only command to delete one specific tracked server with `confirm:True`.
 - `/resize` - guild admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.
 - `/suspend` and `/unsuspend` - admin-only suspension controls. `/suspend` can suspend a direct server, show a selectable menu by Discord user/email, or bulk suspend all except paid/whitelisted servers.
 - `/stopall` - admin-only stop for all tracked servers except whitelisted servers.
@@ -66,7 +67,7 @@ python bot.py
 
 ## Pterodactyl notes
 
-Use a Pterodactyl **Application API** key in `panel_api_key` and a **Client API** key in `client_api_key`. The Application key handles search/create/resize/suspend/delete/list operations; the Client key handles power signals and backups for tracked server identifiers.
+Use a Pterodactyl **Application API** key in `panel_api_key` and a **Client API** key in `client_api_key`. The Application key handles search/create/resize/suspend/delete/list operations; the Client key handles power signals, rename, console commands, resources, and backups for tracked server identifiers.
 
 The bot does **not** create panel users and does **not** use default eggs. Admins must run `/link` for the Discord user first; if `/create-free` or `/create-paid` is used for an unlinked Discord user, the bot stops with an admin-visible error. Admins must select a nest first, then select an egg from that nest; startup, Docker image, and default egg variables are read from the Pterodactyl panel. Server creation uses an available allocation from the selected node instead of blind automatic deployment.
 

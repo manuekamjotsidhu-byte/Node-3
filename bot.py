@@ -639,8 +639,13 @@ class SuspendSelect(discord.ui.View):
         await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
 
 
-async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int, allocations: int, backups: int) -> None:
+async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int, allocations: int, backups: int) -> None:
     await interaction.response.defer(ephemeral=True)
+    if ram <= 0 or disk <= 0 or cpu <= 0:
+        raise RuntimeError("RAM, disk, and CPU must be positive numbers.")
+    ram_mb = ram * 1024
+    disk_mb = disk * 1024
+    duration_seconds = parse_duration(time)
     node_id = parse_id(node)
     nest_id = parse_id(nest)
     egg_id = parse_id(egg)
@@ -655,8 +660,8 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         raise RuntimeError("Discord user is not linked. Use /link first.")
     panel_email = link["email"]
     panel_user = {"id": link["panel_user_id"]}
-    expires_at = utc_now() + timedelta(days=days)
-    server = await ptero.create_server(panel_user_id=panel_user["id"], name=name, ram=ram, disk=disk, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
+    expires_at = utc_now() + timedelta(seconds=duration_seconds)
+    server = await ptero.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
     server_id = str(server["id"])
     record = {
         "server_id": server_id,
@@ -667,8 +672,8 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         "name": name,
         "uuid": server.get("uuid"),
         "identifier": server.get("identifier"),
-        "ram": ram,
-        "disk": disk,
+        "ram": ram_mb,
+        "disk": disk_mb,
         "cpu": cpu,
         "nest_id": nest_id,
         "nest_name": nest_name,
@@ -695,33 +700,41 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         with db() as connection:
             connection.execute("INSERT OR IGNORE INTO whitelist(server_id) VALUES (?)", (server_id,))
 
-    dm_embed = specs_embed(plan, name, ram, disk, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
+    dm_embed = specs_embed(plan, name, ram_mb, disk_mb, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
     try:
         await user.send(embed=dm_embed)
         await user.send(embed=trustpilot_embed())
     except discord.Forbidden:
         pass
 
-    created = branded_embed("Server Created", f"**{name}** was created for {user.mention}.\nServer ID: `{server_id}`\nUUID: `{server.get('uuid', 'unknown')}`\nExpires: <t:{int(expires_at.timestamp())}:R>", 0x2ecc71)
+    created = branded_embed("Server Created", f"**{name}** was created for {user.mention}.", 0x2ecc71)
+    created.add_field(name="Server", value=f"ID: `{server_id}`\nUUID: `{server.get('uuid', 'unknown')}`", inline=False)
+    created.add_field(name="Owner", value=f"Discord: {user.mention}\nEmail: `{panel_email}`", inline=True)
+    created.add_field(name="Specs", value=f"RAM: **{ram_mb:,} MB** ({ram} GB)\nDisk: **{disk_mb:,} MB** ({disk} GB)\nCPU: **{cpu}%**", inline=True)
+    created.add_field(name="Deployment", value=f"Node: **{node_name}**\nNest: **{nest_name}**\nEgg: **{egg_name}**", inline=False)
+    created.add_field(name="Extras", value=f"Databases: **{databases}**\nAllocations: **{allocations}**\nBackups: **{backups}**", inline=True)
+    created.add_field(name="Expiration", value=f"<t:{int(expires_at.timestamp())}:F>\n<t:{int(expires_at.timestamp())}:R>", inline=True)
     await interaction.followup.send(embed=created, ephemeral=True)
 
     if plan == "paid":
         channel = client.get_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))) or await client.fetch_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID)))
-        await channel.send(embed=branded_embed("Paid Server Created", f"Discord User: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nServer: **{name}** (`{server_id}`)\nSpecs: {ram}MB RAM / {disk}MB Disk / {cpu}% CPU\nExtras: DB {databases} / Alloc {allocations} / Backups {backups}\nNode: {node_name}\nNext renewal: <t:{int(expires_at.timestamp())}:F>", 0xf1c40f))
+        await channel.send(embed=branded_embed("Paid Server Created", f"Discord User: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nServer: **{name}** (`{server_id}`)\nSpecs: {ram_mb}MB RAM / {disk_mb}MB Disk / {cpu}% CPU\nExtras: DB {databases} / Alloc {allocations} / Backups {backups}\nNode: {node_name}\nNext renewal: <t:{int(expires_at.timestamp())}:F>", 0xf1c40f))
 
 
 @tree.command(name="create-free", description="Create free server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int = 30, databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
-    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
+@app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
+async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
+    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
 
 
 @tree.command(name="create-paid", description="Create paid server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, days: int, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
-    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, days, databases, allocations, backups)
+@app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
+async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
+    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
 
 
 @tree.command(name="link", description="Link panel email")
@@ -854,6 +867,25 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
     except Exception:
         pass
     await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{row['name']}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>"), ephemeral=True)
+
+
+@tree.command(name="delete", description="Admin delete one server")
+@admin_only()
+@app_commands.autocomplete(server=tracked_server_autocomplete)
+async def delete(interaction: discord.Interaction, server: str, confirm: bool = False) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = fetch_server(server)
+    if not row:
+        raise RuntimeError("Unknown tracked server.")
+    if not confirm:
+        await interaction.followup.send(embed=branded_embed("Confirm Delete", f"Run `/delete server:{server} confirm:True` to permanently delete **{row['name']}**.", 0xffcc00), ephemeral=True)
+        return
+    await ptero.delete_server(server)
+    with db() as connection:
+        connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (server,))
+    database.get("servers", {}).pop(server, None)
+    save_database()
+    await interaction.followup.send(embed=branded_embed("Server Deleted", f"Deleted **{row['name']}** (`{server}`).", 0xe74c3c), ephemeral=True)
 
 
 @tree.command(name="power", description="Power server")
@@ -1100,7 +1132,7 @@ def configure_command_visibility() -> None:
     installs = app_commands.AppInstallationType(guild=True, user=True)
     admin_command_names = {
         "admin", "create-free", "create-paid", "link", "resize", "suspend", "unsuspend", "stopall",
-        "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew",
+        "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew", "delete",
     }
 
     def apply(command: app_commands.Command[Any, ..., Any] | app_commands.Group, admin_only_command: bool = False) -> None:
@@ -1135,9 +1167,9 @@ async def on_ready() -> None:
     guild_id = config.get("guild_id")
     if guild_id:
         guild = discord.Object(id=int(guild_id))
-        tree.copy_global_to(guild=guild)
-        guild_commands = await tree.sync(guild=guild)
-        print(f"Synced {len(guild_commands)} guild commands and {len(global_commands)} global/DM commands.")
+        tree.clear_commands(guild=guild)
+        cleared_guild_commands = await tree.sync(guild=guild)
+        print(f"Synced {len(global_commands)} global/DM commands and cleared {len(cleared_guild_commands)} guild-only duplicates.")
     else:
         print(f"Synced {len(global_commands)} global/DM commands.")
     if not suspend_expired_servers.is_running():
