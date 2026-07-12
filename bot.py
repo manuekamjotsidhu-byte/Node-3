@@ -623,13 +623,14 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
     rows: list[sqlite3.Row | dict[str, Any]] = list(fetch_all_servers())
     seen = {str(row["server_id"]) for row in rows}
     try:
-        for server in await ptero.list_servers():
+        panel_servers = ptero.server_cache or await asyncio.wait_for(ptero.list_servers(), timeout=2.5)
+        for server in panel_servers:
             server_id = str(server.get("id"))
             if server_id not in seen:
                 rows.append(panel_server_record(server))
                 seen.add(server_id)
     except Exception as error:
-        print(f"Failed to include panel servers in admin autocomplete: {error}")
+        print(f"Failed to include panel servers in admin autocomplete quickly: {error}")
     return row_server_choices(current, rows)
 
 
@@ -1144,26 +1145,30 @@ async def schedule_restart(interaction: discord.Interaction, time: str, server: 
 @app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def renew(interaction: discord.Interaction, server: str, time: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    row = fetch_server(server)
-    if not row:
-        raise RuntimeError("Unknown tracked server.")
+    row = await ensure_server_access(interaction, server, allow_admin=True)
+    tracked_row = fetch_server(server)
     seconds = parse_duration(time)
-    current_expiry = datetime.fromisoformat(row["expires_at"])
+    stored_expiry = record_value(row, "expires_at")
+    current_expiry = datetime.fromisoformat(str(stored_expiry)) if stored_expiry else utc_now()
     base = current_expiry if current_expiry > utc_now() else utc_now()
     new_expiry = base + timedelta(seconds=seconds)
-    with db() as connection:
-        connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1 WHERE server_id=?", (new_expiry.isoformat(), server))
+    if tracked_row:
+        with db() as connection:
+            connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1 WHERE server_id=?", (new_expiry.isoformat(), server))
     saga_synced = await ptero.set_saga_auto_suspend(server, new_expiry)
     try:
         await ptero.unsuspend_server(server)
     except RuntimeError:
         pass
-    try:
-        user = await client.fetch_user(int(row["discord_user_id"]))
-        await user.send(embed=branded_embed("Service Renewed", f"Your server **{row['name']}** was renewed until <t:{int(new_expiry.timestamp())}:F>."))
-    except Exception:
-        pass
-    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{row['name']}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
+    discord_user_id = record_value(row, "discord_user_id")
+    if discord_user_id:
+        try:
+            user = await client.fetch_user(int(discord_user_id))
+            await user.send(embed=branded_embed("Service Renewed", f"Your server **{record_value(row, 'name', server)}** was renewed until <t:{int(new_expiry.timestamp())}:F>."))
+        except Exception:
+            pass
+    tracking_note = "Local DB updated" if tracked_row else "Panel/Saga updated only (server is not locally tracked)"
+    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
 
 
 @tree.command(name="delete", description="Admin delete one server")
