@@ -783,7 +783,7 @@ tree.add_command(admin_group)
 @tree.command(name="list", description="List your servers")
 async def list_mine(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    rows = fetch_all_servers() if is_admin(interaction.user) else fetch_user_servers(interaction.user.id)
+    rows = fetch_user_servers(interaction.user.id)
     await interaction.followup.send(embed=branded_embed("Your Servers", "\n".join(server_row_to_line(row) for row in rows[:25]) or "No servers found."), ephemeral=True)
 
 
