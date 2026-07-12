@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""Standalone Node-3 DDoS Guard.
+"""Single-file VPS DDoS guard.
 
-One file that can run, install, uninstall, and inspect a VPS-level Layer 4/Layer 7
-protection service with game protocol filtering. It uses only Python stdlib.
+One .py file only. It creates its own runtime folders/config in the current
+working directory, can run/install/uninstall itself, protects Layer 4 UDP game
+traffic and Layer 7 HTTP traffic, keeps SSH (22) and uploads on HTTP (8080)
+whitelisted, and uses only the Python standard library.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.server
 import ipaddress
 import json
 import os
 import re
-import selectors
 import shutil
 import signal
 import socket
@@ -20,28 +22,49 @@ import socketserver
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unittest
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-APP_NAME = os.environ.get("APP_NAME", "node-3-ddos-guard-py")
-INSTALL_PATH = Path(os.environ.get("INSTALL_PATH", f"/opt/{APP_NAME}/ddos_guard.py"))
+APP_NAME = os.environ.get("APP_NAME", "node3-ddos-guard")
 SERVICE_NAME = os.environ.get("SERVICE_NAME", APP_NAME)
-ENV_PATH = Path(os.environ.get("ENV_PATH", f"/etc/{APP_NAME}.env"))
-
+DEFAULT_WHITELIST_PORTS = {22, 8080}
 SOURCE_PREFIXES = (b"\xff\xff\xff\xffT", b"\xff\xff\xff\xffU", b"\xff\xff\xff\xffV", b"\xff\xff\xff\xffW")
-RAKNET_UNCONNECTED = (b"\x05", b"\x06", b"\x07", b"\x1c")
+RAKNET_UNCONNECTED = (0x05, 0x06, 0x07, 0x1C)
 RAKNET_MAGIC = bytes.fromhex("00ffff00fefefefefdfdfdfd12345678")
-SAMP_QUERY = b"SAMP"
-FIVEM_QUERY = b"getinfo xxx"
-TEAMSPEAK3_PREFIX = b"TS3INIT1"
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
+def app_paths(base_dir: Path) -> dict[str, Path]:
+    state = base_dir / ".node3_ddos_guard"
+    return {
+        "state": state,
+        "uploads": state / "uploads",
+        "logs": state / "logs",
+        "config": state / "config.json",
+        "installed_script": state / "ddos_guard.py",
+    }
+
+
+def ensure_current_dir_files(base_dir: Path, args: argparse.Namespace) -> dict[str, Path]:
+    paths = app_paths(base_dir)
+    for key in ("state", "uploads", "logs"):
+        paths[key].mkdir(parents=True, exist_ok=True)
+    config = {
+        "http_port": args.http_port,
+        "udp_port": args.udp_port,
+        "game_protocol": args.game_protocol,
+        "whitelist_ports": sorted(set(args.whitelist_port) | DEFAULT_WHITELIST_PORTS),
+        "max_upload_bytes": args.max_upload_bytes,
+        "created_by": "ddos_guard.py",
+    }
+    if not paths["config"].exists():
+        paths["config"].write_text(json.dumps(config, indent=2) + "\n")
+    return paths
 
 
 class TokenBucket:
@@ -75,13 +98,6 @@ class RateLimiter:
             self.buckets[key] = (bucket, time.monotonic())
             return bucket.take(cost)
 
-    def cleanup(self) -> None:
-        cutoff = time.monotonic() - self.ttl_sec
-        with self.lock:
-            for key, (_, seen) in list(self.buckets.items()):
-                if seen < cutoff:
-                    self.buckets.pop(key, None)
-
 
 @dataclass
 class PacketVerdict:
@@ -91,8 +107,6 @@ class PacketVerdict:
 
 
 class GameProtocolFilter:
-    """Protocol-aware UDP validation for common game protocols."""
-
     def __init__(self, protocol: str = "auto", min_len: int = 1, max_len: int = 1500) -> None:
         self.protocol = protocol.lower()
         self.min_len = min_len
@@ -122,7 +136,8 @@ class GameProtocolFilter:
         check = checks.get(self.protocol)
         if not check:
             return PacketVerdict(False, "unsupported_protocol", self.protocol)
-        return PacketVerdict(bool(check(packet)), "ok" if check(packet) else "protocol_mismatch", self.protocol)
+        ok = check(packet)
+        return PacketVerdict(ok, "ok" if ok else "protocol_mismatch", self.protocol)
 
 
 def is_source_query(packet: bytes) -> bool:
@@ -130,54 +145,54 @@ def is_source_query(packet: bytes) -> bool:
 
 
 def is_minecraft_query(packet: bytes) -> bool:
-    if packet.startswith(b"\xfe\x01") or packet.startswith(b"\xfe"):
-        return True
-    if 3 <= len(packet) <= 512 and packet[1] == 0x00 and 0 < packet[0] <= len(packet) - 1:
-        return True
-    return False
+    return packet.startswith(b"\xfe") or (3 <= len(packet) <= 512 and packet[1] == 0x00 and 0 < packet[0] <= len(packet) - 1)
 
 
 def is_raknet_query(packet: bytes) -> bool:
-    return len(packet) >= 17 and packet[:1] in RAKNET_UNCONNECTED and RAKNET_MAGIC in packet[:40]
+    return len(packet) >= 17 and packet[0] in RAKNET_UNCONNECTED and RAKNET_MAGIC in packet[:40]
 
 
 def is_samp_query(packet: bytes) -> bool:
-    return len(packet) >= 11 and packet.startswith(SAMP_QUERY)
+    return len(packet) >= 11 and packet.startswith(b"SAMP")
 
 
 def is_fivem_query(packet: bytes) -> bool:
-    return packet.lower().startswith(FIVEM_QUERY) or packet.startswith(b"\xff\xff\xff\xffgetinfo")
+    return packet.lower().startswith(b"getinfo xxx") or packet.startswith(b"\xff\xff\xff\xffgetinfo")
 
 
 def is_teamspeak3_query(packet: bytes) -> bool:
-    return packet.startswith(TEAMSPEAK3_PREFIX) or packet.startswith(b"\x05\xca\x7f\x16")
+    return packet.startswith(b"TS3INIT1") or packet.startswith(b"\x05\xca\x7f\x16")
 
 
 class TemporarySubnetBlocker:
-    def __init__(self, threshold: int = 25, window_sec: int = 10, block_sec: int = 600, prefix: int = 24, firewall: bool = False) -> None:
+    def __init__(self, threshold: int = 25, window_sec: int = 10, block_sec: int = 600, prefix: int = 24, firewall: bool = False, whitelist_ports: set[int] | None = None) -> None:
         self.threshold = threshold
         self.window_sec = window_sec
         self.block_sec = block_sec
         self.prefix = prefix
         self.firewall = firewall
+        self.whitelist_ports = set(whitelist_ports or DEFAULT_WHITELIST_PORTS) | DEFAULT_WHITELIST_PORTS
         self.events: dict[str, deque[float]] = defaultdict(deque)
         self.blocks: dict[str, tuple[float, str]] = {}
         self.lock = threading.Lock()
 
     def subnet(self, ip: str) -> str:
-        try:
-            address = ipaddress.ip_address(ip)
-            network = ipaddress.ip_network(f"{address}/{self.prefix if address.version == 4 else 64}", strict=False)
-            return str(network)
-        except ValueError:
-            return ip
+        address = ipaddress.ip_address(ip)
+        prefix = self.prefix if address.version == 4 else 64
+        return str(ipaddress.ip_network(f"{address}/{prefix}", strict=False))
 
     def is_blocked(self, ip: str) -> bool:
         self.cleanup()
-        return self.subnet(ip) in self.blocks
+        try:
+            return self.subnet(ip) in self.blocks
+        except ValueError:
+            return False
 
     def record(self, ip: str, reason: str) -> bool:
-        subnet = self.subnet(ip)
+        try:
+            subnet = self.subnet(ip)
+        except ValueError:
+            return False
         current = time.monotonic()
         with self.lock:
             if subnet in self.blocks:
@@ -201,14 +216,19 @@ class TemporarySubnetBlocker:
                 if expires <= current:
                     self.blocks.pop(subnet, None)
                     self._firewall_del(subnet)
-                    print(f"[unblock] expired subnet block {subnet}", flush=True)
+
+    def ensure_whitelist(self) -> None:
+        if not self.firewall:
+            return
+        for port in sorted(self.whitelist_ports):
+            ensure_iptables_rule(["INPUT", "-p", "tcp", "--dport", str(port), "-j", "ACCEPT"])
 
     def _firewall_add(self, subnet: str) -> None:
         if not self.firewall:
             return
+        self.ensure_whitelist()
         run(["ipset", "create", "node3_ddos_temp", "hash:net", "timeout", "0", "-exist"], check=False)
-        if run(["iptables", "-C", "INPUT", "-m", "set", "--match-set", "node3_ddos_temp", "src", "-j", "DROP"], check=False).returncode != 0:
-            run(["iptables", "-I", "INPUT", "-m", "set", "--match-set", "node3_ddos_temp", "src", "-j", "DROP"], check=False)
+        ensure_iptables_rule(["INPUT", "-m", "set", "--match-set", "node3_ddos_temp", "src", "-j", "DROP"])
         run(["ipset", "add", "node3_ddos_temp", subnet, "timeout", str(self.block_sec), "-exist"], check=False)
 
     def _firewall_del(self, subnet: str) -> None:
@@ -219,24 +239,34 @@ class TemporarySubnetBlocker:
 class GuardHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     limiter: RateLimiter
     blocker: TemporarySubnetBlocker
+    upload_dir: Path
+    max_upload_bytes: int = 100 * 1024 * 1024
     max_body: int = 1_000_000
     bad_paths = [re.compile(p, re.I) for p in (r"\.env$", r"wp-login\.php", r"xmlrpc\.php", r"/\.git/")]
-    bad_agents = [re.compile(p, re.I) for p in (r"sqlmap", r"masscan", r"nikto", r"zgrab")]
+    bad_agents = [re.compile(p, re.I) for p in (r"sqlmap", r"masscan", r"nikto", r"zgrab", r"masscan")]
 
-    def do_GET(self) -> None: self._handle()
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            return self._json(200, {"ok": True})
+        self._handle()
+
     def do_HEAD(self) -> None: self._handle(body=False)
-    def do_POST(self) -> None: self._handle()
-    def do_PUT(self) -> None: self._handle()
+    def do_PUT(self) -> None: self._upload()
+    def do_POST(self) -> None:
+        if self.path.startswith("/upload"):
+            return self._upload()
+        self._handle()
     def do_PATCH(self) -> None: self._handle()
     def do_DELETE(self) -> None: self._handle()
     def do_OPTIONS(self) -> None: self._handle()
 
     def _handle(self, body: bool = True) -> None:
         ip = self.client_address[0]
+        reason = self._blocked_reason(ip)
+        if reason:
+            return self._deny(403, reason)
         length = int(self.headers.get("content-length", "0") or 0)
         ua = self.headers.get("user-agent", "")
-        if self.blocker.is_blocked(ip):
-            return self._deny(403, "subnet_blocked")
         if length > self.max_body:
             return self._attack(ip, 413, "payload_too_large")
         if any(rx.search(self.path) for rx in self.bad_paths):
@@ -245,26 +275,56 @@ class GuardHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._attack(ip, 403, "blocked_user_agent")
         if not self.limiter.allow(f"{ip}:{self.command}:{self.path}"):
             return self._attack(ip, 429, "rate_limited")
-        payload = json.dumps({"ok": True, "guard": "pass"}).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
-        self.end_headers()
-        if body:
-            self.wfile.write(payload)
+        self._json(200, {"ok": True, "guard": "pass"}, body=body)
+
+    def _upload(self) -> None:
+        ip = self.client_address[0]
+        reason = self._blocked_reason(ip)
+        if reason:
+            return self._deny(403, reason)
+        if self.server.server_port != 8080:
+            return self._attack(ip, 403, "uploads_only_allowed_on_8080")
+        if not self.limiter.allow(f"upload:{ip}", cost=5):
+            return self._attack(ip, 429, "upload_rate_limited")
+        length = int(self.headers.get("content-length", "0") or 0)
+        if length <= 0 or length > self.max_upload_bytes:
+            return self._attack(ip, 413, "upload_size_rejected")
+        filename = safe_filename(self.headers.get("x-filename") or f"upload-{int(time.time())}.bin")
+        digest = hashlib.sha256(f"{ip}:{time.time()}:{filename}".encode()).hexdigest()[:16]
+        target = self.upload_dir / f"{digest}-{filename}"
+        remaining = length
+        with target.open("wb") as fh:
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                fh.write(chunk)
+        if remaining:
+            target.unlink(missing_ok=True)
+            return self._attack(ip, 400, "upload_incomplete")
+        self._json(201, {"ok": True, "stored": str(target), "bytes": length})
+
+    def _blocked_reason(self, ip: str) -> Optional[str]:
+        return "subnet_blocked" if self.blocker.is_blocked(ip) else None
 
     def _attack(self, ip: str, status: int, reason: str) -> None:
         self.blocker.record(ip, reason)
         self._deny(status, reason)
 
     def _deny(self, status: int, reason: str) -> None:
-        payload = json.dumps({"error": reason}).encode()
+        self._json(status, {"error": reason}, headers={"x-ddos-guard": reason})
+
+    def _json(self, status: int, payload: dict[str, object], body: bool = True, headers: dict[str, str] | None = None) -> None:
+        data = json.dumps(payload).encode()
         self.send_response(status)
-        self.send_header("x-ddos-guard", reason)
         self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(payload)))
+        self.send_header("content-length", str(len(data)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(payload)
+        if body:
+            self.wfile.write(data)
 
     def log_message(self, fmt: str, *args: object) -> None:
         print(f"[http] {self.client_address[0]} {fmt % args}", flush=True)
@@ -290,7 +350,7 @@ class UDPGuard(threading.Thread):
     def run(self) -> None:
         self.sock.bind((self.host, self.port))
         self.running.set()
-        print(f"[udp] Layer 4 game guard listening on {self.host}:{self.port} protocol={self.filter.protocol}", flush=True)
+        print(f"[udp] listening {self.host}:{self.port} game_protocol={self.filter.protocol}", flush=True)
         while self.running.is_set():
             try:
                 packet, addr = self.sock.recvfrom(2048)
@@ -302,8 +362,6 @@ class UDPGuard(threading.Thread):
             verdict = self.filter.validate(packet)
             if not verdict.allowed or not self.limiter.allow(f"{ip}:{src_port}"):
                 self.blocker.record(ip, verdict.reason if not verdict.allowed else "rate_limited")
-                continue
-            print(f"[udp] allowed {len(packet)}B from {ip}:{src_port} protocol={verdict.protocol}", flush=True)
 
     def stop(self) -> None:
         self.running.clear()
@@ -322,9 +380,8 @@ def auto_interface() -> tuple[str, str]:
     if candidates:
         return candidates[0]
     if sys.stdin.isatty():
-        iface = input("Could not auto-detect the public IPv4 interface. Enter interface name: ").strip()
-        ip = interface_ipv4(iface) or "0.0.0.0"
-        return iface, ip
+        iface = input("Could not auto-detect public IPv4 interface. Enter interface name: ").strip()
+        return iface, interface_ipv4(iface) or "0.0.0.0"
     print("[warn] could not auto-detect public interface; binding to 0.0.0.0", flush=True)
     return "0.0.0.0", "0.0.0.0"
 
@@ -339,7 +396,8 @@ def public_ipv4_candidates() -> list[tuple[str, str]]:
     result = run(["ip", "-o", "-4", "addr", "show", "scope", "global"], check=False, capture=True).stdout
     found = []
     for line in result.splitlines():
-        iface = line.split()[1]
+        fields = line.split()
+        iface = fields[1] if len(fields) > 1 else "unknown"
         match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/", line)
         if match and not ipaddress.ip_address(match.group(1)).is_private:
             found.append((iface, match.group(1)))
@@ -366,50 +424,65 @@ def discover_ports() -> list[dict[str, object]]:
 
 def monitor_ports(stop: threading.Event, interval: int) -> None:
     while not stop.is_set():
-        print("[ports] listening sockets:", json.dumps(discover_ports()), flush=True)
+        print("[ports]", json.dumps(discover_ports()), flush=True)
         stop.wait(interval)
 
 
+def safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", Path(name).name)[:128]
+    return cleaned or "upload.bin"
+
+
+def ensure_iptables_rule(rule: list[str]) -> None:
+    if run(["iptables", "-C", *rule], check=False).returncode != 0:
+        run(["iptables", "-I", *rule], check=False)
+
+
 def run_guard(args: argparse.Namespace) -> None:
+    base_dir = Path.cwd()
+    paths = ensure_current_dir_files(base_dir, args)
     iface, detected_ip = auto_interface()
     bind_host = args.bind or "0.0.0.0"
-    print(f"[iface] selected={iface} ipv4={detected_ip} bind={bind_host}", flush=True)
-    blocker = TemporarySubnetBlocker(args.subnet_threshold, args.subnet_window, args.subnet_block_seconds, firewall=args.firewall)
+    whitelist_ports = set(args.whitelist_port) | DEFAULT_WHITELIST_PORTS
+    blocker = TemporarySubnetBlocker(args.subnet_threshold, args.subnet_window, args.subnet_block_seconds, firewall=args.firewall, whitelist_ports=whitelist_ports)
+    blocker.ensure_whitelist()
+    print(f"[init] cwd={base_dir} state={paths['state']} interface={iface} ipv4={detected_ip} whitelist_ports={sorted(whitelist_ports)}", flush=True)
     stop = threading.Event()
     threading.Thread(target=monitor_ports, args=(stop, args.port_scan_interval), daemon=True).start()
     udp = UDPGuard(bind_host, args.udp_port, args.game_protocol, RateLimiter(args.udp_capacity, args.udp_refill), blocker)
     udp.start()
     GuardHTTPRequestHandler.limiter = RateLimiter(args.http_capacity, args.http_refill)
     GuardHTTPRequestHandler.blocker = blocker
-    GuardHTTPRequestHandler.max_body = args.max_body
+    GuardHTTPRequestHandler.upload_dir = paths["uploads"]
+    GuardHTTPRequestHandler.max_upload_bytes = args.max_upload_bytes
     httpd = ThreadedHTTPServer((bind_host, args.http_port), GuardHTTPRequestHandler)
 
     def shutdown(_signum: int, _frame: object) -> None:
         stop.set(); udp.stop(); httpd.shutdown()
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
-    print(f"[http] Layer 7 guard listening on {bind_host}:{args.http_port}", flush=True)
+    print(f"[http] listening {bind_host}:{args.http_port}; uploads accepted only on port 8080 at /upload", flush=True)
     httpd.serve_forever()
 
 
 def install(args: argparse.Namespace) -> None:
     if os.geteuid() != 0:
         raise SystemExit("install must run as root")
-    INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(Path(__file__), INSTALL_PATH)
-    INSTALL_PATH.chmod(0o755)
-    ENV_PATH.write_text(
-        f"HTTP_PORT={args.http_port}\nUDP_PORT={args.udp_port}\nGAME_PROTOCOL={args.game_protocol}\nFIREWALL_ENABLED={'true' if args.firewall else 'false'}\n"
-    )
+    base_dir = Path.cwd()
+    paths = ensure_current_dir_files(base_dir, args)
+    shutil.copy2(Path(__file__), paths["installed_script"])
+    paths["installed_script"].chmod(0o755)
+    firewall = "--firewall" if args.firewall else ""
+    whitelist = " ".join(f"--whitelist-port {p}" for p in sorted(set(args.whitelist_port) | DEFAULT_WHITELIST_PORTS))
     service = f"""[Unit]
-Description=Standalone Python Node-3 DDoS Guard
+Description=Single-file Node3 DDoS Guard
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile={ENV_PATH}
-ExecStart={sys.executable} {INSTALL_PATH} run --http-port ${{HTTP_PORT}} --udp-port ${{UDP_PORT}} --game-protocol ${{GAME_PROTOCOL}} {'--firewall' if args.firewall else ''}
+WorkingDirectory={base_dir}
+ExecStart={sys.executable} {paths['installed_script']} run --http-port {args.http_port} --udp-port {args.udp_port} --game-protocol {args.game_protocol} --max-upload-bytes {args.max_upload_bytes} {whitelist} {firewall}
 Restart=always
 RestartSec=2
 StartLimitIntervalSec=0
@@ -424,7 +497,7 @@ WantedBy=multi-user.target
     run(["systemctl", "daemon-reload"])
     run(["systemctl", "enable", f"{SERVICE_NAME}.service"])
     run(["systemctl", "restart", f"{SERVICE_NAME}.service"])
-    print(f"installed {SERVICE_NAME}.service from {INSTALL_PATH}")
+    print(f"installed {SERVICE_NAME}.service; files created under {paths['state']}")
 
 
 def uninstall(_args: argparse.Namespace) -> None:
@@ -433,10 +506,8 @@ def uninstall(_args: argparse.Namespace) -> None:
     run(["systemctl", "stop", f"{SERVICE_NAME}.service"], check=False)
     run(["systemctl", "disable", f"{SERVICE_NAME}.service"], check=False)
     Path(f"/etc/systemd/system/{SERVICE_NAME}.service").unlink(missing_ok=True)
-    INSTALL_PATH.unlink(missing_ok=True)
-    ENV_PATH.unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"], check=False)
-    print(f"uninstalled {SERVICE_NAME}.service")
+    print(f"uninstalled service; current-directory state is intentionally preserved")
 
 
 def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -448,8 +519,32 @@ def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess
         return subprocess.CompletedProcess(cmd, 127, "" if capture else None, "command not found" if capture else None)
 
 
+class SelfTests(unittest.TestCase):
+    def test_protocols(self) -> None:
+        self.assertTrue(GameProtocolFilter("source").validate(b"\xff\xff\xff\xffTSource Engine Query\x00").allowed)
+        self.assertTrue(GameProtocolFilter("raknet").validate(bytes([0x05]) + b"\x00" * 15 + RAKNET_MAGIC).allowed)
+        self.assertTrue(GameProtocolFilter("samp").validate(b"SAMP" + b"\x00" * 7).allowed)
+        self.assertTrue(GameProtocolFilter("fivem").validate(b"getinfo xxx").allowed)
+        self.assertTrue(GameProtocolFilter("teamspeak3").validate(b"TS3INIT1").allowed)
+
+    def test_whitelist_defaults_and_subnet_block(self) -> None:
+        blocker = TemporarySubnetBlocker(threshold=2, window_sec=10, block_sec=60, whitelist_ports={1234})
+        self.assertIn(22, blocker.whitelist_ports)
+        self.assertIn(8080, blocker.whitelist_ports)
+        self.assertFalse(blocker.record("203.0.113.10", "bad"))
+        self.assertTrue(blocker.record("203.0.113.20", "bad"))
+        self.assertTrue(blocker.is_blocked("203.0.113.30"))
+
+    def test_current_dir_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ns = argparse.Namespace(http_port=8080, udp_port=27015, game_protocol="auto", whitelist_port=[], max_upload_bytes=1024)
+            paths = ensure_current_dir_files(Path(tmp), ns)
+            self.assertTrue(paths["uploads"].is_dir())
+            self.assertTrue(paths["config"].is_file())
+
+
 def parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Standalone Layer 4/7 DDoS guard with game protocol filtering")
+    p = argparse.ArgumentParser(description="Single-file Layer 4/7 DDoS guard with upload whitelist on 8080")
     sub = p.add_subparsers(dest="cmd", required=True)
     for name in ("run", "install"):
         sp = sub.add_parser(name)
@@ -458,17 +553,19 @@ def parser() -> argparse.ArgumentParser:
         sp.add_argument("--udp-port", type=int, default=int(os.environ.get("UDP_PORT", "27015")))
         sp.add_argument("--game-protocol", default=os.environ.get("GAME_PROTOCOL", "auto"), choices=["auto", "source", "valve", "minecraft", "raknet", "bedrock", "samp", "fivem", "teamspeak3", "genericudp"])
         sp.add_argument("--firewall", action="store_true", default=os.environ.get("FIREWALL_ENABLED", "false").lower() == "true")
+        sp.add_argument("--whitelist-port", type=int, action="append", default=[], help="TCP port to ACCEPT before dynamic subnet drops; 22 and 8080 are always included")
         sp.add_argument("--http-capacity", type=int, default=120)
         sp.add_argument("--http-refill", type=float, default=60.0)
         sp.add_argument("--udp-capacity", type=int, default=80)
         sp.add_argument("--udp-refill", type=float, default=40.0)
-        sp.add_argument("--max-body", type=int, default=1_000_000)
+        sp.add_argument("--max-upload-bytes", type=int, default=100 * 1024 * 1024)
         sp.add_argument("--subnet-threshold", type=int, default=25)
         sp.add_argument("--subnet-window", type=int, default=10)
         sp.add_argument("--subnet-block-seconds", type=int, default=600)
         sp.add_argument("--port-scan-interval", type=int, default=30)
     sub.add_parser("uninstall")
     sub.add_parser("ports")
+    sub.add_parser("selftest")
     return p
 
 
@@ -482,6 +579,8 @@ def main() -> None:
         uninstall(args)
     elif args.cmd == "ports":
         print(json.dumps(discover_ports(), indent=2))
+    elif args.cmd == "selftest":
+        unittest.main(argv=[sys.argv[0]], exit=False)
 
 
 if __name__ == "__main__":
