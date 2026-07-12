@@ -367,11 +367,39 @@ class PterodactylClient:
     async def reinstall_server(self, server_id: str) -> None:
         await self.request("POST", f"servers/{server_id}/reinstall")
 
+    async def server_build_payload(self, server_id: str, **overrides: Any) -> dict[str, Any]:
+        server = await self.get_server(server_id)
+        limits = server.get("limits") or {}
+        feature_limits = server.get("feature_limits") or {}
+        allocation = server.get("allocation") or server.get("allocation_id")
+        if not allocation:
+            raise RuntimeError("Pterodactyl did not return a primary allocation for this server, so the build cannot be updated safely.")
+        payload = {
+            "allocation": allocation,
+            "memory": int(limits.get("memory") or 0),
+            "swap": int(limits.get("swap") or 0),
+            "disk": int(limits.get("disk") or 0),
+            "io": int(limits.get("io") or 500),
+            "cpu": int(limits.get("cpu") or 0),
+            "threads": limits.get("threads"),
+            "feature_limits": {
+                "databases": int(feature_limits.get("databases") or 0),
+                "allocations": int(feature_limits.get("allocations") or 0),
+                "backups": int(feature_limits.get("backups") or 0),
+            },
+        }
+        payload.update(overrides)
+        return payload
+
     async def resize_server(self, server_id: str, ram: int, disk: int, cpu: int, databases: int, allocations: int, backups: int) -> None:
-        await self.request("PATCH", f"servers/{server_id}/build", {
-            "limits": {"memory": ram, "swap": 0, "disk": disk, "io": 500, "cpu": cpu},
-            "feature_limits": {"databases": databases, "allocations": allocations, "backups": backups},
-        })
+        payload = await self.server_build_payload(
+            server_id,
+            memory=ram,
+            disk=disk,
+            cpu=cpu,
+            feature_limits={"databases": databases, "allocations": allocations, "backups": backups},
+        )
+        await self.request("PATCH", f"servers/{server_id}/build", payload)
 
     async def set_saga_auto_suspend(self, server_id: str, expires_at: datetime | None) -> bool:
         if not saga_auto_suspend_enabled():
@@ -380,7 +408,7 @@ class PterodactylClient:
         last_error: RuntimeError | None = None
         for field in saga_expiration_fields():
             try:
-                await self.request("PATCH", f"servers/{server_id}/build", {field: value})
+                await self.request("PATCH", f"servers/{server_id}/build", await self.server_build_payload(server_id, **{field: value}))
                 return True
             except RuntimeError as error:
                 last_error = error
@@ -800,14 +828,23 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
         row = await ensure_server_access(interaction, self.server_id, allow_admin=self.allow_admin)
-        databases, allocations, backups = [int(part.strip()) for part in str(self.extras.value).split(",")]
-        ram = int(str(self.ram.value))
-        disk = int(str(self.disk.value))
-        cpu = int(str(self.cpu.value))
+        try:
+            extras = [int(part.strip()) for part in str(self.extras.value).split(",")]
+            if len(extras) != 3:
+                raise ValueError
+            databases, allocations, backups = extras
+            ram = int(str(self.ram.value).strip())
+            disk = int(str(self.disk.value).strip())
+            cpu = int(str(self.cpu.value).strip())
+        except ValueError as error:
+            raise RuntimeError("Use whole numbers for RAM, disk, CPU, and extras in `databases,allocations,backups` format, for example `1,1,1`.") from error
+        if min(ram, disk, cpu) <= 0 or min(databases, allocations, backups) < 0:
+            raise RuntimeError("RAM, disk, and CPU must be positive. Databases, allocations, and backups cannot be negative.")
         await ptero.resize_server(self.server_id, ram, disk, cpu, databases, allocations, backups)
-        with db() as connection:
-            connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram, disk, cpu, databases, allocations, backups, self.server_id))
-        await interaction.followup.send(embed=branded_embed("Server Resized", f"**{row['name']}** is now {ram}MB RAM / {disk}MB disk / {cpu}% CPU."), ephemeral=True)
+        if fetch_server(self.server_id):
+            with db() as connection:
+                connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram, disk, cpu, databases, allocations, backups, self.server_id))
+        await interaction.followup.send(embed=branded_embed("Server Resized", f"**{record_value(row, 'name', self.server_id)}** is now {ram:,} MB RAM / {disk:,} MB disk / {cpu}% CPU."), ephemeral=True)
 
 
 class SuspendSelect(discord.ui.View):
