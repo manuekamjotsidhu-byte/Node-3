@@ -1341,19 +1341,31 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
 
 @tree.command(name="autosuspend", description="Toggle autosuspend")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
-async def autosuspend(interaction: discord.Interaction, server: str, state: app_commands.Choice[str]) -> None:
+async def autosuspend(interaction: discord.Interaction, server: str, state: app_commands.Choice[str], time: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
     enabled = 1 if state.value == "on" else 0
-    row = fetch_server(server)
-    if not row:
-        raise RuntimeError("Unknown tracked server.")
-    with db() as connection:
-        connection.execute("UPDATE servers SET autosuspend_enabled=? WHERE server_id=?", (enabled, server))
-    expires_at = datetime.fromisoformat(row["expires_at"]) if enabled else None
-    saga_synced = await ptero.set_saga_auto_suspend(server, expires_at)
-    await interaction.followup.send(embed=branded_embed("Autosuspend Updated", f"Automatic expiration suspension for **{row['name']}** is now **{state.value.upper()}**.\nSaga auto suspension: **{'synced' if saga_synced else 'cleared/not synced'}**"), ephemeral=True)
+    row = await ensure_server_access(interaction, server, allow_admin=True)
+    tracked_row = fetch_server(server)
+    expires_at: datetime | None = None
+    if enabled:
+        if time:
+            expires_at = utc_now() + timedelta(seconds=parse_duration(time))
+        else:
+            stored_expiry = record_value(row, "expires_at")
+            if not stored_expiry:
+                raise RuntimeError("This panel server is not tracked by the bot yet. Provide `time` like `30d`, `12h`, or `1d6h` so Saga can receive an expiration date.")
+            expires_at = datetime.fromisoformat(str(stored_expiry))
+    if tracked_row:
+        with db() as connection:
+            if expires_at and time:
+                connection.execute("UPDATE servers SET autosuspend_enabled=?, expires_at=?, suspended=0 WHERE server_id=?", (enabled, expires_at.isoformat(), server))
+            else:
+                connection.execute("UPDATE servers SET autosuspend_enabled=? WHERE server_id=?", (enabled, server))
+    saga_synced = await ptero.set_saga_auto_suspend(server, expires_at if enabled else None)
+    expiry_line = f"\nExpiration: <t:{int(expires_at.timestamp())}:F>" if expires_at else ""
+    await interaction.followup.send(embed=branded_embed("Autosuspend Updated", f"Automatic expiration suspension for **{record_value(row, 'name', server)}** is now **{state.value.upper()}**.{expiry_line}\nSaga auto suspension: **{'synced' if saga_synced else 'cleared/not synced'}**"), ephemeral=True)
 
 
 @tree.command(name="server-expirations", description="Show expirations")
