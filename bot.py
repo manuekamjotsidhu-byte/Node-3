@@ -865,8 +865,10 @@ async def admin_list(interaction: discord.Interaction) -> None:
             )
         embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(servers)} panel servers • Developer: {DEVELOPER}")
         embeds.append(embed)
-    view = PaginatedEmbeds(embeds) if len(embeds) > 1 else None
-    await interaction.followup.send(embed=embeds[0], view=view, ephemeral=True)
+    if len(embeds) > 1:
+        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embeds[0], ephemeral=True)
 
 @admin_group.command(name="manage", description="Manage any tracked server")
 @admin_only()
@@ -909,10 +911,10 @@ tree.add_command(admin_group)
 
 @tree.command(name="list", description="List your servers")
 async def list_mine(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     rows = fetch_user_servers(interaction.user.id)
     if not rows:
-        await interaction.followup.send(embed=branded_embed("Your Servers", "No servers found."), ephemeral=True)
+        await interaction.followup.send(embed=branded_embed("Your Servers", "No servers found."))
         return
     embeds: list[discord.Embed] = []
     pages = chunked(rows, 10)
@@ -927,8 +929,10 @@ async def list_mine(interaction: discord.Interaction) -> None:
             )
         embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(rows)} server(s) • Developer: {DEVELOPER}")
         embeds.append(embed)
-    view = PaginatedEmbeds(embeds) if len(embeds) > 1 else None
-    await interaction.followup.send(embed=embeds[0], view=view, ephemeral=True)
+    if len(embeds) > 1:
+        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds))
+    else:
+        await interaction.followup.send(embed=embeds[0])
 
 @tree.command(name="manage", description="Open server manager")
 @app_commands.autocomplete(server=tracked_server_autocomplete)

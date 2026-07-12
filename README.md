@@ -46,7 +46,7 @@ python bot.py
 - `/create-paid` - admin-only paid server creation with `time` duration, RAM/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging.
 - `/admin list` - admin-only paginated embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
 - `/admin manage`, `/admin console`, `/admin rename` - admin-only versions that can target any tracked server **and panel-created servers that are not in the local DB yet**; normal `/manage`, `/console`, and `/rename` only show and control the caller’s own servers.
-- `/list` - paginated embed list that always shows only the caller’s own linked/tracked servers. Admins should use `/admin list` for all panel servers.
+- `/list` - public paginated embed list that still shows only the command executor’s own linked/tracked servers. Admins should use `/admin list` for all panel servers.
 - `/manage` - users open a premium control panel for one of their own linked servers with live resource usage and start/stop/restart/kill buttons.
 - `/power` - users or admins start, stop, or restart an owned/tracked server.
 - `/reinstall` - users or admins reinstall an owned/tracked server.
