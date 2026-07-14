@@ -197,9 +197,27 @@ def fetch_all_servers() -> list[sqlite3.Row]:
         return connection.execute("SELECT * FROM servers WHERE deleted = 0 ORDER BY created_at DESC").fetchall()
 
 
-def is_whitelisted(server_id: str) -> bool:
+def whitelist_values() -> set[str]:
+    values = {str(item) for item in database.setdefault("whitelist", [])}
     with db() as connection:
-        return connection.execute("SELECT 1 FROM whitelist WHERE server_id = ?", (server_id,)).fetchone() is not None
+        values.update(str(row["server_id"]) for row in connection.execute("SELECT server_id FROM whitelist").fetchall())
+    return values
+
+
+def is_whitelisted(server_id: str) -> bool:
+    return str(server_id) in whitelist_values()
+
+
+def is_server_protected(record: sqlite3.Row | dict[str, Any]) -> bool:
+    if str(record_value(record, "plan", "")).lower() == "paid":
+        return True
+    protected = whitelist_values()
+    identifiers = {
+        str(record_value(record, "server_id", "")),
+        str(record_value(record, "uuid", "")),
+        str(record_value(record, "identifier", "")),
+    }
+    return any(identifier and identifier in protected for identifier in identifiers)
 
 
 def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
@@ -1318,7 +1336,7 @@ async def nodes(interaction: discord.Interaction) -> None:
 
 @tree.command(name="whitelist", description="Admin: whitelist or unwhitelist a server by name/UUID")
 @admin_only()
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 @app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove")])
 async def whitelist(interaction: discord.Interaction, server: str, action: app_commands.Choice[str]) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -1343,22 +1361,33 @@ async def whitelist(interaction: discord.Interaction, server: str, action: app_c
 async def purge(interaction: discord.Interaction, confirm: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     if not confirm:
-        await interaction.followup.send(embed=branded_embed("Confirmation Required", "Run `/purge confirm:True` to delete tracked free servers. Paid and whitelisted servers are skipped.", 0xffcc00), ephemeral=True)
+        await interaction.followup.send(embed=branded_embed("Confirmation Required", "Run `/purge confirm:True` to delete ONLY tracked free servers. Paid servers and anything whitelisted by ID, UUID, or identifier are always skipped.", 0xffcc00), ephemeral=True)
         return
-    victims = [row for row in fetch_all_servers() if row["plan"] == "free" and not is_whitelisted(row["server_id"])]
+    all_rows = fetch_all_servers()
+    victims = [row for row in all_rows if str(row["plan"]).lower() == "free" and not is_server_protected(row)]
+    skipped = len(all_rows) - len(victims)
     deleted = []
     failed = []
     for record in victims:
         server_id = record["server_id"]
         try:
+            live_row = await refresh_tracked_server(record)
+            if not live_row:
+                failed.append(f"{server_id}: already missing on panel; marked deleted")
+                continue
+            if str(live_row["plan"]).lower() != "free" or is_server_protected(live_row):
+                skipped += 1
+                continue
             await ptero.delete_server(server_id)
-            deleted.append(f"{record['name']} (`{server_id}`)")
+            deleted.append(f"{live_row['name']} (`{server_id}`)")
             with db() as connection:
                 connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (server_id,))
+            database.get("servers", {}).pop(server_id, None)
+            clear_server_notifications(server_id)
         except RuntimeError as error:
             failed.append(f"{server_id}: {error}")
     save_database()
-    description = f"Deleted free servers: **{len(deleted)}**\nSkipped paid/whitelisted servers automatically."
+    description = f"Deleted free servers: **{len(deleted)}**\nSkipped paid/whitelisted/protected servers: **{skipped}**."
     if deleted:
         description += "\n\n" + "\n".join(deleted[:15])
     if failed:
