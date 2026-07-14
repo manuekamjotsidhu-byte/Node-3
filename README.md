@@ -19,7 +19,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
 - Tracked server details are refreshed from the live Pterodactyl panel before user lists and management actions, so renamed/resized/deleted panel servers do not rely on stale local DB values.
 - Saga Auto Suspension can be synced during create, renew, and `/autosuspend` changes by configuring `saga_auto_suspend_enabled` and the panel field name in `saga_auto_suspend_field` (fallbacks try `suspended_at`, `expiration_date`, and `expires_at`).
-- Expired tracked servers are automatically suspended by the background task.
+- Expired tracked servers are automatically suspended by the background task. Users receive renewal reminders before suspension, a deletion warning 24 hours before cleanup, and suspended servers are deleted after 7 days.
 
 ## Files
 
@@ -57,6 +57,7 @@ python bot.py
 - `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.
 - `/renew` - guild admin-only renewal command with admin server autocomplete; tracked servers update the local DB, and panel-only servers still sync Saga/panel expiration by a time such as `30d`.
 - `/delete` - guild admin-only command to delete one specific tracked server with `confirm:True`.
+- `/deletesuspended` - guild admin-only cleanup command to delete suspended `free`, `paid`, or `all` servers after confirmation.
 - `/resize` - guild admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.
 - `/suspend` and `/unsuspend` - admin-only suspension controls. `/suspend` can suspend a direct server, show a selectable menu by Discord user/email, or bulk suspend all except paid/whitelisted servers.
 - `/stopall` - admin-only stop for all tracked servers except whitelisted servers.

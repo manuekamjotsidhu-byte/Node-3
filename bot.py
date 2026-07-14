@@ -123,6 +123,12 @@ def init_db() -> None:
             all_servers INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS server_notifications (
+            server_id TEXT NOT NULL,
+            notification_type TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (server_id, notification_type)
+        );
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
@@ -205,6 +211,21 @@ def fetch_links_by_panel_user() -> dict[int, sqlite3.Row]:
     with db() as connection:
         rows = connection.execute("SELECT * FROM links").fetchall()
     return {int(row["panel_user_id"]): row for row in rows}
+
+
+def notification_sent(server_id: str, notification_type: str) -> bool:
+    with db() as connection:
+        return connection.execute("SELECT 1 FROM server_notifications WHERE server_id=? AND notification_type=?", (server_id, notification_type)).fetchone() is not None
+
+
+def mark_notification_sent(server_id: str, notification_type: str) -> None:
+    with db() as connection:
+        connection.execute("INSERT OR IGNORE INTO server_notifications(server_id, notification_type, sent_at) VALUES (?,?,?)", (server_id, notification_type, utc_now().isoformat()))
+
+
+def clear_server_notifications(server_id: str) -> None:
+    with db() as connection:
+        connection.execute("DELETE FROM server_notifications WHERE server_id=?", (server_id,))
 
 
 def fetch_servers_by_email(email: str) -> list[sqlite3.Row]:
@@ -1155,6 +1176,7 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
     if tracked_row:
         with db() as connection:
             connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1 WHERE server_id=?", (new_expiry.isoformat(), server))
+        clear_server_notifications(server)
     saga_synced = await ptero.set_saga_auto_suspend(server, new_expiry)
     try:
         await ptero.unsuspend_server(server)
@@ -1373,6 +1395,36 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
     await interaction.followup.send(embed=branded_embed("Autosuspend Updated", f"Automatic expiration suspension for **{record_value(row, 'name', server)}** is now **{state.value.upper()}**.{expiry_line}\nSaga auto suspension: **{'synced' if saga_synced else 'cleared/not synced'}**"), ephemeral=True)
 
 
+@tree.command(name="deletesuspended", description="Delete suspended servers")
+@admin_only()
+@app_commands.choices(plan=[app_commands.Choice(name="free", value="free"), app_commands.Choice(name="paid", value="paid"), app_commands.Choice(name="all", value="all")])
+async def deletesuspended(interaction: discord.Interaction, plan: app_commands.Choice[str], confirm: bool = False) -> None:
+    await interaction.response.defer(ephemeral=True)
+    victims = [row for row in fetch_all_servers() if row["suspended"] and (plan.value == "all" or row["plan"] == plan.value)]
+    if not confirm:
+        await interaction.followup.send(embed=branded_embed("Confirm Suspended Delete", f"Found **{len(victims)}** suspended **{plan.value}** server(s). Run `/deletesuspended plan:{plan.value} confirm:True` to permanently delete them from the panel.", 0xffcc00), ephemeral=True)
+        return
+    deleted: list[str] = []
+    failed: list[str] = []
+    for row in victims:
+        try:
+            await ptero.delete_server(row["server_id"])
+            with db() as connection:
+                connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (row["server_id"],))
+            database.get("servers", {}).pop(row["server_id"], None)
+            clear_server_notifications(row["server_id"])
+            deleted.append(f"`{row['server_id']}` • {row['name']}")
+        except Exception as error:
+            failed.append(f"`{row['server_id']}` • {clean(str(error), 120)}")
+    save_database()
+    description = f"Deleted **{len(deleted)}** suspended server(s) for plan **{plan.value}**."
+    if deleted:
+        description += "\n\n" + "\n".join(deleted[:15])
+    if failed:
+        description += "\n\nFailures:\n" + "\n".join(failed[:5])
+    await interaction.followup.send(embed=branded_embed("Suspended Delete Complete", description, 0xe74c3c), ephemeral=True)
+
+
 @tree.command(name="server-expirations", description="Show expirations")
 @admin_only()
 async def server_expirations(interaction: discord.Interaction) -> None:
@@ -1386,23 +1438,77 @@ async def server_expirations(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=branded_embed("Tracked Expirations", "\n".join(rows[:25]) or "No tracked servers."), ephemeral=True)
 
 
+async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, notification_type: str | None = None) -> None:
+    try:
+        user = await client.fetch_user(int(record["discord_user_id"]))
+    except Exception:
+        return
+    plan = record["plan"]
+    server_name = record["name"]
+    timestamp = int(when.timestamp())
+    if event == "suspension_warning":
+        if plan == "paid":
+            title = "Paid Service Renewal Reminder"
+            lead = "7 days" if notification_type == "suspend_7d" else "24 hours"
+            message = f"Your paid server **{server_name}** is scheduled for suspension in **{lead}** at <t:{timestamp}:F>. Please renew by clearing the recurring amount due to keep your service active."
+        else:
+            title = "Free Server Renewal Reminder"
+            message = f"Your free server **{server_name}** will be suspended in **24 hours** at <t:{timestamp}:F>. Please renew your server if you still need it."
+    elif event == "suspended":
+        title = "Server Suspended"
+        message = f"Your server **{server_name}** expired and has been suspended. It will be deleted after 7 days if it is not renewed."
+    elif event == "delete_warning":
+        title = "Server Deletion Warning"
+        if plan == "paid":
+            message = f"Your paid server **{server_name}** is scheduled for permanent deletion in **24 hours** at <t:{timestamp}:F>. Please renew by clearing the recurring amount due to avoid losing the server."
+        else:
+            message = f"Your free server **{server_name}** is scheduled for permanent deletion in **24 hours** at <t:{timestamp}:F>. Please renew your server if you want to keep it."
+    else:
+        title = "Server Deleted"
+        message = f"Your server **{server_name}** was permanently deleted after remaining suspended for 7 days."
+    try:
+        await user.send(embed=branded_embed(title, message, 0xe67e22 if event != "deleted" else 0xe74c3c))
+    except discord.Forbidden:
+        pass
+
+
 @tasks.loop(minutes=1)
 async def suspend_expired_servers() -> None:
     now = utc_now()
     for record in fetch_all_servers():
-        if record["suspended"] or not record["autosuspend_enabled"] or datetime.fromisoformat(record["expires_at"]) > now:
-            continue
+        server_id = record["server_id"]
+        expires_at = datetime.fromisoformat(record["expires_at"])
+        delete_at = expires_at + timedelta(days=7)
         try:
-            await ptero.suspend_server(record["server_id"])
-            with db() as connection:
-                connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (record["server_id"],))
-            user = await client.fetch_user(int(record["discord_user_id"]))
-            try:
-                await user.send(embed=branded_embed("Server Suspended", f"Your server **{record['name']}** expired and has been suspended. Please contact ZeroX Host staff for renewal.", 0xe67e22))
-            except discord.Forbidden:
-                pass
+            if not record["suspended"]:
+                suspension_warnings = [("suspend_1d", timedelta(days=1))]
+                if record["plan"] == "paid":
+                    suspension_warnings.insert(0, ("suspend_7d", timedelta(days=7)))
+                for notification_type, window in suspension_warnings:
+                    if now <= expires_at and expires_at - now <= window and not notification_sent(server_id, notification_type):
+                        await send_lifecycle_dm(record, "suspension_warning", expires_at, notification_type)
+                        mark_notification_sent(server_id, notification_type)
+                if not record["autosuspend_enabled"] or expires_at > now:
+                    continue
+                await ptero.suspend_server(server_id)
+                with db() as connection:
+                    connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
+                await send_lifecycle_dm(record, "suspended", expires_at)
+                continue
+
+            if delete_at - now <= timedelta(days=1) and now < delete_at and not notification_sent(server_id, "delete_1d"):
+                await send_lifecycle_dm(record, "delete_warning", delete_at)
+                mark_notification_sent(server_id, "delete_1d")
+            if now >= delete_at:
+                await ptero.delete_server(server_id)
+                with db() as connection:
+                    connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (server_id,))
+                database.get("servers", {}).pop(server_id, None)
+                clear_server_notifications(server_id)
+                save_database()
+                await send_lifecycle_dm(record, "deleted", delete_at)
         except Exception as error:
-            print(f"Failed to suspend expired server {record['server_id']}: {error}")
+            print(f"Failed lifecycle processing for server {server_id}: {error}")
 
 
 @tasks.loop(minutes=1)
@@ -1448,7 +1554,7 @@ def configure_command_visibility() -> None:
     installs = app_commands.AppInstallationType(guild=True, user=True)
     admin_command_names = {
         "admin", "create-free", "create-paid", "link", "resize", "suspend", "unsuspend", "stopall",
-        "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew", "delete",
+        "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew", "delete", "deletesuspended",
     }
 
     def apply(command: app_commands.Command[Any, ..., Any] | app_commands.Group, admin_only_command: bool = False) -> None:
