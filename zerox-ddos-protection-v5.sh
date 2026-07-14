@@ -55,24 +55,20 @@ IFACE="$iface"
 IFACE_FILTER=1
 PROFILE="conservative"
 BAN_SECONDS=120
-JAVA_VALIDATOR_ENABLED=0
+JAVA_VALIDATOR_ENABLED=0 # transport-only by default; no live Java stream enforcement
 JAVA_CONN_LIMIT=40
 JAVA_SYN_RATE=50
 JAVA_SYN_BURST=150
 RAKNET_SOFT_PPS=1000
 RAKNET_SOFT_BURST=3000
 HARD_SRC_PPS=5000
-HARD_SRC_MBYTES=60
 TCP_NEW_RATE=120
 TCP_NEW_BURST=240
 UDP_BASE_PPS=6000
 UDP_BASE_BURST=12000
 ICMP_RATE=100
 ICMP_BURST=300
-AGG_PPS=0
-AGG_MBYTES=0
 EST_TCP_PPS=20000
-EST_TCP_MBYTES=200
 XDP_BYTE_RATE=8000000
 XDP_MAP_SIZE=131072
 RAKNET_MIN_MTU=576
@@ -80,8 +76,6 @@ RAKNET_MAX_MTU=1492
 RAKNET_MAX_LEN=1492
 RAKNET_PROTOCOLS="11,10"
 JAVA_MAX_INITIAL=4096
-JAVA_PENDING_PER_IP=20
-JAVA_INCOMPLETE_SECONDS=10
 EOF
   echo conservative >"$PROFILE_FILE"; echo 120 >"$BAN_SECONDS_FILE"
 }
@@ -178,11 +172,11 @@ static __always_inline int rate4(__u32 s,__u32 bytes,__u64 now){ if(trust4_ok(s)
 static __always_inline int rate6(const struct in6_addr*s,__u32 bytes,__u64 now){ if(trust6_ok(s)) return 1; struct rate_val*r=bpf_map_lookup_elem(&rates6,s); if(!r){struct rate_val n={.start=now,.packets=1,.bytes=bytes}; bpf_map_update_elem(&rates6,s,&n,BPF_ANY); return 1;} int ok=1; bpf_spin_lock(&r->lock); if(now-r->start>=WINDOW_NS){r->start=now;r->packets=1;r->bytes=bytes;} else {r->packets++;r->bytes+=bytes; if(r->packets>PPS_LIMIT||r->bytes>BYTE_LIMIT) ok=0;} bpf_spin_unlock(&r->lock); return ok; }
 static __always_inline int ping_ok(const __u8*p,__u32 l,const void*e){ return l>=33 && l<=MAX_PKT && magic_ok(p+9,e); }
 static __always_inline int req1_ok(const __u8*p,__u32 l,const void*e){ return l>=18 && l<=MAX_MTU && magic_ok(p+1,e) && (void*)(p+18)<=e && proto_ok(p[17]); }
-static __always_inline int parse_req2(const __u8*p,__u32 l,const void*e){ if(l<34||l>80||!magic_ok(p+1,e)||(void*)(p+18)>e) return 0; __u32 off=17; if(p[off]!=4&&p[off]!=6 && l>50){ off+=8; if((void*)(p+off+1)>e) return 0; if(p[off]!=0 && p[off]!=1) return 0; off++; } if((void*)(p+off+1)>e) return 0; __u8 fam=p[off++]; __u32 alen=(fam==4)?6:((fam==6)?28:0); if(!alen||off+alen+10>l||(void*)(p+off+alen+10)>e) return 0; off+=alen; __u16 mtu=((__u16)p[off]<<8)|p[off+1]; return mtu>=MIN_MTU&&mtu<=MAX_MTU; }
+static __always_inline int parse_req2(const __u8*p,__u32 l,const void*e){ if(l<34||l>80||!magic_ok(p+1,e)||(void*)(p+18)>e) return 0; __u32 off=17; if(p[off]!=4&&p[off]!=6 && l>50){ off+=4; if((void*)(p+off+1)>e) return 0; if(p[off]!=0 && p[off]!=1) return 0; off++; } if((void*)(p+off+1)>e) return 0; __u8 fam=p[off++]; __u32 alen=(fam==4)?6:((fam==6)?28:0); if(!alen||off+alen+10>l||(void*)(p+off+alen+10)>e) return 0; off+=alen; __u16 mtu=((__u16)p[off]<<8)|p[off+1]; return mtu>=MIN_MTU&&mtu<=MAX_MTU; }
 static __always_inline int connected_ok(const __u8*p,__u32 l,const void*e){ if(l<1||l>MAX_PKT) return 0; __u8 id=p[0]; if(id>=0x80 && id<=0x8d) return l>=4; if(id==0xc0||id==0xa0){ if(l<4||(void*)(p+4)>e) return 0; __u16 ranges=((__u16)p[2]<<8)|p[3]; return ranges>0 && ranges<=256 && l<=4+ranges*10; } return 0; }
-static __always_inline int h4(__u32 s,__u16 sp,__u16 dp,const __u8*p,__u32 l,const void*e,__u64 now){ struct ep4 ep={s,sp,dp}; struct st*v=bpf_map_lookup_elem(&verified4,&ep); if(v){ if(now-v->last<VERIFIED_IDLE_NS && now-v->created<VERIFIED_ABS_NS && connected_ok(p,l,e)){v->last=now; cnt(0); return XDP_PASS;} bpf_map_delete_elem(&verified4,&ep); cnt(4); return XDP_DROP;} if(l<1){cnt(4);return XDP_DROP;} __u8 id=p[0]; if(id==1||id==2){ if(ping_ok(p,l,e)){cnt(0);return XDP_PASS;} cnt(2);return XDP_DROP;} if(id==5){ if(!req1_ok(p,l,e)){cnt(3);return XDP_DROP;} struct st st={now,now,1}; bpf_map_update_elem(&pending4,&ep,&st,BPF_ANY); cnt(0); return XDP_PASS;} if(id==7){ if(!parse_req2(p,l,e)){cnt(4);return XDP_DROP;} struct st*q=bpf_map_lookup_elem(&pending4,&ep); if(!q||q->stage!=1||now-q->last>PENDING_NS){cnt(4);return XDP_DROP;} struct st st={now,now,2}; bpf_map_update_elem(&verified4,&ep,&st,BPF_ANY); bpf_map_delete_elem(&pending4,&ep); cnt(0); return XDP_PASS;} cnt(4); return XDP_DROP; }
-static __always_inline int h6(const struct in6_addr*s,__u16 sp,__u16 dp,const __u8*p,__u32 l,const void*e,__u64 now){ struct ep6 ep={.sport=sp,.dport=dp}; __builtin_memcpy(&ep.src,s,sizeof(*s)); struct st*v=bpf_map_lookup_elem(&verified6,&ep); if(v){ if(now-v->last<VERIFIED_IDLE_NS&&now-v->created<VERIFIED_ABS_NS&&connected_ok(p,l,e)){v->last=now;cnt(0);return XDP_PASS;} bpf_map_delete_elem(&verified6,&ep);cnt(4);return XDP_DROP;} if(l<1){cnt(4);return XDP_DROP;} __u8 id=p[0]; if(id==1||id==2){ if(ping_ok(p,l,e)){cnt(0);return XDP_PASS;} cnt(2);return XDP_DROP;} if(id==5){ if(!req1_ok(p,l,e)){cnt(3);return XDP_DROP;} struct st st={now,now,1}; bpf_map_update_elem(&pending6,&ep,&st,BPF_ANY);cnt(0);return XDP_PASS;} if(id==7){ if(!parse_req2(p,l,e)){cnt(4);return XDP_DROP;} struct st*q=bpf_map_lookup_elem(&pending6,&ep); if(!q||q->stage!=1||now-q->last>PENDING_NS){cnt(4);return XDP_DROP;} struct st st={now,now,2}; bpf_map_update_elem(&verified6,&ep,&st,BPF_ANY); bpf_map_delete_elem(&pending6,&ep);cnt(0);return XDP_PASS;} cnt(4);return XDP_DROP; }
-SEC("xdp") int raknet_xdp_v5(struct xdp_md*ctx){ void*data=(void*)(long)ctx->data,*end=(void*)(long)ctx->data_end; struct ethhdr*eth=data; if((void*)(eth+1)>end) return XDP_PASS; __u16 proto=bpf_ntohs(eth->h_proto); __u64 off=sizeof(*eth); for(int i=0;i<2;i++){ if(proto==ETH_P_8021Q||proto==ETH_P_8021AD){ struct vlan_min*vh=data+off; if((void*)(vh+1)>end) return XDP_PASS; proto=bpf_ntohs(vh->encap); off+=sizeof(*vh); }} __u64 now=bpf_ktime_get_ns(); if(proto==ETH_P_IP){ struct iphdr*ip=data+off; if((void*)(ip+1)>end||ip->version!=4||ip->ihl<5) return XDP_PASS; __u32 ihl=ip->ihl*4; if((void*)ip+ihl>end||ip->protocol!=IPPROTO_UDP) return XDP_PASS; struct udphdr*u=(void*)ip+ihl; if((void*)(u+1)>end) return XDP_PASS; __u16 dp=bpf_ntohs(u->dest); if(!port_ok(dp)) return XDP_PASS; if(bpf_ntohs(ip->frag_off)&(IP_MF|IP_OFFSET)){cnt(1);return XDP_DROP;} __u16 ul=bpf_ntohs(u->len), tl=bpf_ntohs(ip->tot_len); if(ul<8||tl<ihl+ul||(void*)u+ul>end){cnt(1);return XDP_DROP;} if(!rate4(ip->saddr,ul,now)){cnt(5);return XDP_DROP;} return h4(ip->saddr,bpf_ntohs(u->source),dp,(void*)(u+1),ul-8,end,now); } if(proto==ETH_P_IPV6){ struct ipv6hdr*ip6=data+off; if((void*)(ip6+1)>end) return XDP_PASS; __u8 nh=ip6->nexthdr; __u64 o=off+sizeof(*ip6); for(int i=0;i<6;i++){ if(nh==IPPROTO_HOPOPTS||nh==IPPROTO_ROUTING||nh==IPPROTO_DSTOPTS){ if(data+o+2>end) return XDP_PASS; __u8*n=data+o; nh=n[0]; o+=(n[1]+1)*8; if(data+o>end) return XDP_PASS; } else if(nh==IPPROTO_FRAGMENT){ if(data+o+8>end) return XDP_PASS; struct frag_hdr{__u8 n;__u8 r;__be16 off;__be32 id;}*f=data+o; nh=f->n; if(f->off & bpf_htons(0xfff9)){cnt(1);return XDP_DROP;} o+=8; } else break; } if(nh!=IPPROTO_UDP) return XDP_PASS; struct udphdr*u=data+o; if((void*)(u+1)>end) return XDP_PASS; __u16 dp=bpf_ntohs(u->dest); if(!port_ok(dp)) return XDP_PASS; __u16 ul=bpf_ntohs(u->len); if(ul<8||bpf_ntohs(ip6->payload_len)<ul||(void*)u+ul>end){cnt(1);return XDP_DROP;} if(!rate6(&ip6->saddr,ul,now)){cnt(5);return XDP_DROP;} return h6(&ip6->saddr,bpf_ntohs(u->source),dp,(void*)(u+1),ul-8,end,now); } return XDP_PASS; }
+static __always_inline int h4(__u32 s,__u16 sp,__u16 dp,const __u8*p,__u32 l,const void*e,__u64 now){ struct ep4 ep={s,sp,dp}; struct st*v=bpf_map_lookup_elem(&verified4,&ep); if(v){ if(now-v->last<VERIFIED_IDLE_NS && now-v->created<VERIFIED_ABS_NS){ if(connected_ok(p,l,e)){v->last=now; cnt(0); return XDP_PASS;} cnt(5); cnt(1); return XDP_DROP;} bpf_map_delete_elem(&verified4,&ep); cnt(4); cnt(1); return XDP_DROP;} if(l<1){cnt(4);return XDP_DROP;} __u8 id=p[0]; if(id==1||id==2){ if(ping_ok(p,l,e)){cnt(0);return XDP_PASS;} cnt(2);return XDP_DROP;} if(id==5){ if(!req1_ok(p,l,e)){cnt(3);return XDP_DROP;} struct st st={now,now,1}; bpf_map_update_elem(&pending4,&ep,&st,BPF_ANY); cnt(7); cnt(0); return XDP_PASS;} if(id==7){ if(!parse_req2(p,l,e)){cnt(4);return XDP_DROP;} struct st*q=bpf_map_lookup_elem(&pending4,&ep); if(!q||q->stage!=1||now-q->last>PENDING_NS){cnt(4);return XDP_DROP;} struct st st={now,now,2}; bpf_map_update_elem(&verified4,&ep,&st,BPF_ANY); bpf_map_delete_elem(&pending4,&ep); cnt(8); cnt(0); return XDP_PASS;} cnt(4); return XDP_DROP; }
+static __always_inline int h6(const struct in6_addr*s,__u16 sp,__u16 dp,const __u8*p,__u32 l,const void*e,__u64 now){ struct ep6 ep={.sport=sp,.dport=dp}; __builtin_memcpy(&ep.src,s,sizeof(*s)); struct st*v=bpf_map_lookup_elem(&verified6,&ep); if(v){ if(now-v->last<VERIFIED_IDLE_NS&&now-v->created<VERIFIED_ABS_NS){ if(connected_ok(p,l,e)){v->last=now;cnt(0);return XDP_PASS;} cnt(5);cnt(1);return XDP_DROP;} bpf_map_delete_elem(&verified6,&ep);cnt(4);cnt(1);return XDP_DROP;} if(l<1){cnt(4);return XDP_DROP;} __u8 id=p[0]; if(id==1||id==2){ if(ping_ok(p,l,e)){cnt(0);return XDP_PASS;} cnt(2);return XDP_DROP;} if(id==5){ if(!req1_ok(p,l,e)){cnt(3);return XDP_DROP;} struct st st={now,now,1}; bpf_map_update_elem(&pending6,&ep,&st,BPF_ANY);cnt(9);cnt(0);return XDP_PASS;} if(id==7){ if(!parse_req2(p,l,e)){cnt(4);return XDP_DROP;} struct st*q=bpf_map_lookup_elem(&pending6,&ep); if(!q||q->stage!=1||now-q->last>PENDING_NS){cnt(4);return XDP_DROP;} struct st st={now,now,2}; bpf_map_update_elem(&verified6,&ep,&st,BPF_ANY); bpf_map_delete_elem(&pending6,&ep);cnt(10);cnt(0);return XDP_PASS;} cnt(4);return XDP_DROP; }
+SEC("xdp") int raknet_xdp_v5(struct xdp_md*ctx){ void*data=(void*)(long)ctx->data,*end=(void*)(long)ctx->data_end; struct ethhdr*eth=data; if((void*)(eth+1)>end) return XDP_PASS; __u16 proto=bpf_ntohs(eth->h_proto); __u64 off=sizeof(*eth); for(int i=0;i<2;i++){ if(proto==ETH_P_8021Q||proto==ETH_P_8021AD){ struct vlan_min*vh=data+off; if((void*)(vh+1)>end) return XDP_PASS; proto=bpf_ntohs(vh->encap); off+=sizeof(*vh); }} __u64 now=bpf_ktime_get_ns(); if(proto==ETH_P_IP){ struct iphdr*ip=data+off; if((void*)(ip+1)>end||ip->version!=4||ip->ihl<5) return XDP_PASS; __u32 ihl=ip->ihl*4; if((void*)ip+ihl>end||ip->protocol!=IPPROTO_UDP) return XDP_PASS; struct udphdr*u=(void*)ip+ihl; if((void*)(u+1)>end) return XDP_PASS; __u16 dp=bpf_ntohs(u->dest); if(!port_ok(dp)) return XDP_PASS; if(bpf_ntohs(ip->frag_off)&(IP_MF|IP_OFFSET)){cnt(1);return XDP_DROP;} __u16 ul=bpf_ntohs(u->len), tl=bpf_ntohs(ip->tot_len); if(ul<8||tl<ihl+ul||(void*)u+ul>end){cnt(1);return XDP_DROP;} if(!rate4(ip->saddr,ul,now)){cnt(6);cnt(1);return XDP_DROP;} return h4(ip->saddr,bpf_ntohs(u->source),dp,(void*)(u+1),ul-8,end,now); } if(proto==ETH_P_IPV6){ struct ipv6hdr*ip6=data+off; if((void*)(ip6+1)>end) return XDP_PASS; __u8 nh=ip6->nexthdr; __u64 o=off+sizeof(*ip6); for(int i=0;i<6;i++){ if(nh==IPPROTO_HOPOPTS||nh==IPPROTO_ROUTING||nh==IPPROTO_DSTOPTS){ if(data+o+2>end) return XDP_PASS; __u8*n=data+o; nh=n[0]; o+=(n[1]+1)*8; if(data+o>end) return XDP_PASS; } else if(nh==IPPROTO_FRAGMENT){ if(data+o+8>end) return XDP_PASS; struct frag_hdr{__u8 n;__u8 r;__be16 off;__be32 id;}*f=data+o; nh=f->n; if(f->off & bpf_htons(0xfff9)){cnt(1);return XDP_DROP;} o+=8; } else break; } if(nh!=IPPROTO_UDP) return XDP_PASS; struct udphdr*u=data+o; if((void*)(u+1)>end) return XDP_PASS; __u16 dp=bpf_ntohs(u->dest); if(!port_ok(dp)) return XDP_PASS; __u16 ul=bpf_ntohs(u->len); if(ul<8||bpf_ntohs(ip6->payload_len)<ul||(void*)u+ul>end){cnt(1);return XDP_DROP;} if(!rate6(&ip6->saddr,ul,now)){cnt(6);cnt(1);return XDP_DROP;} return h6(&ip6->saddr,bpf_ntohs(u->source),dp,(void*)(u+1),ul-8,end,now); } return XDP_PASS; }
 char LICENSE[] SEC("license")="GPL";
 EOF_C
 }
@@ -244,27 +238,27 @@ chmod 0755 "$JAVA_VALIDATOR"
 
 write_nft_rules(){
   load_conf
-  local jp rp t4 t6 iface_expr=""; jp="$(join_ports "$JAVA_PORTS")"; rp="$(join_ports "$RAKNET_PORTS")"; t4="$(set_literal "$TRUST4")"; t6="$(set_literal "$TRUST6")"
-  [[ -n "$jp" ]] || jp=""
-  [[ -n "$rp" ]] || rp=""
+  local jp rp t4 t6 iface_expr="" trust4_set trust6_set java_set raknet_set; jp="$(join_ports "$JAVA_PORTS")"; rp="$(join_ports "$RAKNET_PORTS")"; t4="$(set_literal "$TRUST4")"; t6="$(set_literal "$TRUST6")"
+  trust4_set="set trusted4 { type ipv4_addr; flags interval; }"; [[ -n "$t4" ]] && trust4_set="set trusted4 { type ipv4_addr; flags interval; elements = { $t4 }; }"
+  trust6_set="set trusted6 { type ipv6_addr; flags interval; }"; [[ -n "$t6" ]] && trust6_set="set trusted6 { type ipv6_addr; flags interval; elements = { $t6 }; }"
+  java_set="set java_ports { type inet_service; }"; [[ -n "$jp" ]] && java_set="set java_ports { type inet_service; elements = { $jp }; }"
+  raknet_set="set raknet_ports { type inet_service; }"; [[ -n "$rp" ]] && raknet_set="set raknet_ports { type inet_service; elements = { $rp }; }"
   [[ "${IFACE_FILTER:-1}" == 1 ]] && iface_expr="iifname \"$IFACE\""
   cat >"$NFT_RULES" <<EOF
 #!/usr/sbin/nft -f
 table inet $NFT_TABLE {
-  set trusted4 { type ipv4_addr; flags interval; elements = { ${t4} } }
-  set trusted6 { type ipv6_addr; flags interval; elements = { ${t6} } }
-  set java_ports { type inet_service; elements = { ${jp} } }
-  set raknet_ports { type inet_service; elements = { ${rp} } }
-  set ban4 { type ipv4_addr; flags timeout; }
-  set ban6 { type ipv6_addr; flags timeout; }
+  ${trust4_set}
+  ${trust6_set}
+  ${java_set}
+  ${raknet_set}
+  set game_ban4 { type ipv4_addr; flags timeout; }
+  set game_ban6 { type ipv6_addr; flags timeout; }
   set java_conn4 { type ipv4_addr; flags dynamic; }
   set java_conn6 { type ipv6_addr; flags dynamic; }
   chain baseline {
     ct state invalid counter drop
     ip saddr @trusted4 return
     ip6 saddr @trusted6 return
-    ip saddr @ban4 counter drop
-    ip6 saddr @ban6 counter drop
     meta l4proto tcp tcp flags & (fin|syn|rst|psh|ack|urg) == 0 counter drop
     meta l4proto tcp tcp flags & (fin|syn) == (fin|syn) counter drop
     meta l4proto tcp tcp flags & (syn|rst) == (syn|rst) counter drop
@@ -281,18 +275,16 @@ table inet $NFT_TABLE {
   chain game {
     ip saddr @trusted4 return
     ip6 saddr @trusted6 return
-    ip saddr @ban4 counter drop
-    ip6 saddr @ban6 counter drop
     meta l4proto udp udp dport @raknet_ports ip frag-off & 0x3fff != 0 counter drop
     meta l4proto udp udp dport @raknet_ports ip6 nexthdr frag counter drop
     meta l4proto tcp tcp dport @java_ports ct state new tcp flags syn meter javasyn4 { ip saddr timeout 10s limit rate over ${JAVA_SYN_RATE}/second burst ${JAVA_SYN_BURST} packets } counter drop
     meta l4proto tcp tcp dport @java_ports ct state new tcp flags syn meter javasyn6 { ip6 saddr timeout 10s limit rate over ${JAVA_SYN_RATE}/second burst ${JAVA_SYN_BURST} packets } counter drop
     meta l4proto tcp tcp dport @java_ports ct state new add @java_conn4 { ip saddr ct count over ${JAVA_CONN_LIMIT} } counter drop
     meta l4proto tcp tcp dport @java_ports ct state new add @java_conn6 { ip6 saddr ct count over ${JAVA_CONN_LIMIT} } counter drop
+    meta l4proto udp udp dport @raknet_ports meter hardpps4 { ip saddr timeout ${BAN_SECONDS}s limit rate over ${HARD_SRC_PPS}/second burst $((HARD_SRC_PPS*2)) packets } add @game_ban4 { ip saddr timeout ${BAN_SECONDS}s } counter drop
+    meta l4proto udp udp dport @raknet_ports meter hardpps6 { ip6 saddr timeout ${BAN_SECONDS}s limit rate over ${HARD_SRC_PPS}/second burst $((HARD_SRC_PPS*2)) packets } add @game_ban6 { ip6 saddr timeout ${BAN_SECONDS}s } counter drop
     meta l4proto udp udp dport @raknet_ports meter raksoft4 { ip saddr timeout 10s limit rate over ${RAKNET_SOFT_PPS}/second burst ${RAKNET_SOFT_BURST} packets } counter drop
     meta l4proto udp udp dport @raknet_ports meter raksoft6 { ip6 saddr timeout 10s limit rate over ${RAKNET_SOFT_PPS}/second burst ${RAKNET_SOFT_BURST} packets } counter drop
-    meta l4proto udp udp dport @raknet_ports meter hardpps4 { ip saddr timeout ${BAN_SECONDS}s limit rate over ${HARD_SRC_PPS}/second burst $((HARD_SRC_PPS*2)) packets } add @ban4 { ip saddr timeout ${BAN_SECONDS}s } counter drop
-    meta l4proto udp udp dport @raknet_ports meter hardpps6 { ip6 saddr timeout ${BAN_SECONDS}s limit rate over ${HARD_SRC_PPS}/second burst $((HARD_SRC_PPS*2)) packets } add @ban6 { ip6 saddr timeout ${BAN_SECONDS}s } counter drop
     return
   }
   chain input { type filter hook input priority -10; policy accept; ${iface_expr} jump baseline; ${iface_expr} jump game; }
@@ -396,11 +388,65 @@ EOF
 sysctl --system >/dev/null || true; }
 restore_sysctl(){ [[ -r "$SYSCTL_SAVED" ]] && while IFS='=' read -r k v; do [[ -n "$k" ]] && sysctl -w "$k=$v" >/dev/null 2>&1 || true; done <"$SYSCTL_SAVED"; rm -f "$SYSCTL_FILE"; sysctl --system >/dev/null 2>&1 || true; }
 
+map_ids_by_name(){
+  local prog="$1" name="$2" ids mid
+  ids="$(bpftool prog show id "$prog" 2>/dev/null | sed -n 's/.*map_ids \([^\n]*\)$/\1/p' | tr ',' ' ')"
+  for mid in $ids; do bpftool map show id "$mid" 2>/dev/null | grep -q "name $name" && { echo "$mid"; return 0; }; done
+  return 1
+}
+hex_key(){ python3 - "$1" <<'PYHEX'
+import struct,sys
+print(' '.join(f'{b:02x}' for b in struct.pack('<I', int(sys.argv[1]))))
+PYHEX
+}
+hex_u16(){ python3 - "$1" <<'PYHEX'
+import struct,sys
+print(' '.join(f'{b:02x}' for b in struct.pack('<H', int(sys.argv[1]))))
+PYHEX
+}
+hex_u8(){ printf '%02x' "$1"; }
+hex_cidr4(){ python3 - "$1" <<'PYHEX'
+import ipaddress,sys
+n=ipaddress.ip_network(sys.argv[1], strict=False)
+mask=((0xffffffff << (32-n.prefixlen)) & 0xffffffff) if n.prefixlen else 0
+print(' '.join(f'{b:02x}' for b in (int(n.network_address).to_bytes(4,'big') + mask.to_bytes(4,'big'))))
+PYHEX
+}
+hex_cidr6(){ python3 - "$1" <<'PYHEX'
+import ipaddress,sys
+n=ipaddress.ip_network(sys.argv[1], strict=False)
+print(' '.join(f'{b:02x}' for b in (n.network_address.packed + bytes([n.prefixlen,0,0,0]))))
+PYHEX
+}
 populate_xdp_maps(){
-  have bpftool || return 0
-  local id; id="$(cat "$XDP_PROG_FILE" 2>/dev/null || true)"; [[ -n "$id" ]] || return 0
-  # bpftool map updates vary by version; keep attachment safe even if map population is unavailable.
-  warn "If RakNet ports are not in XDP maps on this bpftool version, nftables protection still remains active. Use status to verify XDP counters."
+  have bpftool || die "bpftool is required to populate XDP maps"
+  load_conf
+  local id; id="$(cat "$XDP_PROG_FILE" 2>/dev/null || true)"; [[ -n "$id" ]] || die "No recorded XDP program id"
+  local ports_map protos_map trust4_map trust6_map i v
+  ports_map="$(map_ids_by_name "$id" ports)" || die "XDP ports map not found"
+  protos_map="$(map_ids_by_name "$id" protos)" || die "XDP protos map not found"
+  trust4_map="$(map_ids_by_name "$id" trust4)" || true
+  trust6_map="$(map_ids_by_name "$id" trust6)" || true
+  i=0; while read -r v; do [[ -n "$v" ]] || continue; bpftool map update id "$ports_map" key hex $(hex_key "$i") value hex $(hex_u16 "$v"); i=$((i+1)); done <"$RAKNET_PORTS"
+  i=0; IFS=',' read -ra _proto_arr <<<"${RAKNET_PROTOCOLS:-11,10}"; for v in "${_proto_arr[@]}"; do v="${v// /}"; [[ -n "$v" ]] || continue; bpftool map update id "$protos_map" key hex $(hex_key "$i") value hex $(hex_u8 "$v"); i=$((i+1)); done
+  if [[ -n "${trust4_map:-}" ]]; then i=0; while read -r v; do [[ -n "$v" ]] || continue; bpftool map update id "$trust4_map" key hex $(hex_key "$i") value hex $(hex_cidr4 "$v"); i=$((i+1)); done <"$TRUST4"; fi
+  if [[ -n "${trust6_map:-}" ]]; then i=0; while read -r v; do [[ -n "$v" ]] || continue; bpftool map update id "$trust6_map" key hex $(hex_key "$i") value hex $(hex_cidr6 "$v"); i=$((i+1)); done <"$TRUST6"; fi
+  ok "Populated XDP ports, RakNet protocol versions, and trusted CIDR maps."
+}
+
+validate_nft_transaction(){
+  local tmp; tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  if nft list table inet $NFT_TABLE >/dev/null 2>&1; then echo "delete table inet $NFT_TABLE" >"$tmp"; fi
+  cat "$NFT_RULES" >>"$tmp"
+  nft -c -f "$tmp"
+}
+
+test_load_xdp(){
+  have bpftool || return 1
+  local pin="/sys/fs/bpf/zerox-ddos-v5-test-$$"
+  rm -f "$pin"
+  bpftool prog load "$XDP_OBJ" "$pin" type xdp
+  rm -f "$pin"
 }
 
 run_self_tests(){
@@ -410,8 +456,8 @@ run_self_tests(){
   have nft || { echo "nft missing"; failed=1; }
   have clang || { echo "clang missing"; failed=1; }
   have ip || { echo "ip missing"; failed=1; }
-  write_nft_rules; nft -c -f "$NFT_RULES" || failed=1
-  if [[ -s "$RAKNET_PORTS" ]]; then compile_xdp || failed=1; if have llvm-objdump; then llvm-objdump -h "$XDP_OBJ" | grep -w xdp || failed=1; elif have readelf; then readelf -S "$XDP_OBJ" | grep -w xdp || failed=1; fi; bpftool feature probe kernel unprivileged 2>/dev/null | head -20 || true; "$XDP_CTRL" status >/dev/null 2>&1 || true; fi
+  write_nft_rules; validate_nft_transaction || failed=1
+  if [[ -s "$RAKNET_PORTS" ]]; then compile_xdp || failed=1; if have llvm-objdump; then llvm-objdump -h "$XDP_OBJ" | grep -w xdp || failed=1; elif have readelf; then readelf -S "$XDP_OBJ" | grep -w xdp || failed=1; fi; bpftool feature probe kernel unprivileged 2>/dev/null | head -20 || true; test_load_xdp || failed=1; "$XDP_CTRL" status >/dev/null 2>&1 || true; fi
   if [[ "${JAVA_VALIDATOR_ENABLED:-0}" == 1 ]]; then "$JAVA_VALIDATOR" --startup-test --max-initial "$JAVA_MAX_INITIAL" || failed=1; fi
   nft describe ct state >/dev/null || failed=1
   nft describe limit >/dev/null || failed=1
@@ -423,8 +469,17 @@ apply_reload(){
   ensure_dirs; load_conf; write_nft_rules; write_loader; write_xdp_control; write_java_validator; [[ -s "$RAKNET_PORTS" ]] && compile_xdp
   run_self_tests
   systemctl daemon-reload || true
-  "$NFT_LOADER"
-  if [[ -s "$RAKNET_PORTS" ]]; then "$XDP_CTRL" attach || { warn "XDP attach failed after nft load; nftables remains active."; exit 1; }; populate_xdp_maps; fi
+  local old_nft="$STATE/previous.nft" old_xdp="$STATE/previous_xdp_id"
+  nft list table inet "$NFT_TABLE" >"$old_nft" 2>/dev/null || : >"$old_nft"
+  [[ -x "$XDP_CTRL" ]] && "$XDP_CTRL" status | sed -n 's/^Program ID: //p' >"$old_xdp" 2>/dev/null || true
+  if ! "$NFT_LOADER"; then warn "nftables load failed; previous managed table preserved by atomic validation."; return 1; fi
+  if [[ -s "$RAKNET_PORTS" ]]; then
+    if ! "$XDP_CTRL" attach || ! populate_xdp_maps; then
+      warn "XDP attach/map population failed; restoring previous managed nftables table."
+      if [[ -s "$old_nft" ]]; then { echo "delete table inet $NFT_TABLE"; cat "$old_nft"; } | nft -f - || true; else nft delete table inet "$NFT_TABLE" 2>/dev/null || true; fi
+      return 1
+    fi
+  fi
   ok "Protection applied."
 }
 
@@ -435,7 +490,7 @@ install_all(){
   if yesno "Add default RakNet/Geyser Bedrock port 19132?" y; then echo 19132 >>"$RAKNET_PORTS"; fi
   unique_file "$JAVA_PORTS"; unique_file "$RAKNET_PORTS"
   v="$(read_default 'Temporary ban seconds (60-600)' "$(cat "$BAN_SECONDS_FILE")")"; [[ "$v" =~ ^[0-9]+$ ]] && ((v>=60&&v<=600)) || die "Invalid ban seconds"; echo "$v" >"$BAN_SECONDS_FILE"; perl -0777 -i -pe "s/^BAN_SECONDS=.*/BAN_SECONDS=$v/m" "$CONF"
-  write_java_validator; write_services; apply_sysctl; apply_reload; systemctl enable zerox-ddos-v5.service >/dev/null 2>&1 || true
+  write_java_validator; write_services; apply_sysctl; apply_reload; systemctl enable --now zerox-ddos-v5.service >/dev/null 2>&1 || true
 }
 
 add_port(){ local f="$1" p; p="$(read_default 'Port' '')"; valid_port "$p" || die "Invalid port"; echo "$p" >>"$f"; unique_file "$f"; ok "Added $p"; }
@@ -447,10 +502,41 @@ open(sys.argv[2] if net.version==4 else sys.argv[3],'a').write(str(net)+'\n')
 PY
 unique_file "$TRUST4"; unique_file "$TRUST6";; 3) local n; n="$(read_default 'CIDR to remove' '')"; sed -i "#^$n\$#d" "$TRUST4" "$TRUST6";; 4) echo IPv4; cat "$TRUST4"; echo IPv6; cat "$TRUST6";; 5) :>"$TRUST4"; :>"$TRUST6";; 0) break;; esac; done; }
 select_profile(){ echo "1 Conservative (recommended)  2 Balanced  3 Aggressive"; read -r -p '> ' c; case "$c" in 1) PROFILE=conservative;;2) PROFILE=balanced;;3) PROFILE=aggressive;;*) die invalid;; esac; echo "$PROFILE" >"$PROFILE_FILE"; perl -0777 -i -pe "s/^PROFILE=.*/PROFILE=\"$PROFILE\"/m" "$CONF"; apply_profile_defaults; }
-show_bans(){ nft list set inet "$NFT_TABLE" ban4 2>/dev/null || true; nft list set inet "$NFT_TABLE" ban6 2>/dev/null || true; }
-clear_ban(){ local ip; ip="$(read_default 'IP to clear' '')"; nft delete element inet "$NFT_TABLE" ban4 "{ $ip }" 2>/dev/null || nft delete element inet "$NFT_TABLE" ban6 "{ $ip }" 2>/dev/null || true; }
-clear_all_bans(){ nft flush set inet "$NFT_TABLE" ban4 2>/dev/null || true; nft flush set inet "$NFT_TABLE" ban6 2>/dev/null || true; }
-status(){ load_conf; echo "=== Zerox DDoS Protection V5 status ==="; systemctl is-active zerox-ddos-v5.service 2>/dev/null || true; echo "Interface: ${IFACE:-unset}"; echo "Profile: ${PROFILE:-unset}"; echo "Java ports: $(join_ports "$JAVA_PORTS")"; echo "RakNet ports: $(join_ports "$RAKNET_PORTS")"; echo "Trusted IPv4:"; cat "$TRUST4" 2>/dev/null || true; echo "Trusted IPv6:"; cat "$TRUST6" 2>/dev/null || true; echo "--- nftables ---"; nft -a list table inet "$NFT_TABLE" 2>/dev/null || echo not-loaded; echo "--- bans ---"; show_bans; echo "--- XDP ---"; [[ -x "$XDP_CTRL" ]] && "$XDP_CTRL" status || true; echo "--- conntrack ---"; local c m; c=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0); m=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0); echo "conntrack_count=$c max=$m usage=$([[ $m -gt 0 ]] && awk -v c=$c -v m=$m 'BEGIN{printf "%.2f%%",100*c/m}' || echo n/a)"; have bpftool && bpftool map show 2>/dev/null | grep -E 'stats|pending|verified|rates' || true; }
+show_bans(){ nft list set inet "$NFT_TABLE" game_ban4 2>/dev/null || true; nft list set inet "$NFT_TABLE" game_ban6 2>/dev/null || true; }
+clear_ban(){ local ip; ip="$(read_default 'IP to clear' '')"; nft delete element inet "$NFT_TABLE" game_ban4 "{ $ip }" 2>/dev/null || nft delete element inet "$NFT_TABLE" game_ban6 "{ $ip }" 2>/dev/null || true; }
+clear_all_bans(){ nft flush set inet "$NFT_TABLE" game_ban4 2>/dev/null || true; nft flush set inet "$NFT_TABLE" game_ban6 2>/dev/null || true; }
+status(){
+  load_conf
+  echo "=== Zerox DDoS Protection V5 status ==="
+  systemctl is-active zerox-ddos-v5.service 2>/dev/null || true
+  echo "Interface: ${IFACE:-unset}"
+  echo "Profile: ${PROFILE:-unset}"
+  echo "Java protection: transport-only unless an administrator adds external TPROXY/sk_skb integration"
+  echo "Java ports: $(join_ports "$JAVA_PORTS")"
+  echo "RakNet ports: $(join_ports "$RAKNET_PORTS")"
+  echo "RakNet protocol allowlist: ${RAKNET_PROTOCOLS:-11,10}"
+  echo "Trusted IPv4:"; cat "$TRUST4" 2>/dev/null || true
+  echo "Trusted IPv6:"; cat "$TRUST6" 2>/dev/null || true
+  echo "--- nftables ---"; nft -a list table inet "$NFT_TABLE" 2>/dev/null || echo not-loaded
+  echo "--- game bans ---"; show_bans
+  echo "--- XDP ---"
+  if [[ -x "$XDP_CTRL" ]]; then "$XDP_CTRL" status || true; fi
+  if have bpftool; then
+    local xid sm pm vm rm
+    xid="$(cat "$XDP_PROG_FILE" 2>/dev/null || true)"
+    if [[ -n "$xid" ]]; then
+      for mname in stats ports protos trust4 trust6 pending4 pending6 verified4 verified6 rates4 rates6; do
+        mid="$(map_ids_by_name "$xid" "$mname" 2>/dev/null || true)"
+        [[ -n "$mid" ]] || continue
+        echo "map $mname id=$mid"
+        bpftool map dump id "$mid" 2>/dev/null | head -40 || true
+      done
+    fi
+  fi
+  echo "--- conntrack ---"
+  local c m; c=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0); m=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
+  echo "conntrack_count=$c max=$m usage=$([[ $m -gt 0 ]] && awk -v c=$c -v m=$m 'BEGIN{printf "%.2f%%",100*c/m}' || echo n/a)"
+}
 uninstall_all(){ need_root; systemctl disable --now zerox-ddos-v5.service zerox-java-validator-v5.service 2>/dev/null || true; [[ -x "$XDP_CTRL" ]] && "$XDP_CTRL" detach || true; nft delete table inet "$NFT_TABLE" 2>/dev/null || true; restore_sysctl; rm -f "$SERVICE" "$JAVA_SERVICE" "$NFT_LOADER" "$XDP_CTRL" "$JAVA_VALIDATOR"; rm -rf "$APP"; systemctl daemon-reload || true; ok "Uninstalled."; }
 
 menu(){ need_root; ensure_dirs; [[ -r "$CONF" ]] || write_default_conf; while true; do cat <<EOF
