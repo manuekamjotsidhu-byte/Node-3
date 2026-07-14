@@ -656,6 +656,27 @@ async def tracked_server_autocomplete(interaction: discord.Interaction, current:
     return row_server_choices(current, fetch_user_servers(interaction.user.id))
 
 
+async def accessible_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if interaction.guild is not None and is_admin(interaction.user):
+        return await admin_tracked_server_autocomplete(interaction, current)
+    return await tracked_server_autocomplete(interaction, current)
+
+
+def command_allows_admin_access(interaction: discord.Interaction) -> bool:
+    return interaction.guild is not None and is_admin(interaction.user)
+
+
+async def admin_or_owner_server(interaction: discord.Interaction, server: str) -> sqlite3.Row | dict[str, Any]:
+    return await ensure_server_access(interaction, server, allow_admin=command_allows_admin_access(interaction))
+
+
+async def require_client_identifier(row: sqlite3.Row | dict[str, Any]) -> str:
+    identifier = record_value(row, "identifier")
+    if not identifier:
+        raise RuntimeError("This server is missing its Pterodactyl client identifier. Run `/admin list` to refresh panel data, then try again.")
+    return str(identifier)
+
+
 async def admin_tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     if interaction.guild is None or not is_admin(interaction.user):
         return []
@@ -1074,11 +1095,12 @@ async def admin_manage(interaction: discord.Interaction, server: str) -> None:
 @app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def admin_console(interaction: discord.Interaction, server: str, command: str) -> None:
     await interaction.response.defer(ephemeral=True)
+    if not command.strip():
+        raise RuntimeError("Console command cannot be empty.")
     row = await ensure_server_access(interaction, server, allow_admin=True)
-    if not row["identifier"]:
-        raise RuntimeError("This tracked server is missing its client identifier.")
-    await client_api.command(row["identifier"], command)
-    await interaction.followup.send(embed=branded_embed("Admin Console Command Sent", f"Sent command to **{row['name']}**.\n```{clean(command, 1000)}```"), ephemeral=True)
+    identifier = await require_client_identifier(row)
+    await client_api.command(identifier, command.strip())
+    await interaction.followup.send(embed=branded_embed("Admin Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
 
 @admin_group.command(name="rename", description="Rename any tracked server")
@@ -1124,40 +1146,43 @@ async def list_mine(interaction: discord.Interaction) -> None:
         await interaction.followup.send(embed=embeds[0])
 
 @tree.command(name="manage", description="Open server manager")
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=accessible_server_autocomplete)
 async def manage(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    row = await ensure_server_access(interaction, server)
-    resources = await client_api.resources(row["identifier"]) if row["identifier"] else {}
-    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server), ephemeral=True)
+    allow_admin = command_allows_admin_access(interaction)
+    row = await ensure_server_access(interaction, server, allow_admin=allow_admin)
+    identifier = record_value(row, "identifier")
+    resources = await client_api.resources(str(identifier)) if identifier else {}
+    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=allow_admin), ephemeral=True)
 
 
 @tree.command(name="console", description="Send console command")
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=accessible_server_autocomplete)
 async def console(interaction: discord.Interaction, server: str, command: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    row = await ensure_server_access(interaction, server)
-    if not row["identifier"]:
-        raise RuntimeError("This tracked server is missing its client identifier.")
-    await client_api.command(row["identifier"], command)
-    await interaction.followup.send(embed=branded_embed("Console Command Sent", f"Sent command to **{row['name']}**.\n```{clean(command, 1000)}```"), ephemeral=True)
+    if not command.strip():
+        raise RuntimeError("Console command cannot be empty.")
+    row = await admin_or_owner_server(interaction, server)
+    identifier = await require_client_identifier(row)
+    await client_api.command(identifier, command.strip())
+    await interaction.followup.send(embed=branded_embed("Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
 
 @tree.command(name="rename", description="Rename server")
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=accessible_server_autocomplete)
 async def rename(interaction: discord.Interaction, server: str, new_name: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    row = await ensure_server_access(interaction, server)
-    if not row["identifier"]:
-        raise RuntimeError("This tracked server is missing its client identifier.")
-    await client_api.rename(row["identifier"], new_name)
-    with db() as connection:
-        connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
-    await interaction.followup.send(embed=branded_embed("Server Renamed", f"`{row['name']}` is now **{new_name}**."), ephemeral=True)
+    row = await admin_or_owner_server(interaction, server)
+    identifier = await require_client_identifier(row)
+    await client_api.rename(identifier, new_name)
+    if fetch_server(server):
+        with db() as connection:
+            connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
+    await interaction.followup.send(embed=branded_embed("Server Renamed", f"`{record_value(row, 'name', server)}` is now **{new_name}**."), ephemeral=True)
 
 
 @tree.command(name="schedule-restart", description="Schedule restarts")
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=accessible_server_autocomplete)
 async def schedule_restart(interaction: discord.Interaction, time: str, server: str | None = None, all_servers: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     seconds = parse_duration(time)
@@ -1173,10 +1198,12 @@ async def schedule_restart(interaction: discord.Interaction, time: str, server: 
         return
     if not server:
         raise RuntimeError("Select one server, or admins can set all_servers:True inside the Discord server.")
-    row = await ensure_server_access(interaction, server)
+    row = await admin_or_owner_server(interaction, server)
+    if not fetch_server(server):
+        raise RuntimeError("Scheduled restarts require a locally tracked server. Use `/create-free`, `/create-paid`, or renew/link tracking first.")
     with db() as connection:
         connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,0,1)", (server, str(interaction.user.id), seconds, next_run))
-    await interaction.followup.send(embed=branded_embed("Restart Scheduled", f"**{row['name']}** will restart every **{time}**."), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("Restart Scheduled", f"**{record_value(row, 'name', server)}** will restart every **{time}**."), ephemeral=True)
 
 
 @tree.command(name="renew", description="Admin renew server")
@@ -1231,24 +1258,23 @@ async def delete(interaction: discord.Interaction, server: str, confirm: bool = 
 
 
 @tree.command(name="power", description="Power server")
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=accessible_server_autocomplete)
 @app_commands.choices(action=[app_commands.Choice(name="start", value="start"), app_commands.Choice(name="stop", value="stop"), app_commands.Choice(name="restart", value="restart")])
 async def power(interaction: discord.Interaction, server: str, action: app_commands.Choice[str]) -> None:
     await interaction.response.defer(ephemeral=True)
-    row = await ensure_server_access(interaction, server)
-    if not row["identifier"]:
-        raise RuntimeError("This tracked server is missing its client identifier.")
-    await client_api.power(row["identifier"], action.value)
-    await interaction.followup.send(embed=branded_embed("Power Signal Sent", f"Sent **{action.value}** to **{row['name']}**."), ephemeral=True)
+    row = await admin_or_owner_server(interaction, server)
+    identifier = await require_client_identifier(row)
+    await client_api.power(identifier, action.value)
+    await interaction.followup.send(embed=branded_embed("Power Signal Sent", f"Sent **{action.value}** to **{record_value(row, 'name', server)}**."), ephemeral=True)
 
 
 @tree.command(name="reinstall", description="Reinstall server")
-@app_commands.autocomplete(server=tracked_server_autocomplete)
+@app_commands.autocomplete(server=accessible_server_autocomplete)
 async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    row = await ensure_server_access(interaction, server)
+    row = await admin_or_owner_server(interaction, server)
     await ptero.reinstall_server(server)
-    await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{row['name']}**."), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{record_value(row, 'name', server)}**."), ephemeral=True)
 
 
 @tree.command(name="resize", description="Resize server")
