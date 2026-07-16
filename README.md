@@ -52,6 +52,7 @@ python bot.py
 - `/manage` - users open a premium control panel for one of their own linked servers with live resource usage and start/stop/restart/kill buttons.
 - `/power` - users or admins start, stop, or restart an owned/tracked server.
 - `/reinstall` - users or admins reinstall an owned/tracked server.
+- `/change-egg` - users can change their own server egg, while guild admins get all-server autocomplete; it asks for nest, egg, whether to wipe files, and whether to reinstall.
 - `/console` - users send a console command to their own linked server.
 - `/rename` - users rename their own linked server.
 - `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.

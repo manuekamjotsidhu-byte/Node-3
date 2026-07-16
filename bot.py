@@ -333,15 +333,33 @@ class PterodactylClient:
                 environment[env_name] = str(attributes.get("default_value") or "")
         return environment
 
-    async def create_server(self, *, panel_user_id: int, name: str, ram: int, disk: int, cpu: int, node_id: int, nest_id: int, egg_id: int, databases: int, allocations: int, backups: int) -> dict[str, Any]:
-        egg = await self.get_egg(nest_id, egg_id)
+    def egg_docker_image(self, egg: dict[str, Any]) -> str | None:
         docker_images = egg.get("docker_images") or {}
         if isinstance(docker_images, dict):
-            docker_image = egg.get("docker_image") or next(iter(docker_images.values()), None)
-        elif isinstance(docker_images, list):
-            docker_image = egg.get("docker_image") or next(iter(docker_images), None)
-        else:
-            docker_image = egg.get("docker_image")
+            return egg.get("docker_image") or next(iter(docker_images.values()), None)
+        if isinstance(docker_images, list):
+            return egg.get("docker_image") or next(iter(docker_images), None)
+        return egg.get("docker_image")
+
+    async def change_server_egg(self, server_id: str, nest_id: int, egg_id: int, *, skip_scripts: bool = False) -> dict[str, Any]:
+        egg = await self.get_egg(nest_id, egg_id)
+        docker_image = self.egg_docker_image(egg)
+        startup = egg.get("startup")
+        if not docker_image or not startup:
+            raise RuntimeError("Selected egg is missing a startup command or Docker image on the panel.")
+        payload = {
+            "startup": startup,
+            "environment": await self.egg_environment(nest_id, egg_id),
+            "egg": egg_id,
+            "image": docker_image,
+            "skip_scripts": skip_scripts,
+        }
+        data = await self.request("PATCH", f"servers/{server_id}/startup", payload)
+        return data.get("attributes", {})
+
+    async def create_server(self, *, panel_user_id: int, name: str, ram: int, disk: int, cpu: int, node_id: int, nest_id: int, egg_id: int, databases: int, allocations: int, backups: int) -> dict[str, Any]:
+        egg = await self.get_egg(nest_id, egg_id)
+        docker_image = self.egg_docker_image(egg)
         startup = egg.get("startup")
         if not docker_image or not startup:
             raise RuntimeError("Selected egg is missing a startup command or Docker image on the panel.")
@@ -1275,6 +1293,29 @@ async def reinstall(interaction: discord.Interaction, server: str) -> None:
     row = await admin_or_owner_server(interaction, server)
     await ptero.reinstall_server(server)
     await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{record_value(row, 'name', server)}**."), ephemeral=True)
+
+
+@tree.command(name="change-egg", description="Change server egg")
+@app_commands.autocomplete(server=accessible_server_autocomplete, nest=nest_autocomplete, egg=egg_autocomplete)
+async def change_egg(interaction: discord.Interaction, server: str, nest: str, egg: str, wipe_files: bool = False, reinstall: bool = True) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = await admin_or_owner_server(interaction, server)
+    nest_id = parse_id(nest)
+    egg_id = parse_id(egg)
+    if nest_id <= 0 or egg_id <= 0:
+        raise RuntimeError("Select a real nest and egg from autocomplete before changing the server egg.")
+    nest_name = nest.split(":", 1)[1] if ":" in nest else f"Nest {nest_id}"
+    egg_name = egg.split(":", 1)[1] if ":" in egg else f"Egg {egg_id}"
+    await ptero.change_server_egg(server, nest_id, egg_id)
+    reinstall_requested = reinstall or wipe_files
+    if reinstall_requested:
+        await ptero.reinstall_server(server)
+    if fetch_server(server):
+        with db() as connection:
+            connection.execute("UPDATE servers SET nest_id=?, nest_name=?, egg_id=?, egg_name=? WHERE server_id=?", (nest_id, nest_name, egg_id, egg_name, server))
+    wipe_note = "Wipe requested; Pterodactyl reinstall was started so files will be rebuilt by the panel." if wipe_files else "Files were left in place unless the panel reinstall process changes them."
+    reinstall_note = "Reinstall started." if reinstall_requested else "Reinstall was not started."
+    await interaction.followup.send(embed=branded_embed("Egg Changed", f"**{record_value(row, 'name', server)}** is now set to **{nest_name} / {egg_name}**.\n{reinstall_note}\n{wipe_note}"), ephemeral=True)
 
 
 @tree.command(name="resize", description="Resize server")
