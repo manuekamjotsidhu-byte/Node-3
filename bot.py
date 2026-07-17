@@ -556,6 +556,25 @@ client_api = PterodactylClientApi(config.get("panel_url", PANEL_URL), config.get
 # The free panel is deliberately a separate client. Do not reuse paid-panel
 # credentials here: account provisioning is supported only on FreeDash.
 free_ptero = PterodactylClient(config.get("free_panel_url", "https://mc.freedash.cloud"), config.get("free_panel_api_key", ""))
+free_client_api = PterodactylClientApi(
+    config.get("free_panel_url", "https://mc.freedash.cloud"),
+    config.get("free_client_api_key", ""),
+)
+
+
+def client_api_for_record(record: sqlite3.Row | dict[str, Any]) -> PterodactylClientApi:
+    """Route client actions to the panel that owns the selected server."""
+    return free_client_api if str(record_value(record, "plan", "")).lower() == "free" else client_api
+
+
+async def ready_client_api_for(record: sqlite3.Row | dict[str, Any]) -> PterodactylClientApi:
+    """Start the selected panel client on demand before a client-API request."""
+    api = client_api_for_record(record)
+    if not api.session:
+        if api is free_client_api and not config.get("free_client_api_key"):
+            raise RuntimeError("Set `free_client_api_key` in config.json to manage FreeDash servers.")
+        await api.start()
+    return api
 
 
 
@@ -882,7 +901,7 @@ class ManageView(discord.ui.View):
 
     async def refresh_message(self, interaction: discord.Interaction, note: str) -> None:
         row = await self.row(interaction)
-        resources = await client_api.resources(row["identifier"]) if row["identifier"] else {}
+        resources = await (await ready_client_api_for(row)).resources(row["identifier"]) if row["identifier"] else {}
         embed = manage_embed(row, resources)
         embed.description = f"{embed.description}\n\n{note}"
         await interaction.response.edit_message(embed=embed, view=self)
@@ -892,7 +911,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
-        await client_api.power(row["identifier"], "start")
+        await (await ready_client_api_for(row)).power(row["identifier"], "start")
         await self.refresh_message(interaction, "✅ Start signal sent.")
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="⏹️", row=0)
@@ -900,7 +919,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
-        await client_api.power(row["identifier"], "stop")
+        await (await ready_client_api_for(row)).power(row["identifier"], "stop")
         await self.refresh_message(interaction, "✅ Stop signal sent.")
 
     @discord.ui.button(label="Restart", style=discord.ButtonStyle.primary, emoji="🔁", row=0)
@@ -908,7 +927,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
-        await client_api.power(row["identifier"], "restart")
+        await (await ready_client_api_for(row)).power(row["identifier"], "restart")
         await self.refresh_message(interaction, "✅ Restart signal sent.")
 
     @discord.ui.button(label="Kill", style=discord.ButtonStyle.danger, emoji="💀", row=0)
@@ -916,7 +935,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
-        await client_api.power(row["identifier"], "kill")
+        await (await ready_client_api_for(row)).power(row["identifier"], "kill")
         await self.refresh_message(interaction, "✅ Kill signal sent.")
 
 
@@ -1215,7 +1234,7 @@ async def admin_list(interaction: discord.Interaction) -> None:
 async def admin_manage(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await ensure_server_access(interaction, server, allow_admin=True)
-    resources = await client_api.resources(row["identifier"]) if row["identifier"] else {}
+    resources = await (await ready_client_api_for(row)).resources(row["identifier"]) if row["identifier"] else {}
     await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=True), ephemeral=True)
 
 
@@ -1228,7 +1247,7 @@ async def admin_console(interaction: discord.Interaction, server: str, command: 
         raise RuntimeError("Console command cannot be empty.")
     row = await ensure_server_access(interaction, server, allow_admin=True)
     identifier = await require_client_identifier(row)
-    await client_api.command(identifier, command.strip())
+    await (await ready_client_api_for(row)).command(identifier, command.strip())
     await interaction.followup.send(embed=branded_embed("Admin Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
 
@@ -1240,7 +1259,7 @@ async def admin_rename(interaction: discord.Interaction, server: str, new_name: 
     row = await ensure_server_access(interaction, server, allow_admin=True)
     if not row["identifier"]:
         raise RuntimeError("This tracked server is missing its client identifier.")
-    await client_api.rename(row["identifier"], new_name)
+    await (await ready_client_api_for(row)).rename(row["identifier"], new_name)
     with db() as connection:
         connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
     await interaction.followup.send(embed=branded_embed("Admin Server Renamed", f"`{row['name']}` is now **{new_name}**."), ephemeral=True)
@@ -1281,7 +1300,7 @@ async def manage(interaction: discord.Interaction, server: str) -> None:
     allow_admin = command_allows_admin_access(interaction)
     row = await ensure_server_access(interaction, server, allow_admin=allow_admin)
     identifier = record_value(row, "identifier")
-    resources = await client_api.resources(str(identifier)) if identifier else {}
+    resources = await (await ready_client_api_for(row)).resources(str(identifier)) if identifier else {}
     await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=allow_admin), ephemeral=True)
 
 
@@ -1293,7 +1312,7 @@ async def console(interaction: discord.Interaction, server: str, command: str) -
         raise RuntimeError("Console command cannot be empty.")
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
-    await client_api.command(identifier, command.strip())
+    await (await ready_client_api_for(row)).command(identifier, command.strip())
     await interaction.followup.send(embed=branded_embed("Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
 
@@ -1303,7 +1322,7 @@ async def rename(interaction: discord.Interaction, server: str, new_name: str) -
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
-    await client_api.rename(identifier, new_name)
+    await (await ready_client_api_for(row)).rename(identifier, new_name)
     if fetch_server(server):
         with db() as connection:
             connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
@@ -1393,7 +1412,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
-    await client_api.power(identifier, action.value)
+    await (await ready_client_api_for(row)).power(identifier, action.value)
     await interaction.followup.send(embed=branded_embed("Power Signal Sent", f"Sent **{action.value}** to **{record_value(row, 'name', server)}**."), ephemeral=True)
 
 
@@ -1820,6 +1839,7 @@ async def main() -> None:
         await ptero.close()
         await client_api.close()
         await free_ptero.close()
+        await free_client_api.close()
 
 
 if __name__ == "__main__":

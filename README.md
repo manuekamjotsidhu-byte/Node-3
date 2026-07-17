@@ -24,7 +24,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 ## Files
 
 - `bot.py` - the full Discord bot, slash commands, Pterodactyl Application/Client API clients, local SQLite `.db`, DM embeds, paid logs, purge, whitelist, autobackups, and expiration loop.
-- `config.example.json` - copy to `config.json` and fill in Discord/Pterodactyl settings. `free_panel_url` and `free_panel_api_key` are only needed for FreeDash account creation. Nests and eggs are fetched from the panel, not hardcoded.
+- `config.example.json` - copy to `config.json` and fill in Discord/Pterodactyl settings. FreeDash needs its own `free_panel_api_key` **and** `free_client_api_key`; the Application key provisions/administers FreeDash, while the Client key is required for FreeDash server power, console, resources, and backups. Nests and eggs are fetched from the panel, not hardcoded.
 - `requirements.txt` - Python dependencies.
 - `data/zerox_host.db` - generated SQLite runtime database used for links, servers, whitelist, autobackups, and exact-time suspension. A legacy JSON mirror may also be created.
 
