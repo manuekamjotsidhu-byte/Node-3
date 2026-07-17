@@ -44,7 +44,7 @@ python bot.py
 
 ## Slash commands
 
-- `/create-free` - admin-only free server creation with linked Discord user, name, RAM/Disk in GB, specs, nest, egg, node, `time` duration, and optional feature limits.
+- `/create-free` - admin-only **FreeDash** server creation. Its node, nest, and egg autocomplete values are loaded from the FreeDash panel, and it requires the user to have a FreeDash account linked through `/admin createuser`.
 - `/create-paid` - admin-only paid server creation with `time` duration, RAM/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging.
 - `/admin list` - admin-only paginated embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
 - `/admin createuser` - admin-only **FreeDash** account creation and Discord linking. It requests the target Discord user, email, username, first/last name, and temporary password, then DMs polished credentials. It has no paid/free selector because the bot never creates paid-panel accounts.

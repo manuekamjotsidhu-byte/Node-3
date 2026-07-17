@@ -235,6 +235,12 @@ def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
     return row if row and int(row["panel_user_id"] or 0) > 0 and str(row["email"] or "").strip() else None
 
 
+def fetch_free_link(discord_user_id: int) -> sqlite3.Row | None:
+    with db() as connection:
+        row = connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
+    return row if row and int(row["free_panel_user_id"] or 0) > 0 and str(row["free_email"] or "").strip() else None
+
+
 def fetch_links_by_panel_user() -> dict[int, sqlite3.Row]:
     with db() as connection:
         rows = connection.execute("SELECT * FROM links").fetchall()
@@ -662,8 +668,24 @@ async def node_autocomplete(interaction: discord.Interaction, current: str) -> l
     return [app_commands.Choice(name=f"{node['name']} (ID {node['id']})", value=f"{node['id']}:{node['name']}") for node in matches[:25]]
 
 
+async def free_node_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if not free_ptero.session:
+        await free_ptero.start()
+    nodes = free_ptero.node_cache or await free_ptero.list_nodes()
+    matches = [node for node in nodes if current.lower() in f"{node['id']} {node['name']}".lower()]
+    return [app_commands.Choice(name=f"{node['name']} (ID {node['id']})", value=f"{node['id']}:{node['name']}") for node in matches[:25]]
+
+
 async def nest_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     nests = ptero.nest_cache or await ptero.list_nests()
+    matches = [nest for nest in nests if current.lower() in f"{nest['id']} {nest['name']}".lower()]
+    return [app_commands.Choice(name=f"{nest['name']} (ID {nest['id']})", value=f"{nest['id']}:{nest['name']}") for nest in matches[:25]]
+
+
+async def free_nest_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if not free_ptero.session:
+        await free_ptero.start()
+    nests = free_ptero.nest_cache or await free_ptero.list_nests()
     matches = [nest for nest in nests if current.lower() in f"{nest['id']} {nest['name']}".lower()]
     return [app_commands.Choice(name=f"{nest['name']} (ID {nest['id']})", value=f"{nest['id']}:{nest['name']}") for nest in matches[:25]]
 
@@ -674,6 +696,18 @@ async def egg_autocomplete(interaction: discord.Interaction, current: str) -> li
         return [app_commands.Choice(name="Select a nest first", value="0:select-nest-first")]
     nest_id = parse_id(str(nest_value))
     eggs = ptero.egg_cache.get(nest_id) or await ptero.list_eggs(nest_id)
+    matches = [egg for egg in eggs if current.lower() in f"{egg['id']} {egg['name']}".lower()]
+    return [app_commands.Choice(name=f"{egg['name']} (ID {egg['id']})", value=f"{egg['id']}:{egg['name']}") for egg in matches[:25]]
+
+
+async def free_egg_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    nest_value = getattr(interaction.namespace, "nest", None)
+    if not nest_value:
+        return []
+    if not free_ptero.session:
+        await free_ptero.start()
+    nest_id = parse_id(nest_value)
+    eggs = free_ptero.egg_cache.get(nest_id) or await free_ptero.list_eggs(nest_id)
     matches = [egg for egg in eggs if current.lower() in f"{egg['id']} {egg['name']}".lower()]
     return [app_commands.Choice(name=f"{egg['name']} (ID {egg['id']})", value=f"{egg['id']}:{egg['name']}") for egg in matches[:25]]
 
@@ -1015,15 +1049,20 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     if nest_id <= 0 or egg_id <= 0:
         await interaction.followup.send(embed=branded_embed("Nest And Egg Required", "Select a real nest first, then select an egg from that nest.", 0xff4d4d), ephemeral=True)
         return
-    link = fetch_link(user.id)
+    is_free = plan == "free"
+    panel = free_ptero if is_free else ptero
+    if is_free and not panel.session:
+        await panel.start()
+    link = fetch_free_link(user.id) if is_free else fetch_link(user.id)
     if not link:
-        raise RuntimeError("Discord user is not linked. Use /link first.")
-    panel_email = link["email"]
-    panel_user = {"id": link["panel_user_id"]}
+        instruction = "Use `/admin createuser` to create and link the user's FreeDash account first." if is_free else "Use /link first."
+        raise RuntimeError(f"Discord user is not linked to the {plan} panel. {instruction}")
+    panel_email = link["free_email"] if is_free else link["email"]
+    panel_user = {"id": link["free_panel_user_id"] if is_free else link["panel_user_id"]}
     expires_at = utc_now() + timedelta(seconds=duration_seconds)
-    server = await ptero.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
+    server = await panel.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
     server_id = str(server["id"])
-    saga_synced = await ptero.set_saga_auto_suspend(server_id, expires_at)
+    saga_synced = await panel.set_saga_auto_suspend(server_id, expires_at)
     record = {
         "server_id": server_id,
         "plan": plan,
@@ -1085,7 +1124,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
 
 @tree.command(name="create-free", description="Create free server")
 @admin_only()
-@app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
+@app_commands.autocomplete(nest=free_nest_autocomplete, egg=free_egg_autocomplete, node=free_node_autocomplete)
 @app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
 async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
     await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
@@ -1810,8 +1849,21 @@ async def on_ready() -> None:
         await ptero.start()
     if not client_api.session:
         await client_api.start()
-    # FreeDash is started lazily by `/admin createuser`, so a missing optional
-    # FreeDash key can never prevent the paid-panel bot from starting.
+    # Warm deployment-node caches at every ready event. This keeps node
+    # autocomplete current after reconnects instead of waiting for a command.
+    try:
+        await ptero.list_nodes()
+        print(f"Synced {len(ptero.node_cache)} paid-panel nodes.")
+    except Exception as error:
+        print(f"Could not sync paid-panel nodes at startup: {error}")
+    if config.get("free_panel_api_key"):
+        try:
+            if not free_ptero.session:
+                await free_ptero.start()
+            await free_ptero.list_nodes()
+            print(f"Synced {len(free_ptero.node_cache)} FreeDash nodes.")
+        except Exception as error:
+            print(f"Could not sync FreeDash nodes at startup: {error}")
     configure_command_visibility()
     global_commands = await tree.sync()
     guild_id = config.get("guild_id")
