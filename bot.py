@@ -1603,7 +1603,10 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
                 embed.add_field(name=category, value=label, inline=False)
             embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(entries)} protected servers • Developer: {DEVELOPER}")
             embeds.append(embed)
-        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds) if len(embeds) > 1 else None, ephemeral=True)
+        if len(embeds) > 1:
+            await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embeds[0], ephemeral=True)
         return
     if not server:
         raise RuntimeError("Select a server when using the add or remove whitelist action.")
