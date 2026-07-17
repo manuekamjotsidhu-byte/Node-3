@@ -133,6 +133,13 @@ def init_db() -> None:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_enabled INTEGER NOT NULL DEFAULT 1")
+        link_columns = {row[1] for row in connection.execute("PRAGMA table_info(links)").fetchall()}
+        # FreeDash accounts are intentionally stored separately. Paid-panel accounts
+        # are registered by the paid panel and must never be created by this bot.
+        if "free_panel_user_id" not in link_columns:
+            connection.execute("ALTER TABLE links ADD COLUMN free_panel_user_id INTEGER")
+        if "free_email" not in link_columns:
+            connection.execute("ALTER TABLE links ADD COLUMN free_email TEXT")
 
 
 def upsert_server_record(record: dict[str, Any]) -> None:
@@ -222,13 +229,16 @@ def is_server_protected(record: sqlite3.Row | dict[str, Any]) -> bool:
 
 def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
     with db() as connection:
-        return connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
+        row = connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
+    # A FreeDash-only link uses a sentinel because legacy paid-link columns are
+    # non-nullable. It must not be treated as a paid-panel account.
+    return row if row and int(row["panel_user_id"] or 0) > 0 and str(row["email"] or "").strip() else None
 
 
 def fetch_links_by_panel_user() -> dict[int, sqlite3.Row]:
     with db() as connection:
         rows = connection.execute("SELECT * FROM links").fetchall()
-    return {int(row["panel_user_id"]): row for row in rows}
+    return {int(row["panel_user_id"]): row for row in rows if int(row["panel_user_id"] or 0) > 0}
 
 
 def notification_sent(server_id: str, notification_type: str) -> bool:
@@ -316,6 +326,20 @@ class PterodactylClient:
         if not user:
             raise RuntimeError("No Pterodactyl user exists with that email. Create the panel user first, then retry.")
         return user
+
+    async def create_user(self, *, email: str, username: str, first_name: str, last_name: str, password: str) -> dict[str, Any]:
+        """Create a standard, non-admin Pterodactyl account on this client panel."""
+        payload = {
+            "email": email,
+            "username": username,
+            "first_name": first_name,
+            "last_name": last_name,
+            "password": password,
+            "root_admin": False,
+            "language": "en",
+        }
+        data = await self.request("POST", "users", payload)
+        return data["attributes"]
 
     async def get_egg(self, nest_id: int, egg_id: int) -> dict[str, Any]:
         data = await self.request("GET", f"nests/{nest_id}/eggs/{egg_id}?include=variables")
@@ -529,6 +553,9 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 ptero = PterodactylClient(config.get("panel_url", PANEL_URL), config.get("panel_api_key", ""))
 client_api = PterodactylClientApi(config.get("panel_url", PANEL_URL), config.get("client_api_key", ""))
+# The free panel is deliberately a separate client. Do not reuse paid-panel
+# credentials here: account provisioning is supported only on FreeDash.
+free_ptero = PterodactylClient(config.get("free_panel_url", "https://mc.freedash.cloud"), config.get("free_panel_api_key", ""))
 
 
 
@@ -1059,11 +1086,95 @@ async def link(interaction: discord.Interaction, user: discord.User, panel_email
     await interaction.response.defer(ephemeral=True)
     panel_user = await ptero.get_required_panel_user(panel_email)
     with db() as connection:
-        connection.execute("INSERT OR REPLACE INTO links VALUES (?,?,?)", (str(user.id), panel_user["id"], panel_email))
+        connection.execute(
+            """
+            INSERT INTO links(discord_user_id, panel_user_id, email) VALUES (?,?,?)
+            ON CONFLICT(discord_user_id) DO UPDATE SET panel_user_id=excluded.panel_user_id, email=excluded.email
+            """,
+            (str(user.id), panel_user["id"], panel_email),
+        )
     await interaction.followup.send(embed=branded_embed("User Linked", f"{user.mention} linked to `{panel_email}` / panel user `{panel_user['id']}`."), ephemeral=True)
 
 
 admin_group = app_commands.Group(name="admin", description="ZeroX Host admin tools")
+
+
+@admin_group.command(name="createuser", description="Create a FreeDash account")
+@admin_only()
+@app_commands.describe(
+    user="Discord user who will own this FreeDash account",
+    email="FreeDash account email",
+    username="FreeDash username",
+    first_name="Account first name",
+    last_name="Account last name",
+    password="Temporary FreeDash password",
+)
+async def admin_createuser(
+    interaction: discord.Interaction,
+    user: discord.User,
+    email: str,
+    username: str,
+    first_name: str,
+    last_name: str,
+    password: str,
+) -> None:
+    """Provision only FreeDash accounts; paid users register on the paid panel."""
+    await interaction.response.defer(ephemeral=True)
+    if not config.get("free_panel_api_key"):
+        raise RuntimeError("Set `free_panel_api_key` in config.json before creating FreeDash accounts.")
+    email = email.strip().lower()
+    username = username.strip()
+    first_name = first_name.strip()
+    last_name = last_name.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise RuntimeError("Enter a valid email address.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username):
+        raise RuntimeError("Username must be 3-32 characters using letters, numbers, `.`, `_`, or `-`.")
+    if not first_name or not last_name:
+        raise RuntimeError("First name and last name are required.")
+    if len(password) < 8:
+        raise RuntimeError("Use a temporary password with at least 8 characters.")
+    if not free_ptero.session:
+        await free_ptero.start()
+    existing = await free_ptero.find_user_by_email(email)
+    if existing:
+        raise RuntimeError("A FreeDash account with that email already exists. Use the existing account instead.")
+    account = await free_ptero.create_user(
+        email=email,
+        username=username,
+        first_name=first_name,
+        last_name=last_name,
+        password=password,
+    )
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO links(discord_user_id, panel_user_id, email, free_panel_user_id, free_email) VALUES (?,?,?,?,?)
+            ON CONFLICT(discord_user_id) DO UPDATE SET free_panel_user_id=excluded.free_panel_user_id, free_email=excluded.free_email
+            """,
+            (str(user.id), 0, "", int(account["id"]), email),
+        )
+    credentials = branded_embed(
+        "Your FreeDash Account Is Ready",
+        f"Your complimentary panel account has been created for **{BRAND}**.",
+        0x2ECC71,
+    )
+    credentials.add_field(name="Panel", value=config.get("free_panel_url", "https://mc.freedash.cloud"), inline=False)
+    credentials.add_field(name="Email", value=f"`{email}`", inline=True)
+    credentials.add_field(name="Username", value=f"`{username}`", inline=True)
+    credentials.add_field(name="Temporary password", value=f"||{password}||", inline=False)
+    credentials.add_field(name="Keep it secure", value="Change this temporary password after your first sign-in. Do not share it with anyone.", inline=False)
+    dm_status = "sent"
+    try:
+        await user.send(embed=credentials)
+    except discord.Forbidden:
+        dm_status = "blocked by the user"
+    result = branded_embed("FreeDash Account Created", f"Created and linked the FreeDash account for {user.mention}.", 0x2ECC71)
+    result.add_field(name="FreeDash user ID", value=f"`{account['id']}`", inline=True)
+    result.add_field(name="Email", value=f"`{email}`", inline=True)
+    result.add_field(name="Credential DM", value=dm_status, inline=True)
+    result.add_field(name="Paid accounts", value="Paid-panel registration is handled by the paid panel. This bot never creates paid accounts.", inline=False)
+    await interaction.followup.send(embed=result, ephemeral=True)
 
 
 @admin_group.command(name="list", description="List panel servers")
@@ -1680,6 +1791,8 @@ async def on_ready() -> None:
         await ptero.start()
     if not client_api.session:
         await client_api.start()
+    # FreeDash is started lazily by `/admin createuser`, so a missing optional
+    # FreeDash key can never prevent the paid-panel bot from starting.
     configure_command_visibility()
     global_commands = await tree.sync()
     guild_id = config.get("guild_id")
@@ -1706,6 +1819,7 @@ async def main() -> None:
     finally:
         await ptero.close()
         await client_api.close()
+        await free_ptero.close()
 
 
 if __name__ == "__main__":

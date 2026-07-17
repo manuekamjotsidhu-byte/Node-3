@@ -10,7 +10,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 - No invite system.
 - No SMTP flow.
-- No panel user creation: the Pterodactyl user must already exist, and admins provide the panel email during creation.
+- Paid-panel accounts are never created by the bot: users register through the paid panel. `/admin createuser` creates and links **FreeDash-only** accounts using the separate free-panel API.
 - Only configured owners/admin roles can create, purge, whitelist, or view management data. Admin commands are guild-only and are intentionally hidden/blocked in DMs; DMs only expose user-safe commands for linked servers.
 - Admins select a deployment node by name/ID with slash-command autocomplete.
 - Admins create either `/create-free` or `/create-paid` servers with custom `time`, nest, egg, node, RAM/Disk entered in GB, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link`.
@@ -24,7 +24,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 ## Files
 
 - `bot.py` - the full Discord bot, slash commands, Pterodactyl Application/Client API clients, local SQLite `.db`, DM embeds, paid logs, purge, whitelist, autobackups, and expiration loop.
-- `config.example.json` - copy to `config.json` and fill in Discord/Pterodactyl settings, including the Saga Auto Suspension field if your panel addon uses a custom field name. Nests and eggs are fetched from the panel, not hardcoded.
+- `config.example.json` - copy to `config.json` and fill in Discord/Pterodactyl settings. `free_panel_url` and `free_panel_api_key` are only needed for FreeDash account creation. Nests and eggs are fetched from the panel, not hardcoded.
 - `requirements.txt` - Python dependencies.
 - `data/zerox_host.db` - generated SQLite runtime database used for links, servers, whitelist, autobackups, and exact-time suspension. A legacy JSON mirror may also be created.
 
@@ -47,6 +47,7 @@ python bot.py
 - `/create-free` - admin-only free server creation with linked Discord user, name, RAM/Disk in GB, specs, nest, egg, node, `time` duration, and optional feature limits.
 - `/create-paid` - admin-only paid server creation with `time` duration, RAM/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging.
 - `/admin list` - admin-only paginated embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
+- `/admin createuser` - admin-only **FreeDash** account creation and Discord linking. It requests the target Discord user, email, username, first/last name, and temporary password, then DMs polished credentials. It has no paid/free selector because the bot never creates paid-panel accounts.
 - `/admin manage`, `/admin console`, `/admin rename` - admin-only versions that can target any tracked server **and panel-created servers that are not in the local DB yet**; normal `/manage`, `/console`, `/rename`, `/power`, and `/reinstall` also show admin-wide server autocomplete when used by admins in the guild, while regular users only see their own servers.
 - `/list` - public paginated embed list that still shows only the command executor’s own linked/tracked servers. Admins should use `/admin list` for all panel servers.
 - `/manage` - users open a premium control panel for one of their own linked servers with live resource usage and start/stop/restart/kill buttons.
@@ -74,7 +75,7 @@ python bot.py
 
 Use a Pterodactyl **Application API** key in `panel_api_key` and a **Client API** key in `client_api_key`. The Application key handles search/create/resize/suspend/delete/list operations; the Client key handles power signals, rename, console commands, resources, and backups for tracked server identifiers.
 
-The bot does **not** create panel users and does **not** use default eggs. Admins must run `/link` for the Discord user first; if `/create-free` or `/create-paid` is used for an unlinked Discord user, the bot stops with an admin-visible error. Admins must select a nest first, then select an egg from that nest; startup, Docker image, and default egg variables are read from the Pterodactyl panel. Server creation uses an available allocation from the selected node instead of blind automatic deployment.
+The bot does **not** create paid-panel users and does **not** use default eggs. Paid users must register through the paid panel; FreeDash accounts may be created only with `/admin createuser`. Admins must run `/link` for a paid-panel user before `/create-paid`; if it is used for an unlinked Discord user, the bot stops with an admin-visible error. Admins must select a nest first, then select an egg from that nest; startup, Docker image, and default egg variables are read from the panel. Server creation uses an available allocation from the selected node instead of blind automatic deployment.
 
 ## Branding
 
