@@ -66,7 +66,7 @@ python bot.py
 - `/autobackup-enable` - owner/admin-only automatic backup scheduler using durations like `2d`, `4h`, or `12h`.
 - `/link` - admin-only link of an existing panel email to a Discord user.
 - `/nodes` - admin-only list of Pterodactyl deployment node names and IDs.
-- `/whitelist` - admin-only `add`, `remove`, or `list` command. Its `list` action shows every protected server, labelling paid servers as **Paid** and manually protected servers as **Whitelisted**; purge protection checks server ID, UUID, and identifier.
+- `/whitelist` - admin-only `add`, `remove`, or `list` command. Its `list` action shows every protected server, labelling paid servers as **Paid** and manually protected servers as **Whitelisted**; deleted servers are automatically removed from the whitelist. Purge protection checks server ID, UUID, and identifier.
 - `/purge confirm:True` - admin-only purge for tracked free servers only; paid servers and whitelist matches by server ID, UUID, or identifier are not deleted.
 - `/autosuspend` - admin-only toggle to turn automatic expiration suspension on/off with admin server autocomplete; for panel-only servers, pass `time` like `30d` when turning it on so Saga has an expiration date.
 - `/server-expirations` - admin-only view of tracked server expiration and autosuspend status.

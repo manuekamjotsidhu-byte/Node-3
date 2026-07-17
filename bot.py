@@ -159,12 +159,28 @@ def fetch_user_servers(discord_user_id: int) -> list[sqlite3.Row]:
         return connection.execute("SELECT * FROM servers WHERE discord_user_id = ? AND deleted = 0 ORDER BY created_at DESC", (str(discord_user_id),)).fetchall()
 
 
+def remove_whitelist_entries(values: set[str]) -> None:
+    """Remove deleted server identifiers from both whitelist stores."""
+    if not values:
+        return
+    database["whitelist"] = sorted({str(item) for item in database.setdefault("whitelist", [])} - values, key=str)
+    with db() as connection:
+        connection.executemany("DELETE FROM whitelist WHERE server_id=?", [(value,) for value in values])
+
+
 def mark_server_deleted(server_id: str) -> None:
+    record = fetch_server(server_id) or database.get("servers", {}).get(str(server_id), {})
+    identifiers = {
+        str(server_id),
+        str(record_value(record, "uuid", "")),
+        str(record_value(record, "identifier", "")),
+    }
     with db() as connection:
         connection.execute("UPDATE servers SET deleted = 1 WHERE server_id = ?", (str(server_id),))
     if str(server_id) in database.get("servers", {}):
         database["servers"][str(server_id)]["deleted"] = True
-        save_database()
+    remove_whitelist_entries({identifier for identifier in identifiers if identifier})
+    save_database()
 
 
 def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any], panel_email: str | None = None) -> None:
@@ -1438,10 +1454,7 @@ async def delete(interaction: discord.Interaction, server: str, confirm: bool = 
         await interaction.followup.send(embed=branded_embed("Confirm Delete", f"Run `/delete server:{server} confirm:True` to permanently delete **{record_value(row, 'name', server)}**.", 0xffcc00), ephemeral=True)
         return
     await ptero.delete_server(server)
-    with db() as connection:
-        connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (server,))
-    database.get("servers", {}).pop(server, None)
-    save_database()
+    mark_server_deleted(server)
     await interaction.followup.send(embed=branded_embed("Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", 0xe74c3c), ephemeral=True)
 
 
@@ -1579,10 +1592,29 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
     await interaction.response.defer(ephemeral=True)
     if action.value == "list":
         protected_ids = whitelist_values()
+        panel_servers = await ptero.list_servers()
+        panel_ids = {str(panel_server["id"]) for panel_server in panel_servers}
         records: dict[str, sqlite3.Row | dict[str, Any]] = {
-            str(row["server_id"]): row for row in fetch_all_servers()
+            str(row["server_id"]): row for row in fetch_all_servers() if str(row["server_id"]) in panel_ids
         }
-        records.update({str(server_id): record for server_id, record in database.get("servers", {}).items()})
+        records.update({
+            str(server_id): record
+            for server_id, record in database.get("servers", {}).items()
+            if not record.get("deleted", False) and str(server_id) in panel_ids
+        })
+        for panel_server in panel_servers:
+            records.setdefault(str(panel_server["id"]), panel_server_record(panel_server))
+        active_identifiers = {
+            str(record_value(record, field, ""))
+            for record in records.values()
+            for field in ("server_id", "uuid", "identifier")
+            if record_value(record, field, "")
+        }
+        stale_entries = protected_ids - active_identifiers
+        if stale_entries:
+            remove_whitelist_entries(stale_entries)
+            save_database()
+            protected_ids -= stale_entries
         entries: list[tuple[str, str]] = []
         for server_id in sorted(protected_ids | {server_id for server_id, record in records.items() if str(record_value(record, "plan", "")).lower() == "paid"}):
             record = records.get(server_id)
@@ -1590,8 +1622,6 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
                 name = clean(str(record_value(record, "name", server_id)), 80)
                 category = "Paid" if str(record_value(record, "plan", "")).lower() == "paid" else "Whitelisted"
                 entries.append((category, f"**{name}** (`{server_id}`)"))
-            else:
-                entries.append(("Whitelisted", f"Unknown/deleted server (`{server_id}`)"))
         if not entries:
             await interaction.followup.send(embed=branded_embed("Whitelisted Servers", "No paid or manually whitelisted servers found."), ephemeral=True)
             return
@@ -1650,9 +1680,7 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
                 continue
             await ptero.delete_server(server_id)
             deleted.append(f"{live_row['name']} (`{server_id}`)")
-            with db() as connection:
-                connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (server_id,))
-            database.get("servers", {}).pop(server_id, None)
+            mark_server_deleted(server_id)
             clear_server_notifications(server_id)
         except RuntimeError as error:
             failed.append(f"{server_id}: {error}")
@@ -1708,9 +1736,7 @@ async def deletesuspended(interaction: discord.Interaction, plan: app_commands.C
     for row in victims:
         try:
             await ptero.delete_server(row["server_id"])
-            with db() as connection:
-                connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (row["server_id"],))
-            database.get("servers", {}).pop(row["server_id"], None)
+            mark_server_deleted(row["server_id"])
             clear_server_notifications(row["server_id"])
             deleted.append(f"`{row['server_id']}` • {row['name']}")
         except Exception as error:
@@ -1800,9 +1826,7 @@ async def suspend_expired_servers() -> None:
                 mark_notification_sent(server_id, "delete_1d")
             if now >= delete_at:
                 await ptero.delete_server(server_id)
-                with db() as connection:
-                    connection.execute("UPDATE servers SET deleted=1 WHERE server_id=?", (server_id,))
-                database.get("servers", {}).pop(server_id, None)
+                mark_server_deleted(server_id)
                 clear_server_notifications(server_id)
                 save_database()
                 await send_lifecycle_dm(record, "deleted", delete_at)
