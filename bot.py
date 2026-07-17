@@ -632,7 +632,8 @@ def branded_embed(title: str, description: str, color: int = 0x00d4ff) -> discor
 
 
 def specs_embed(plan: str, name: str, ram: int, disk: int, cpu: int, node_name: str, nest: str, egg: str, expires_at: datetime, databases: int, allocations: int, backups: int) -> discord.Embed:
-    embed = branded_embed(f"Your {BRAND} {plan.title()} Server Is Ready", f"Panel: **{config['panel_url'].rstrip('/')}**")
+    panel_url = config.get("free_panel_url", "https://mc.freedash.cloud") if plan == "free" else config.get("panel_url", PANEL_URL)
+    embed = branded_embed(f"Your {BRAND} {plan.title()} Server Is Ready", f"Panel: **{panel_url.rstrip('/')}**")
     embed.add_field(name="🖥️ Server", value=name, inline=True)
     embed.add_field(name="🪺 Nest", value=nest, inline=True)
     embed.add_field(name="🥚 Egg", value=egg, inline=True)
@@ -1570,12 +1571,42 @@ async def nodes(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=branded_embed("Deployment Nodes", "\n".join(rows) or "No nodes found."), ephemeral=True)
 
 
-@tree.command(name="whitelist", description="Admin: whitelist or unwhitelist a server by name/UUID")
+@tree.command(name="whitelist", description="Admin: manage or list whitelisted servers")
 @admin_only()
 @app_commands.autocomplete(server=admin_tracked_server_autocomplete)
-@app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove")])
-async def whitelist(interaction: discord.Interaction, server: str, action: app_commands.Choice[str]) -> None:
+@app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove"), app_commands.Choice(name="list", value="list")])
+async def whitelist(interaction: discord.Interaction, action: app_commands.Choice[str], server: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
+    if action.value == "list":
+        protected_ids = whitelist_values()
+        records: dict[str, sqlite3.Row | dict[str, Any]] = {
+            str(row["server_id"]): row for row in fetch_all_servers()
+        }
+        records.update({str(server_id): record for server_id, record in database.get("servers", {}).items()})
+        entries: list[tuple[str, str]] = []
+        for server_id in sorted(protected_ids | {server_id for server_id, record in records.items() if str(record_value(record, "plan", "")).lower() == "paid"}):
+            record = records.get(server_id)
+            if record:
+                name = clean(str(record_value(record, "name", server_id)), 80)
+                category = "Paid" if str(record_value(record, "plan", "")).lower() == "paid" else "Whitelisted"
+                entries.append((category, f"**{name}** (`{server_id}`)"))
+            else:
+                entries.append(("Whitelisted", f"Unknown/deleted server (`{server_id}`)"))
+        if not entries:
+            await interaction.followup.send(embed=branded_embed("Whitelisted Servers", "No paid or manually whitelisted servers found."), ephemeral=True)
+            return
+        embeds: list[discord.Embed] = []
+        pages = chunked(entries, 10)
+        for page_number, page in enumerate(pages, start=1):
+            embed = branded_embed("Whitelisted Servers", "Paid servers are included automatically and are protected alongside manually whitelisted servers.")
+            for category, label in page:
+                embed.add_field(name=category, value=label, inline=False)
+            embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(entries)} protected servers • Developer: {DEVELOPER}")
+            embeds.append(embed)
+        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds) if len(embeds) > 1 else None, ephemeral=True)
+        return
+    if not server:
+        raise RuntimeError("Select a server when using the add or remove whitelist action.")
     whitelist_set = set(str(item) for item in database.setdefault("whitelist", []))
     if action.value == "add":
         whitelist_set.add(server)
