@@ -742,17 +742,35 @@ def record_value(record: sqlite3.Row | dict[str, Any], key: str, default: Any = 
         return default
 
 
-def panel_server_record(server: dict[str, Any]) -> dict[str, Any]:
+def panel_label_for_plan(plan: str) -> str:
+    return "FreeDash" if str(plan).lower() == "free" else "Paid"
+
+
+def application_client_for_record(record: sqlite3.Row | dict[str, Any]) -> PterodactylClient:
+    """Route application API actions to the panel that owns the server."""
+    return free_ptero if str(record_value(record, "plan", "")).lower() == "free" else ptero
+
+
+async def ready_application_client_for(record: sqlite3.Row | dict[str, Any]) -> PterodactylClient:
+    """Start the selected application API client on demand."""
+    panel = application_client_for_record(record)
+    if not panel.session:
+        await panel.start()
+    return panel
+
+
+def panel_server_record(server: dict[str, Any], plan: str = "paid") -> dict[str, Any]:
     limits = server.get("limits") or {}
     return {
         "server_id": str(server.get("id")),
         "identifier": server.get("identifier"),
         "uuid": server.get("uuid"),
         "name": server.get("name", f"Panel Server {server.get('id')}"),
-        "plan": "panel",
+        "plan": plan,
+        "panel_label": panel_label_for_plan(plan),
         "discord_user_id": "",
         "panel_user_id": server.get("user") or 0,
-        "panel_email": "panel-created/unlinked",
+        "panel_email": f"{panel_label_for_plan(plan)} panel-created/unlinked",
         "ram": int(limits.get("memory") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
@@ -763,8 +781,8 @@ def panel_server_record(server: dict[str, Any]) -> dict[str, Any]:
 
 def row_server_choices(current: str, rows: list[sqlite3.Row | dict[str, Any]]) -> list[app_commands.Choice[str]]:
     lowered = current.lower()
-    matches = [row for row in rows if lowered in f"{record_value(row, 'server_id', '')} {record_value(row, 'name', '')} {record_value(row, 'uuid', '') or ''} {record_value(row, 'identifier', '') or ''}".lower()]
-    return [app_commands.Choice(name=f"{record_value(row, 'name', 'unknown')} • {record_value(row, 'server_id')}", value=str(record_value(row, "server_id"))) for row in matches[:25]]
+    matches = [row for row in rows if lowered in f"{panel_label_for_plan(str(record_value(row, 'plan', 'paid')))} {record_value(row, 'server_id', '')} {record_value(row, 'name', '')} {record_value(row, 'uuid', '') or ''} {record_value(row, 'identifier', '') or ''}".lower()]
+    return [app_commands.Choice(name=f"[{panel_label_for_plan(str(record_value(row, 'plan', 'paid')))}] {record_value(row, 'name', 'unknown')} • {record_value(row, 'server_id')}", value=str(record_value(row, "server_id"))) for row in matches[:25]]
 
 
 async def tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -796,16 +814,23 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
     if interaction.guild is None or not is_admin(interaction.user):
         return []
     rows: list[sqlite3.Row | dict[str, Any]] = list(fetch_all_servers())
-    seen = {str(row["server_id"]) for row in rows}
-    try:
-        panel_servers = ptero.server_cache or await asyncio.wait_for(ptero.list_servers(), timeout=2.5)
-        for server in panel_servers:
-            server_id = str(server.get("id"))
-            if server_id not in seen:
-                rows.append(panel_server_record(server))
-                seen.add(server_id)
-    except Exception as error:
-        print(f"Failed to include panel servers in admin autocomplete quickly: {error}")
+    seen = {(str(row["plan"]).lower(), str(row["server_id"])) for row in rows}
+    panel_sources = [("paid", ptero)]
+    if config.get("free_panel_api_key"):
+        panel_sources.append(("free", free_ptero))
+    for plan, panel in panel_sources:
+        try:
+            if not panel.session:
+                await panel.start()
+            panel_servers = panel.server_cache or await asyncio.wait_for(panel.list_servers(), timeout=2.5)
+            for server in panel_servers:
+                server_id = str(server.get("id"))
+                key = (plan, server_id)
+                if key not in seen:
+                    rows.append(panel_server_record(server, plan))
+                    seen.add(key)
+        except Exception as error:
+            print(f"Failed to include {panel_label_for_plan(plan)} panel servers in admin autocomplete quickly: {error}")
     return row_server_choices(current, rows)
 
 
@@ -825,17 +850,18 @@ def is_not_found_error(error: Exception) -> bool:
 
 
 async def refresh_tracked_server(row: sqlite3.Row) -> sqlite3.Row | None:
-    """Refresh a tracked DB server from the panel so local state never wins over live panel data."""
+    """Refresh a tracked DB server from its owning panel so local state never wins over live panel data."""
     server_id = str(row["server_id"])
+    panel = await ready_application_client_for(row)
     try:
-        panel_server = await ptero.get_server(server_id)
+        panel_server = await panel.get_server(server_id)
     except RuntimeError as error:
         if is_not_found_error(error):
             mark_server_deleted(server_id)
             return None
         raise
     panel_user_id = int(panel_server.get("user") or 0)
-    panel_user = await ptero.get_user(panel_user_id) if panel_user_id else None
+    panel_user = await panel.get_user(panel_user_id) if panel_user_id else None
     update_tracked_server_from_panel(server_id, panel_server, panel_user.get("email") if panel_user else None)
     return fetch_server(server_id)
 
@@ -867,9 +893,14 @@ async def ensure_server_access(interaction: discord.Interaction, server_id: str,
         raise RuntimeError("You can only control your own servers. Use `/admin manage` for staff access to other users' servers.")
     if allow_admin and interaction.guild is not None and is_admin(interaction.user):
         try:
-            return panel_server_record(await ptero.get_server(server_id))
-        except RuntimeError as error:
-            raise RuntimeError(f"Unknown tracked or panel server: {server_id}") from error
+            return panel_server_record(await ptero.get_server(server_id), "paid")
+        except RuntimeError as paid_error:
+            try:
+                if not free_ptero.session:
+                    await free_ptero.start()
+                return panel_server_record(await free_ptero.get_server(server_id), "free")
+            except RuntimeError as free_error:
+                raise RuntimeError(f"Unknown tracked or panel server: {server_id}") from free_error
     raise RuntimeError("Unknown tracked server.")
 
 
@@ -1016,7 +1047,7 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
             raise RuntimeError("Use whole numbers for RAM, disk, CPU, and extras in `databases,allocations,backups` format, for example `1,1,1`.") from error
         if min(ram, disk, cpu) <= 0 or min(databases, allocations, backups) < 0:
             raise RuntimeError("RAM, disk, and CPU must be positive. Databases, allocations, and backups cannot be negative.")
-        await ptero.resize_server(self.server_id, ram, disk, cpu, databases, allocations, backups)
+        await (await ready_application_client_for(row)).resize_server(self.server_id, ram, disk, cpu, databases, allocations, backups)
         if fetch_server(self.server_id):
             with db() as connection:
                 connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram, disk, cpu, databases, allocations, backups, self.server_id))
@@ -1044,7 +1075,7 @@ class SuspendSelect(discord.ui.View):
         if not row:
             await interaction.response.send_message(embed=branded_embed("Missing Server", "That tracked server was not found anymore.", 0xff4d4d), ephemeral=True)
             return
-        await ptero.suspend_server(server_id)
+        await (await ready_application_client_for(row)).suspend_server(server_id)
         with db() as connection:
             connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
         await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
@@ -1426,9 +1457,10 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
         with db() as connection:
             connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1 WHERE server_id=?", (new_expiry.isoformat(), server))
         clear_server_notifications(server)
-    saga_synced = await ptero.set_saga_auto_suspend(server, new_expiry)
+    saga_synced = await (await ready_application_client_for(row)).set_saga_auto_suspend(server, new_expiry)
     try:
-        await ptero.unsuspend_server(server)
+        row = await ensure_server_access(interaction, server, allow_admin=True)
+        await (await ready_application_client_for(row)).unsuspend_server(server)
     except RuntimeError:
         pass
     discord_user_id = record_value(row, "discord_user_id")
@@ -1449,11 +1481,16 @@ async def delete(interaction: discord.Interaction, server: str, confirm: bool = 
     await interaction.response.defer(ephemeral=True)
     row = fetch_server(server)
     if not row:
-        row = panel_server_record(await ptero.get_server(server))
+        try:
+            row = panel_server_record(await ptero.get_server(server), "paid")
+        except RuntimeError:
+            if not free_ptero.session:
+                await free_ptero.start()
+            row = panel_server_record(await free_ptero.get_server(server), "free")
     if not confirm:
         await interaction.followup.send(embed=branded_embed("Confirm Delete", f"Run `/delete server:{server} confirm:True` to permanently delete **{record_value(row, 'name', server)}**.", 0xffcc00), ephemeral=True)
         return
-    await ptero.delete_server(server)
+    await (await ready_application_client_for(row)).delete_server(server)
     mark_server_deleted(server)
     await interaction.followup.send(embed=branded_embed("Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", 0xe74c3c), ephemeral=True)
 
@@ -1474,7 +1511,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
 async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
-    await ptero.reinstall_server(server)
+    await (await ready_application_client_for(row)).reinstall_server(server)
     await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{record_value(row, 'name', server)}**."), ephemeral=True)
 
 
@@ -1489,10 +1526,11 @@ async def change_egg(interaction: discord.Interaction, server: str, nest: str, e
         raise RuntimeError("Select a real nest and egg from autocomplete before changing the server egg.")
     nest_name = nest.split(":", 1)[1] if ":" in nest else f"Nest {nest_id}"
     egg_name = egg.split(":", 1)[1] if ":" in egg else f"Egg {egg_id}"
-    await ptero.change_server_egg(server, nest_id, egg_id)
+    panel = await ready_application_client_for(row)
+    await panel.change_server_egg(server, nest_id, egg_id)
     reinstall_requested = reinstall or wipe_files
     if reinstall_requested:
-        await ptero.reinstall_server(server)
+        await panel.reinstall_server(server)
     if fetch_server(server):
         with db() as connection:
             connection.execute("UPDATE servers SET nest_id=?, nest_name=?, egg_id=?, egg_name=? WHERE server_id=?", (nest_id, nest_name, egg_id, egg_name, server))
@@ -1518,7 +1556,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
         for row in fetch_all_servers():
             if row["plan"] == "paid" or is_whitelisted(row["server_id"]):
                 continue
-            await ptero.suspend_server(row["server_id"])
+            await (await ready_application_client_for(row)).suspend_server(row["server_id"])
             with db() as connection:
                 connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (row["server_id"],))
             suspended += 1
@@ -1526,8 +1564,8 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
         return
 
     if server:
-        row = fetch_server(server)
-        await ptero.suspend_server(server)
+        row = await ensure_server_access(interaction, server, allow_admin=True)
+        await (await ready_application_client_for(row)).suspend_server(server)
         with db() as connection:
             connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
         await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended **{row['name'] if row else server}**."), ephemeral=True)
@@ -1545,7 +1583,8 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
 @app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    await ptero.unsuspend_server(server)
+    row = await ensure_server_access(interaction, server, allow_admin=True)
+    await (await ready_application_client_for(row)).unsuspend_server(server)
     with db() as connection:
         connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
     await interaction.followup.send(embed=branded_embed("Server Unsuspended", f"Unsuspended server `{server}`."), ephemeral=True)
@@ -1559,7 +1598,7 @@ async def stopall(interaction: discord.Interaction) -> None:
     for row in fetch_all_servers():
         if is_whitelisted(row["server_id"]) or not row["identifier"]:
             continue
-        await client_api.power(row["identifier"], "stop")
+        await (await ready_client_api_for(row)).power(row["identifier"], "stop")
         stopped += 1
     await interaction.followup.send(embed=branded_embed("Stop All Complete", f"Stopped **{stopped}** server(s). Whitelisted servers were skipped."), ephemeral=True)
 
@@ -1592,18 +1631,31 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
     await interaction.response.defer(ephemeral=True)
     if action.value == "list":
         protected_ids = whitelist_values()
-        panel_servers = await ptero.list_servers()
-        panel_ids = {str(panel_server["id"]) for panel_server in panel_servers}
-        records: dict[str, sqlite3.Row | dict[str, Any]] = {
-            str(row["server_id"]): row for row in fetch_all_servers() if str(row["server_id"]) in panel_ids
+        panel_sources = [("paid", ptero)]
+        if config.get("free_panel_api_key"):
+            panel_sources.append(("free", free_ptero))
+        live_panel_servers: dict[str, list[dict[str, Any]]] = {}
+        for plan, panel in panel_sources:
+            if not panel.session:
+                await panel.start()
+            live_panel_servers[plan] = await panel.list_servers()
+        panel_ids_by_plan = {
+            plan: {str(panel_server["id"]) for panel_server in panel_servers}
+            for plan, panel_servers in live_panel_servers.items()
         }
-        records.update({
-            str(server_id): record
-            for server_id, record in database.get("servers", {}).items()
-            if not record.get("deleted", False) and str(server_id) in panel_ids
-        })
-        for panel_server in panel_servers:
-            records.setdefault(str(panel_server["id"]), panel_server_record(panel_server))
+        records: dict[str, sqlite3.Row | dict[str, Any]] = {}
+        for row in fetch_all_servers():
+            plan = str(row["plan"]).lower()
+            if str(row["server_id"]) in panel_ids_by_plan.get(plan, set()):
+                records[f"{plan}:{row['server_id']}"] = row
+        for server_id, record in database.get("servers", {}).items():
+            plan = str(record.get("plan", "paid")).lower()
+            if not record.get("deleted", False) and str(server_id) in panel_ids_by_plan.get(plan, set()):
+                records.setdefault(f"{plan}:{server_id}", record)
+        for plan, panel_servers in live_panel_servers.items():
+            for panel_server in panel_servers:
+                server_id = str(panel_server["id"])
+                records.setdefault(f"{plan}:{server_id}", panel_server_record(panel_server, plan))
         active_identifiers = {
             str(record_value(record, field, ""))
             for record in records.values()
@@ -1616,12 +1668,23 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
             save_database()
             protected_ids -= stale_entries
         entries: list[tuple[str, str]] = []
-        for server_id in sorted(protected_ids | {server_id for server_id, record in records.items() if str(record_value(record, "plan", "")).lower() == "paid"}):
-            record = records.get(server_id)
-            if record:
-                name = clean(str(record_value(record, "name", server_id)), 80)
-                category = "Paid" if str(record_value(record, "plan", "")).lower() == "paid" else "Whitelisted"
-                entries.append((category, f"**{name}** (`{server_id}`)"))
+        for key, record in sorted(records.items(), key=lambda item: (panel_label_for_plan(str(record_value(item[1], "plan", "paid"))), str(record_value(item[1], "name", "")))):
+            record_identifiers = {
+                str(record_value(record, field, ""))
+                for field in ("server_id", "uuid", "identifier")
+                if record_value(record, field, "")
+            }
+            plan = str(record_value(record, "plan", "")).lower()
+            is_paid = plan == "paid"
+            is_manual = bool(record_identifiers & protected_ids)
+            if not is_paid and not is_manual:
+                continue
+            server_id = str(record_value(record, "server_id", key.split(":", 1)[-1]))
+            name = clean(str(record_value(record, "name", server_id)), 80)
+            panel_label = panel_label_for_plan(plan)
+            category = "Paid" if is_paid else "Whitelisted"
+            protection = "automatic paid protection" if is_paid else "manual whitelist"
+            entries.append((category, f"**{name}** (`{server_id}`)\nPanel: **{panel_label}** • Source: **{protection}**"))
         if not entries:
             await interaction.followup.send(embed=branded_embed("Whitelisted Servers", "No paid or manually whitelisted servers found."), ephemeral=True)
             return
@@ -1678,7 +1741,7 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
             if str(live_row["plan"]).lower() != "free" or is_server_protected(live_row):
                 skipped += 1
                 continue
-            await ptero.delete_server(server_id)
+            await (await ready_application_client_for(live_row)).delete_server(server_id)
             deleted.append(f"{live_row['name']} (`{server_id}`)")
             mark_server_deleted(server_id)
             clear_server_notifications(server_id)
@@ -1717,7 +1780,7 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
                 connection.execute("UPDATE servers SET autosuspend_enabled=?, expires_at=?, suspended=0 WHERE server_id=?", (enabled, expires_at.isoformat(), server))
             else:
                 connection.execute("UPDATE servers SET autosuspend_enabled=? WHERE server_id=?", (enabled, server))
-    saga_synced = await ptero.set_saga_auto_suspend(server, expires_at if enabled else None)
+    saga_synced = await (await ready_application_client_for(row)).set_saga_auto_suspend(server, expires_at if enabled else None)
     expiry_line = f"\nExpiration: <t:{int(expires_at.timestamp())}:F>" if expires_at else ""
     await interaction.followup.send(embed=branded_embed("Autosuspend Updated", f"Automatic expiration suspension for **{record_value(row, 'name', server)}** is now **{state.value.upper()}**.{expiry_line}\nSaga auto suspension: **{'synced' if saga_synced else 'cleared/not synced'}**"), ephemeral=True)
 
@@ -1735,7 +1798,7 @@ async def deletesuspended(interaction: discord.Interaction, plan: app_commands.C
     failed: list[str] = []
     for row in victims:
         try:
-            await ptero.delete_server(row["server_id"])
+            await (await ready_application_client_for(row)).delete_server(row["server_id"])
             mark_server_deleted(row["server_id"])
             clear_server_notifications(row["server_id"])
             deleted.append(f"`{row['server_id']}` • {row['name']}")
@@ -1815,7 +1878,7 @@ async def suspend_expired_servers() -> None:
                         mark_notification_sent(server_id, notification_type)
                 if not record["autosuspend_enabled"] or expires_at > now:
                     continue
-                await ptero.suspend_server(server_id)
+                await (await ready_application_client_for(record)).suspend_server(server_id)
                 with db() as connection:
                     connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
                 await send_lifecycle_dm(record, "suspended", expires_at)
@@ -1825,7 +1888,7 @@ async def suspend_expired_servers() -> None:
                 await send_lifecycle_dm(record, "delete_warning", delete_at)
                 mark_notification_sent(server_id, "delete_1d")
             if now >= delete_at:
-                await ptero.delete_server(server_id)
+                await (await ready_application_client_for(record)).delete_server(server_id)
                 mark_server_deleted(server_id)
                 clear_server_notifications(server_id)
                 save_database()
@@ -1844,7 +1907,7 @@ async def run_scheduled_restarts() -> None:
         if not row or not row["identifier"] or row["deleted"] or row["suspended"]:
             continue
         try:
-            await client_api.power(row["identifier"], "restart")
+            await (await ready_client_api_for(row)).power(row["identifier"], "restart")
         except Exception as error:
             print(f"Failed to scheduled-restart {restart['server_id']}: {error}")
         with db() as connection:
