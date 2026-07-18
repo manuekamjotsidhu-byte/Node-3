@@ -133,13 +133,7 @@ def init_db() -> None:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_enabled INTEGER NOT NULL DEFAULT 1")
-        link_columns = {row[1] for row in connection.execute("PRAGMA table_info(links)").fetchall()}
-        # FreeDash accounts are intentionally stored separately. Paid-panel accounts
-        # are registered by the paid panel and must never be created by this bot.
-        if "free_panel_user_id" not in link_columns:
-            connection.execute("ALTER TABLE links ADD COLUMN free_panel_user_id INTEGER")
-        if "free_email" not in link_columns:
-            connection.execute("ALTER TABLE links ADD COLUMN free_email TEXT")
+        # Legacy databases may contain older link columns, but new installs use one panel only.
 
 
 def upsert_server_record(record: dict[str, Any]) -> None:
@@ -198,16 +192,17 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         "databases": int(feature_limits.get("databases") or 0),
         "allocations": int(feature_limits.get("allocations") or 0),
         "backups": int(feature_limits.get("backups") or 0),
+        "suspended": int(bool(panel_server.get("suspended", False))),
         "deleted": 0,
     }
     with db() as connection:
         connection.execute(
             """
             UPDATE servers
-            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, deleted=?
+            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=?, deleted=?
             WHERE server_id=?
             """,
-            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["deleted"], str(server_id)),
+            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["suspended"], updates["deleted"], str(server_id)),
         )
     if str(server_id) in database.get("servers", {}):
         mirror_updates = {key: value for key, value in updates.items() if value is not None}
@@ -246,15 +241,7 @@ def is_server_protected(record: sqlite3.Row | dict[str, Any]) -> bool:
 def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
     with db() as connection:
         row = connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
-    # A FreeDash-only link uses a sentinel because legacy paid-link columns are
-    # non-nullable. It must not be treated as a paid-panel account.
     return row if row and int(row["panel_user_id"] or 0) > 0 and str(row["email"] or "").strip() else None
-
-
-def fetch_free_link(discord_user_id: int) -> sqlite3.Row | None:
-    with db() as connection:
-        row = connection.execute("SELECT * FROM links WHERE discord_user_id = ?", (str(discord_user_id),)).fetchone()
-    return row if row and int(row["free_panel_user_id"] or 0) > 0 and str(row["free_email"] or "").strip() else None
 
 
 def fetch_links_by_panel_user() -> dict[int, sqlite3.Row]:
@@ -575,26 +562,15 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 ptero = PterodactylClient(config.get("panel_url", PANEL_URL), config.get("panel_api_key", ""))
 client_api = PterodactylClientApi(config.get("panel_url", PANEL_URL), config.get("client_api_key", ""))
-# The free panel is deliberately a separate client. Do not reuse paid-panel
-# credentials here: account provisioning is supported only on FreeDash.
-free_ptero = PterodactylClient(config.get("free_panel_url", "https://mc.freedash.cloud"), config.get("free_panel_api_key", ""))
-free_client_api = PterodactylClientApi(
-    config.get("free_panel_url", "https://mc.freedash.cloud"),
-    config.get("free_client_api_key", ""),
-)
-
-
 def client_api_for_record(record: sqlite3.Row | dict[str, Any]) -> PterodactylClientApi:
-    """Route client actions to the panel that owns the selected server."""
-    return free_client_api if str(record_value(record, "plan", "")).lower() == "free" else client_api
+    """Return the single configured panel client API for all server plans."""
+    return client_api
 
 
 async def ready_client_api_for(record: sqlite3.Row | dict[str, Any]) -> PterodactylClientApi:
     """Start the selected panel client on demand before a client-API request."""
     api = client_api_for_record(record)
     if not api.session:
-        if api is free_client_api and not config.get("free_client_api_key"):
-            raise RuntimeError("Set `free_client_api_key` in config.json to manage FreeDash servers.")
         await api.start()
     return api
 
@@ -648,7 +624,7 @@ def branded_embed(title: str, description: str, color: int = 0x00d4ff) -> discor
 
 
 def specs_embed(plan: str, name: str, ram: int, disk: int, cpu: int, node_name: str, nest: str, egg: str, expires_at: datetime, databases: int, allocations: int, backups: int) -> discord.Embed:
-    panel_url = config.get("free_panel_url", "https://mc.freedash.cloud") if plan == "free" else config.get("panel_url", PANEL_URL)
+    panel_url = config.get("panel_url", PANEL_URL)
     embed = branded_embed(f"Your {BRAND} {plan.title()} Server Is Ready", f"Panel: **{panel_url.rstrip('/')}**")
     embed.add_field(name="🖥️ Server", value=name, inline=True)
     embed.add_field(name="🪺 Nest", value=nest, inline=True)
@@ -685,26 +661,12 @@ async def node_autocomplete(interaction: discord.Interaction, current: str) -> l
     return [app_commands.Choice(name=f"{node['name']} (ID {node['id']})", value=f"{node['id']}:{node['name']}") for node in matches[:25]]
 
 
-async def free_node_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    if not free_ptero.session:
-        await free_ptero.start()
-    nodes = free_ptero.node_cache or await free_ptero.list_nodes()
-    matches = [node for node in nodes if current.lower() in f"{node['id']} {node['name']}".lower()]
-    return [app_commands.Choice(name=f"{node['name']} (ID {node['id']})", value=f"{node['id']}:{node['name']}") for node in matches[:25]]
-
 
 async def nest_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     nests = ptero.nest_cache or await ptero.list_nests()
     matches = [nest for nest in nests if current.lower() in f"{nest['id']} {nest['name']}".lower()]
     return [app_commands.Choice(name=f"{nest['name']} (ID {nest['id']})", value=f"{nest['id']}:{nest['name']}") for nest in matches[:25]]
 
-
-async def free_nest_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    if not free_ptero.session:
-        await free_ptero.start()
-    nests = free_ptero.nest_cache or await free_ptero.list_nests()
-    matches = [nest for nest in nests if current.lower() in f"{nest['id']} {nest['name']}".lower()]
-    return [app_commands.Choice(name=f"{nest['name']} (ID {nest['id']})", value=f"{nest['id']}:{nest['name']}") for nest in matches[:25]]
 
 
 async def egg_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -716,17 +678,6 @@ async def egg_autocomplete(interaction: discord.Interaction, current: str) -> li
     matches = [egg for egg in eggs if current.lower() in f"{egg['id']} {egg['name']}".lower()]
     return [app_commands.Choice(name=f"{egg['name']} (ID {egg['id']})", value=f"{egg['id']}:{egg['name']}") for egg in matches[:25]]
 
-
-async def free_egg_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    nest_value = getattr(interaction.namespace, "nest", None)
-    if not nest_value:
-        return []
-    if not free_ptero.session:
-        await free_ptero.start()
-    nest_id = parse_id(nest_value)
-    eggs = free_ptero.egg_cache.get(nest_id) or await free_ptero.list_eggs(nest_id)
-    matches = [egg for egg in eggs if current.lower() in f"{egg['id']} {egg['name']}".lower()]
-    return [app_commands.Choice(name=f"{egg['name']} (ID {egg['id']})", value=f"{egg['id']}:{egg['name']}") for egg in matches[:25]]
 
 
 async def server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -743,12 +694,12 @@ def record_value(record: sqlite3.Row | dict[str, Any], key: str, default: Any = 
 
 
 def panel_label_for_plan(plan: str) -> str:
-    return "FreeDash" if str(plan).lower() == "free" else "Paid"
+    return "gp.zeroxhost.space"
 
 
 def application_client_for_record(record: sqlite3.Row | dict[str, Any]) -> PterodactylClient:
-    """Route application API actions to the panel that owns the server."""
-    return free_ptero if str(record_value(record, "plan", "")).lower() == "free" else ptero
+    """Return the single configured Pterodactyl application API client."""
+    return ptero
 
 
 async def ready_application_client_for(record: sqlite3.Row | dict[str, Any]) -> PterodactylClient:
@@ -759,7 +710,7 @@ async def ready_application_client_for(record: sqlite3.Row | dict[str, Any]) -> 
     return panel
 
 
-def panel_server_record(server: dict[str, Any], plan: str = "paid") -> dict[str, Any]:
+def panel_server_record(server: dict[str, Any], plan: str = "panel") -> dict[str, Any]:
     limits = server.get("limits") or {}
     return {
         "server_id": str(server.get("id")),
@@ -781,8 +732,8 @@ def panel_server_record(server: dict[str, Any], plan: str = "paid") -> dict[str,
 
 def row_server_choices(current: str, rows: list[sqlite3.Row | dict[str, Any]]) -> list[app_commands.Choice[str]]:
     lowered = current.lower()
-    matches = [row for row in rows if lowered in f"{panel_label_for_plan(str(record_value(row, 'plan', 'paid')))} {record_value(row, 'server_id', '')} {record_value(row, 'name', '')} {record_value(row, 'uuid', '') or ''} {record_value(row, 'identifier', '') or ''}".lower()]
-    return [app_commands.Choice(name=f"[{panel_label_for_plan(str(record_value(row, 'plan', 'paid')))}] {record_value(row, 'name', 'unknown')} • {record_value(row, 'server_id')}", value=str(record_value(row, "server_id"))) for row in matches[:25]]
+    matches = [row for row in rows if lowered in f"{panel_label_for_plan(str(record_value(row, 'plan', 'panel')))} {record_value(row, 'server_id', '')} {record_value(row, 'name', '')} {record_value(row, 'uuid', '') or ''} {record_value(row, 'identifier', '') or ''}".lower()]
+    return [app_commands.Choice(name=f"[{panel_label_for_plan(str(record_value(row, 'plan', 'panel')))}] {record_value(row, 'name', 'unknown')} • {record_value(row, 'server_id')}", value=str(record_value(row, "server_id"))) for row in matches[:25]]
 
 
 async def tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -814,10 +765,8 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
     if interaction.guild is None or not is_admin(interaction.user):
         return []
     rows: list[sqlite3.Row | dict[str, Any]] = list(fetch_all_servers())
-    seen = {(str(row["plan"]).lower(), str(row["server_id"])) for row in rows}
-    panel_sources = [("paid", ptero)]
-    if config.get("free_panel_api_key"):
-        panel_sources.append(("free", free_ptero))
+    seen = {str(row["server_id"]) for row in rows}
+    panel_sources = [("panel", ptero)]
     for plan, panel in panel_sources:
         try:
             if not panel.session:
@@ -825,10 +774,9 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
             panel_servers = panel.server_cache or await asyncio.wait_for(panel.list_servers(), timeout=2.5)
             for server in panel_servers:
                 server_id = str(server.get("id"))
-                key = (plan, server_id)
-                if key not in seen:
+                if server_id not in seen:
                     rows.append(panel_server_record(server, plan))
-                    seen.add(key)
+                    seen.add(server_id)
         except Exception as error:
             print(f"Failed to include {panel_label_for_plan(plan)} panel servers in admin autocomplete quickly: {error}")
     return row_server_choices(current, rows)
@@ -893,14 +841,9 @@ async def ensure_server_access(interaction: discord.Interaction, server_id: str,
         raise RuntimeError("You can only control your own servers. Use `/admin manage` for staff access to other users' servers.")
     if allow_admin and interaction.guild is not None and is_admin(interaction.user):
         try:
-            return panel_server_record(await ptero.get_server(server_id), "paid")
-        except RuntimeError as paid_error:
-            try:
-                if not free_ptero.session:
-                    await free_ptero.start()
-                return panel_server_record(await free_ptero.get_server(server_id), "free")
-            except RuntimeError as free_error:
-                raise RuntimeError(f"Unknown tracked or panel server: {server_id}") from free_error
+            return panel_server_record(await ptero.get_server(server_id), "panel")
+        except RuntimeError as error:
+            raise RuntimeError(f"Unknown tracked or panel server: {server_id}") from error
     raise RuntimeError("Unknown tracked server.")
 
 
@@ -1097,16 +1040,12 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     if nest_id <= 0 or egg_id <= 0:
         await interaction.followup.send(embed=branded_embed("Nest And Egg Required", "Select a real nest first, then select an egg from that nest.", 0xff4d4d), ephemeral=True)
         return
-    is_free = plan == "free"
-    panel = free_ptero if is_free else ptero
-    if is_free and not panel.session:
-        await panel.start()
-    link = fetch_free_link(user.id) if is_free else fetch_link(user.id)
+    panel = ptero
+    link = fetch_link(user.id)
     if not link:
-        instruction = "Use `/admin createuser` to create and link the user's FreeDash account first." if is_free else "Use /link first."
-        raise RuntimeError(f"Discord user is not linked to the {plan} panel. {instruction}")
-    panel_email = link["free_email"] if is_free else link["email"]
-    panel_user = {"id": link["free_panel_user_id"] if is_free else link["panel_user_id"]}
+        raise RuntimeError(f"Discord user is not linked to the panel. Use /link first.")
+    panel_email = link["email"]
+    panel_user = {"id": link["panel_user_id"]}
     expires_at = utc_now() + timedelta(seconds=duration_seconds)
     server = await panel.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
     server_id = str(server["id"])
@@ -1172,7 +1111,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
 
 @tree.command(name="create-free", description="Create free server")
 @admin_only()
-@app_commands.autocomplete(nest=free_nest_autocomplete, egg=free_egg_autocomplete, node=free_node_autocomplete)
+@app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
 @app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
 async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
     await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
@@ -1205,15 +1144,15 @@ async def link(interaction: discord.Interaction, user: discord.User, panel_email
 admin_group = app_commands.Group(name="admin", description="ZeroX Host admin tools")
 
 
-@admin_group.command(name="createuser", description="Create a FreeDash account")
+@admin_group.command(name="createuser", description="Create a panel account")
 @admin_only()
 @app_commands.describe(
-    user="Discord user who will own this FreeDash account",
-    email="FreeDash account email",
-    username="FreeDash username",
+    user="Discord user who will own this panel account",
+    email="Panel account email",
+    username="Panel username",
     first_name="Account first name",
     last_name="Account last name",
-    password="Temporary FreeDash password",
+    password="Temporary panel password",
 )
 async def admin_createuser(
     interaction: discord.Interaction,
@@ -1224,10 +1163,8 @@ async def admin_createuser(
     last_name: str,
     password: str,
 ) -> None:
-    """Provision only FreeDash accounts; paid users register on the paid panel."""
+    """Provision and link accounts on the single configured panel."""
     await interaction.response.defer(ephemeral=True)
-    if not config.get("free_panel_api_key"):
-        raise RuntimeError("Set `free_panel_api_key` in config.json before creating FreeDash accounts.")
     email = email.strip().lower()
     username = username.strip()
     first_name = first_name.strip()
@@ -1240,12 +1177,10 @@ async def admin_createuser(
         raise RuntimeError("First name and last name are required.")
     if len(password) < 8:
         raise RuntimeError("Use a temporary password with at least 8 characters.")
-    if not free_ptero.session:
-        await free_ptero.start()
-    existing = await free_ptero.find_user_by_email(email)
+    existing = await ptero.find_user_by_email(email)
     if existing:
-        raise RuntimeError("A FreeDash account with that email already exists. Use the existing account instead.")
-    account = await free_ptero.create_user(
+        raise RuntimeError("A panel account with that email already exists. Use the existing account instead.")
+    account = await ptero.create_user(
         email=email,
         username=username,
         first_name=first_name,
@@ -1255,17 +1190,17 @@ async def admin_createuser(
     with db() as connection:
         connection.execute(
             """
-            INSERT INTO links(discord_user_id, panel_user_id, email, free_panel_user_id, free_email) VALUES (?,?,?,?,?)
-            ON CONFLICT(discord_user_id) DO UPDATE SET free_panel_user_id=excluded.free_panel_user_id, free_email=excluded.free_email
+            INSERT INTO links(discord_user_id, panel_user_id, email) VALUES (?,?,?)
+            ON CONFLICT(discord_user_id) DO UPDATE SET panel_user_id=excluded.panel_user_id, email=excluded.email
             """,
-            (str(user.id), 0, "", int(account["id"]), email),
+            (str(user.id), int(account["id"]), email),
         )
     credentials = branded_embed(
-        "Your FreeDash Account Is Ready",
-        f"Your complimentary panel account has been created for **{BRAND}**.",
+        "Your Panel Account Is Ready",
+        f"Your panel account has been created for **{BRAND}**.",
         0x2ECC71,
     )
-    credentials.add_field(name="Panel", value=config.get("free_panel_url", "https://mc.freedash.cloud"), inline=False)
+    credentials.add_field(name="Panel", value=config.get("panel_url", PANEL_URL), inline=False)
     credentials.add_field(name="Email", value=f"`{email}`", inline=True)
     credentials.add_field(name="Username", value=f"`{username}`", inline=True)
     credentials.add_field(name="Temporary password", value=f"||{password}||", inline=False)
@@ -1275,11 +1210,11 @@ async def admin_createuser(
         await user.send(embed=credentials)
     except discord.Forbidden:
         dm_status = "blocked by the user"
-    result = branded_embed("FreeDash Account Created", f"Created and linked the FreeDash account for {user.mention}.", 0x2ECC71)
-    result.add_field(name="FreeDash user ID", value=f"`{account['id']}`", inline=True)
+    result = branded_embed("Panel Account Created", f"Created and linked the panel account for {user.mention}.", 0x2ECC71)
+    result.add_field(name="Panel user ID", value=f"`{account['id']}`", inline=True)
     result.add_field(name="Email", value=f"`{email}`", inline=True)
     result.add_field(name="Credential DM", value=dm_status, inline=True)
-    result.add_field(name="Paid accounts", value="Paid-panel registration is handled by the paid panel. This bot never creates paid accounts.", inline=False)
+    result.add_field(name="Panel", value=config.get("panel_url", PANEL_URL), inline=False)
     await interaction.followup.send(embed=result, ephemeral=True)
 
 
@@ -1481,12 +1416,7 @@ async def delete(interaction: discord.Interaction, server: str, confirm: bool = 
     await interaction.response.defer(ephemeral=True)
     row = fetch_server(server)
     if not row:
-        try:
-            row = panel_server_record(await ptero.get_server(server), "paid")
-        except RuntimeError:
-            if not free_ptero.session:
-                await free_ptero.start()
-            row = panel_server_record(await free_ptero.get_server(server), "free")
+        row = panel_server_record(await ptero.get_server(server), "panel")
     if not confirm:
         await interaction.followup.send(embed=branded_embed("Confirm Delete", f"Run `/delete server:{server} confirm:True` to permanently delete **{record_value(row, 'name', server)}**.", 0xffcc00), ephemeral=True)
         return
@@ -1631,31 +1561,21 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
     await interaction.response.defer(ephemeral=True)
     if action.value == "list":
         protected_ids = whitelist_values()
-        panel_sources = [("paid", ptero)]
-        if config.get("free_panel_api_key"):
-            panel_sources.append(("free", free_ptero))
-        live_panel_servers: dict[str, list[dict[str, Any]]] = {}
-        for plan, panel in panel_sources:
-            if not panel.session:
-                await panel.start()
-            live_panel_servers[plan] = await panel.list_servers()
-        panel_ids_by_plan = {
-            plan: {str(panel_server["id"]) for panel_server in panel_servers}
-            for plan, panel_servers in live_panel_servers.items()
-        }
+        if not ptero.session:
+            await ptero.start()
+        panel_servers = await ptero.list_servers()
+        live_panel_ids = {str(panel_server["id"]) for panel_server in panel_servers}
         records: dict[str, sqlite3.Row | dict[str, Any]] = {}
         for row in fetch_all_servers():
-            plan = str(row["plan"]).lower()
-            if str(row["server_id"]) in panel_ids_by_plan.get(plan, set()):
-                records[f"{plan}:{row['server_id']}"] = row
+            server_id = str(row["server_id"])
+            if server_id in live_panel_ids:
+                records[server_id] = row
         for server_id, record in database.get("servers", {}).items():
-            plan = str(record.get("plan", "paid")).lower()
-            if not record.get("deleted", False) and str(server_id) in panel_ids_by_plan.get(plan, set()):
-                records.setdefault(f"{plan}:{server_id}", record)
-        for plan, panel_servers in live_panel_servers.items():
-            for panel_server in panel_servers:
-                server_id = str(panel_server["id"])
-                records.setdefault(f"{plan}:{server_id}", panel_server_record(panel_server, plan))
+            if not record.get("deleted", False) and str(server_id) in live_panel_ids:
+                records.setdefault(str(server_id), record)
+        for panel_server in panel_servers:
+            server_id = str(panel_server["id"])
+            records.setdefault(server_id, panel_server_record(panel_server, "panel"))
         active_identifiers = {
             str(record_value(record, field, ""))
             for record in records.values()
@@ -1860,6 +1780,31 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
         pass
 
 
+
+
+@tasks.loop(seconds=60)
+async def sync_panel_activity() -> None:
+    """Refresh tracked servers from the single live panel every 60 seconds."""
+    try:
+        panel_servers = await ptero.list_servers()
+    except Exception as error:
+        print(f"Failed to sync panel activity: {error}")
+        return
+    live_by_id = {str(server.get("id")): server for server in panel_servers}
+    for row in fetch_all_servers():
+        server_id = str(row["server_id"])
+        panel_server = live_by_id.get(server_id)
+        if not panel_server:
+            mark_server_deleted(server_id)
+            clear_server_notifications(server_id)
+            continue
+        try:
+            panel_user_id = int(panel_server.get("user") or 0)
+            panel_user = await ptero.get_user(panel_user_id) if panel_user_id else None
+            update_tracked_server_from_panel(server_id, panel_server, panel_user.get("email") if panel_user else None)
+        except Exception as error:
+            print(f"Failed to refresh tracked server {server_id}: {error}")
+
 @tasks.loop(minutes=1)
 async def suspend_expired_servers() -> None:
     now = utc_now()
@@ -1977,14 +1922,6 @@ async def on_ready() -> None:
         print(f"Synced {len(ptero.node_cache)} paid-panel nodes.")
     except Exception as error:
         print(f"Could not sync paid-panel nodes at startup: {error}")
-    if config.get("free_panel_api_key"):
-        try:
-            if not free_ptero.session:
-                await free_ptero.start()
-            await free_ptero.list_nodes()
-            print(f"Synced {len(free_ptero.node_cache)} FreeDash nodes.")
-        except Exception as error:
-            print(f"Could not sync FreeDash nodes at startup: {error}")
     configure_command_visibility()
     global_commands = await tree.sync()
     guild_id = config.get("guild_id")
@@ -2001,6 +1938,8 @@ async def on_ready() -> None:
         run_autobackups.start()
     if not run_scheduled_restarts.is_running():
         run_scheduled_restarts.start()
+    if not sync_panel_activity.is_running():
+        sync_panel_activity.start()
     print(f"{BRAND} bot online as {client.user} | Developer: {DEVELOPER}")
 
 
@@ -2011,8 +1950,6 @@ async def main() -> None:
     finally:
         await ptero.close()
         await client_api.close()
-        await free_ptero.close()
-        await free_client_api.close()
 
 
 if __name__ == "__main__":
