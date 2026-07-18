@@ -315,8 +315,8 @@ class PterodactylClient:
                 raise RuntimeError(f"Pterodactyl API error {response.status}: {detail}")
             return data
 
-    async def get_user(self, user_id: int) -> dict[str, Any] | None:
-        if user_id in self.user_cache:
+    async def get_user(self, user_id: int, *, refresh: bool = False) -> dict[str, Any] | None:
+        if not refresh and user_id in self.user_cache:
             return self.user_cache[user_id]
         try:
             data = await self.request("GET", f"users/{user_id}")
@@ -324,6 +324,19 @@ class PterodactylClient:
             return None
         self.user_cache[user_id] = data["attributes"]
         return self.user_cache[user_id]
+
+    async def list_paginated(self, endpoint: str) -> list[dict[str, Any]]:
+        separator = "&" if "?" in endpoint else "?"
+        page = 1
+        items: list[dict[str, Any]] = []
+        while True:
+            data = await self.request("GET", f"{endpoint}{separator}per_page=100&page={page}")
+            items.extend(item["attributes"] for item in data.get("data", []))
+            pagination = data.get("meta", {}).get("pagination", {})
+            total_pages = int(pagination.get("total_pages") or page)
+            if page >= total_pages:
+                return items
+            page += 1
 
     async def find_user_by_email(self, email: str) -> dict[str, Any] | None:
         data = await self.request("GET", f"users?filter[email]={email}")
@@ -413,24 +426,20 @@ class PterodactylClient:
         return data["attributes"]
 
     async def list_nests(self) -> list[dict[str, Any]]:
-        data = await self.request("GET", "nests?per_page=100")
-        self.nest_cache = [item["attributes"] for item in data.get("data", [])]
+        self.nest_cache = await self.list_paginated("nests")
         return self.nest_cache
 
     async def list_eggs(self, nest_id: int) -> list[dict[str, Any]]:
-        data = await self.request("GET", f"nests/{nest_id}/eggs?per_page=100")
-        eggs = [item["attributes"] for item in data.get("data", [])]
+        eggs = await self.list_paginated(f"nests/{nest_id}/eggs")
         self.egg_cache[nest_id] = eggs
         return eggs
 
     async def list_nodes(self) -> list[dict[str, Any]]:
-        data = await self.request("GET", "nodes?per_page=100")
-        self.node_cache = [item["attributes"] for item in data.get("data", [])]
+        self.node_cache = await self.list_paginated("nodes")
         return self.node_cache
 
     async def list_servers(self) -> list[dict[str, Any]]:
-        data = await self.request("GET", "servers?per_page=100")
-        self.server_cache = [item["attributes"] for item in data.get("data", [])]
+        self.server_cache = await self.list_paginated("servers")
         return self.server_cache
 
     async def get_server(self, server_id: str) -> dict[str, Any]:
@@ -656,14 +665,22 @@ def panel_server_embed(server: dict[str, Any], email: str, discord_label: str) -
 
 
 async def node_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    nodes = ptero.node_cache or await ptero.list_nodes()
+    try:
+        nodes = await asyncio.wait_for(ptero.list_nodes(), timeout=2.0)
+    except Exception as error:
+        print(f"Node autocomplete used cache because panel fetch failed: {error}")
+        nodes = ptero.node_cache
     matches = [node for node in nodes if current.lower() in f"{node['id']} {node['name']}".lower()]
     return [app_commands.Choice(name=f"{node['name']} (ID {node['id']})", value=f"{node['id']}:{node['name']}") for node in matches[:25]]
 
 
 
 async def nest_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    nests = ptero.nest_cache or await ptero.list_nests()
+    try:
+        nests = await asyncio.wait_for(ptero.list_nests(), timeout=2.0)
+    except Exception as error:
+        print(f"Nest autocomplete used cache because panel fetch failed: {error}")
+        nests = ptero.nest_cache
     matches = [nest for nest in nests if current.lower() in f"{nest['id']} {nest['name']}".lower()]
     return [app_commands.Choice(name=f"{nest['name']} (ID {nest['id']})", value=f"{nest['id']}:{nest['name']}") for nest in matches[:25]]
 
@@ -674,14 +691,22 @@ async def egg_autocomplete(interaction: discord.Interaction, current: str) -> li
     if not nest_value:
         return [app_commands.Choice(name="Select a nest first", value="0:select-nest-first")]
     nest_id = parse_id(str(nest_value))
-    eggs = ptero.egg_cache.get(nest_id) or await ptero.list_eggs(nest_id)
+    try:
+        eggs = await asyncio.wait_for(ptero.list_eggs(nest_id), timeout=2.0)
+    except Exception as error:
+        print(f"Egg autocomplete used cache for nest {nest_id} because panel fetch failed: {error}")
+        eggs = ptero.egg_cache.get(nest_id, [])
     matches = [egg for egg in eggs if current.lower() in f"{egg['id']} {egg['name']}".lower()]
     return [app_commands.Choice(name=f"{egg['name']} (ID {egg['id']})", value=f"{egg['id']}:{egg['name']}") for egg in matches[:25]]
 
 
 
 async def server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
-    servers = ptero.server_cache or await ptero.list_servers()
+    try:
+        servers = await asyncio.wait_for(ptero.list_servers(), timeout=2.0)
+    except Exception as error:
+        print(f"Server autocomplete used cache because panel fetch failed: {error}")
+        servers = ptero.server_cache
     matches = [server for server in servers if current.lower() in f"{server['id']} {server['name']} {server.get('uuid', '')}".lower()]
     return [app_commands.Choice(name=f"{server['name']} • {server.get('uuid', server['id'])}", value=str(server["id"])) for server in matches[:25]]
 
@@ -1784,13 +1809,20 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
 
 @tasks.loop(seconds=60)
 async def sync_panel_activity() -> None:
-    """Refresh tracked servers from the single live panel every 60 seconds."""
+    """Refresh every cached panel object and tracked server from the live panel every 60 seconds."""
     try:
+        nodes = await ptero.list_nodes()
+        nests = await ptero.list_nests()
+        for nest in nests:
+            await ptero.list_eggs(int(nest["id"]))
         panel_servers = await ptero.list_servers()
     except Exception as error:
         print(f"Failed to sync panel activity: {error}")
         return
     live_by_id = {str(server.get("id")): server for server in panel_servers}
+    live_user_ids = {int(server.get("user") or 0) for server in panel_servers if server.get("user")}
+    for user_id in live_user_ids:
+        await ptero.get_user(user_id, refresh=True)
     for row in fetch_all_servers():
         server_id = str(row["server_id"])
         panel_server = live_by_id.get(server_id)
@@ -1804,6 +1836,7 @@ async def sync_panel_activity() -> None:
             update_tracked_server_from_panel(server_id, panel_server, panel_user.get("email") if panel_user else None)
         except Exception as error:
             print(f"Failed to refresh tracked server {server_id}: {error}")
+    print(f"Panel sync refreshed {len(nodes)} nodes, {len(nests)} nests, {sum(len(eggs) for eggs in ptero.egg_cache.values())} eggs, {len(panel_servers)} servers, and {len(live_user_ids)} users.")
 
 @tasks.loop(minutes=1)
 async def suspend_expired_servers() -> None:
@@ -1915,13 +1948,17 @@ async def on_ready() -> None:
         await ptero.start()
     if not client_api.session:
         await client_api.start()
-    # Warm deployment-node caches at every ready event. This keeps node
-    # autocomplete current after reconnects instead of waiting for a command.
+    # Warm all panel caches at every ready event. This keeps node/nest/egg/server
+    # autocompletes current after reconnects instead of waiting for commands.
     try:
-        await ptero.list_nodes()
-        print(f"Synced {len(ptero.node_cache)} paid-panel nodes.")
+        nodes = await ptero.list_nodes()
+        nests = await ptero.list_nests()
+        for nest in nests:
+            await ptero.list_eggs(int(nest["id"]))
+        servers = await ptero.list_servers()
+        print(f"Synced {len(nodes)} nodes, {len(nests)} nests, {sum(len(eggs) for eggs in ptero.egg_cache.values())} eggs, and {len(servers)} servers at startup.")
     except Exception as error:
-        print(f"Could not sync paid-panel nodes at startup: {error}")
+        print(f"Could not sync panel caches at startup: {error}")
     configure_command_visibility()
     global_commands = await tree.sync()
     guild_id = config.get("guild_id")
