@@ -1743,7 +1743,7 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
     await interaction.followup.send(embed=branded_embed("Whitelist Updated", f"Action: **{action.value}**\nServer: **{server_name}**\nWhitelist count: **{len(whitelist_values())}**"), ephemeral=True)
 
 
-@tree.command(name="purge", description="Admin: purge tracked free servers, excluding paid and whitelisted servers")
+@tree.command(name="purge", description="Admin: purge live panel servers except paid, whitelisted, or prefix-skipped servers")
 @admin_only()
 @app_commands.describe(skip_keyword="Optional name prefix to skip, for example smp skips names starting smp or [smp].")
 async def purge(interaction: discord.Interaction, confirm: bool = False, skip_keyword: str | None = None) -> None:
@@ -1753,25 +1753,34 @@ async def purge(interaction: discord.Interaction, confirm: bool = False, skip_ke
     bracketed_skip = f"[{normalized_core}]" if normalized_core else ""
     keyword_note = f" Servers starting with `{normalized_core}` or `{bracketed_skip}` will also be skipped." if normalized_core else ""
     if not confirm:
-        await interaction.followup.send(embed=branded_embed("Confirmation Required", f"Run `/purge confirm:True` to delete ONLY tracked free servers. Paid servers and anything whitelisted by ID, UUID, or identifier are always skipped.{keyword_note}", 0xffcc00), ephemeral=True)
+        await interaction.followup.send(embed=branded_embed("Confirmation Required", f"Run `/purge confirm:True` to delete live panel servers. Paid servers and anything whitelisted by ID, UUID, or identifier are always skipped.{keyword_note}", 0xffcc00), ephemeral=True)
         return
-    all_rows = fetch_all_servers()
-    victims = [row for row in all_rows if str(row["plan"]).lower() == "free" and not is_server_protected(row) and not matches_purge_skip_keyword(row["name"], skip_keyword)]
-    skipped = len(all_rows) - len(victims)
+    if not ptero.session:
+        await ptero.start()
+    panel_servers = await ptero.list_servers()
+    tracked_by_id = {str(row["server_id"]): row for row in fetch_all_servers()}
+    victims: list[sqlite3.Row | dict[str, Any]] = []
+    skipped = 0
+    for panel_server in panel_servers:
+        server_id = str(panel_server["id"])
+        tracked = tracked_by_id.get(server_id)
+        record = tracked or panel_server_record(panel_server, "panel")
+        if tracked:
+            panel_user_id = int(panel_server.get("user") or 0)
+            panel_user = await ptero.get_user(panel_user_id, refresh=True) if panel_user_id else None
+            update_tracked_server_from_panel(server_id, panel_server, panel_user.get("email") if panel_user else None)
+            record = fetch_server(server_id) or record
+        if is_server_protected(record) or matches_purge_skip_keyword(str(record_value(record, "name", server_id)), skip_keyword):
+            skipped += 1
+            continue
+        victims.append(record)
     deleted = []
     failed = []
     for record in victims:
-        server_id = record["server_id"]
+        server_id = str(record_value(record, "server_id"))
         try:
-            live_row = await refresh_tracked_server(record)
-            if not live_row:
-                failed.append(f"{server_id}: already missing on panel; marked deleted")
-                continue
-            if str(live_row["plan"]).lower() != "free" or is_server_protected(live_row) or matches_purge_skip_keyword(live_row["name"], skip_keyword):
-                skipped += 1
-                continue
-            await (await ready_application_client_for(live_row)).delete_server(server_id)
-            deleted.append(f"{live_row['name']} (`{server_id}`)")
+            await ptero.delete_server(server_id)
+            deleted.append(f"{record_value(record, 'name', server_id)} (`{server_id}`)")
             mark_server_deleted(server_id)
             clear_server_notifications(server_id)
         except RuntimeError as error:
@@ -1779,12 +1788,12 @@ async def purge(interaction: discord.Interaction, confirm: bool = False, skip_ke
     save_database()
     skipped_reason = "paid/whitelisted/protected/prefix-matched" if normalized_core else "paid/whitelisted/protected"
     skip_line = f"\nSkipped name prefix: **{normalized_core}**" if normalized_core else ""
-    description = f"Deleted free servers: **{len(deleted)}**\nSkipped {skipped_reason} servers: **{skipped}**.{skip_line}"
+    description = f"Deleted panel servers: **{len(deleted)}**\nSkipped {skipped_reason} servers: **{skipped}**.{skip_line}"
     if deleted:
         description += "\n\n" + "\n".join(deleted[:15])
     if failed:
         description += "\n\nFailures:\n" + "\n".join(failed[:5])
-    await interaction.followup.send(embed=branded_embed("Free Server Purge Complete", description, 0xe74c3c), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("Panel Server Purge Complete", description, 0xe74c3c), ephemeral=True)
 
 
 @tree.command(name="autosuspend", description="Toggle autosuspend")
