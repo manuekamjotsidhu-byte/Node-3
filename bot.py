@@ -226,16 +226,22 @@ def is_whitelisted(server_id: str) -> bool:
     return str(server_id) in whitelist_values()
 
 
+def server_identifiers(record: sqlite3.Row | dict[str, Any] | None, server_id: str | None = None) -> set[str]:
+    identifiers = {str(server_id or "")}
+    if record:
+        identifiers.update({
+            str(record_value(record, "server_id", "")),
+            str(record_value(record, "uuid", "")),
+            str(record_value(record, "identifier", "")),
+        })
+    return {identifier for identifier in identifiers if identifier}
+
+
 def is_server_protected(record: sqlite3.Row | dict[str, Any]) -> bool:
     if str(record_value(record, "plan", "")).lower() == "paid":
         return True
     protected = whitelist_values()
-    identifiers = {
-        str(record_value(record, "server_id", "")),
-        str(record_value(record, "uuid", "")),
-        str(record_value(record, "identifier", "")),
-    }
-    return any(identifier and identifier in protected for identifier in identifiers)
+    return bool(server_identifiers(record) & protected)
 
 
 def fetch_link(discord_user_id: int) -> sqlite3.Row | None:
@@ -805,6 +811,36 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
         except Exception as error:
             print(f"Failed to include {panel_label_for_plan(plan)} panel servers in admin autocomplete quickly: {error}")
     return row_server_choices(current, rows)
+
+
+async def whitelist_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if interaction.guild is None or not is_admin(interaction.user):
+        return []
+    action = getattr(interaction.namespace, "action", "")
+    action_value = getattr(action, "value", action)
+    action_value = str(action_value or "").lower()
+    rows: list[sqlite3.Row | dict[str, Any]] = list(fetch_all_servers())
+    seen = {str(row["server_id"]) for row in rows}
+    try:
+        panel_servers = ptero.server_cache or await asyncio.wait_for(ptero.list_servers(), timeout=2.5)
+        for server in panel_servers:
+            server_id = str(server.get("id"))
+            if server_id not in seen:
+                rows.append(panel_server_record(server, "panel"))
+                seen.add(server_id)
+    except Exception as error:
+        print(f"Failed to include panel servers in whitelist autocomplete quickly: {error}")
+    protected = whitelist_values()
+    filtered: list[sqlite3.Row | dict[str, Any]] = []
+    for row in rows:
+        identifiers = server_identifiers(row)
+        is_manual = bool(identifiers & protected)
+        is_paid = str(record_value(row, "plan", "")).lower() == "paid"
+        if action_value == "remove" and is_manual:
+            filtered.append(row)
+        elif action_value == "add" and not is_manual and not is_paid:
+            filtered.append(row)
+    return row_server_choices(current, filtered)
 
 
 def parse_duration(value: str) -> int:
@@ -1580,7 +1616,7 @@ async def nodes(interaction: discord.Interaction) -> None:
 
 @tree.command(name="whitelist", description="Admin: manage or list whitelisted servers")
 @admin_only()
-@app_commands.autocomplete(server=admin_tracked_server_autocomplete)
+@app_commands.autocomplete(server=whitelist_server_autocomplete)
 @app_commands.choices(action=[app_commands.Choice(name="add", value="add"), app_commands.Choice(name="remove", value="remove"), app_commands.Choice(name="list", value="list")])
 async def whitelist(interaction: discord.Interaction, action: app_commands.Choice[str], server: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -1648,20 +1684,32 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
         return
     if not server:
         raise RuntimeError("Select a server when using the add or remove whitelist action.")
+    tracked_row = fetch_server(server)
+    legacy_record = database.get("servers", {}).get(server)
+    panel_record: dict[str, Any] | None = None
+    if not tracked_row and not legacy_record:
+        try:
+            panel_record = panel_server_record(await ptero.get_server(server), "panel")
+        except RuntimeError:
+            panel_record = None
+    record = tracked_row or legacy_record or panel_record
+    identifiers = server_identifiers(record, server)
     whitelist_set = set(str(item) for item in database.setdefault("whitelist", []))
     if action.value == "add":
+        if record and is_server_protected(record):
+            raise RuntimeError("That server is already protected, so it is hidden from whitelist add choices.")
         whitelist_set.add(server)
-    else:
-        whitelist_set.discard(server)
-    database["whitelist"] = sorted(whitelist_set, key=str)
-    save_database()
-    with db() as connection:
-        if action.value == "add":
+        database["whitelist"] = sorted(whitelist_set, key=str)
+        save_database()
+        with db() as connection:
             connection.execute("INSERT OR IGNORE INTO whitelist(server_id) VALUES (?)", (server,))
-        else:
-            connection.execute("DELETE FROM whitelist WHERE server_id=?", (server,))
-    tracked = database.get("servers", {}).get(server, {})
-    await interaction.followup.send(embed=branded_embed("Whitelist Updated", f"Action: **{action.value}**\nServer: **{tracked.get('name', server)}**\nWhitelist count: **{len(database['whitelist'])}**"), ephemeral=True)
+    else:
+        if not identifiers & whitelist_values():
+            raise RuntimeError("That server is not manually whitelisted, so it is hidden from whitelist remove choices.")
+        remove_whitelist_entries(identifiers)
+        save_database()
+    server_name = record_value(record, "name", server) if record else server
+    await interaction.followup.send(embed=branded_embed("Whitelist Updated", f"Action: **{action.value}**\nServer: **{server_name}**\nWhitelist count: **{len(whitelist_values())}**"), ephemeral=True)
 
 
 @tree.command(name="purge", description="Admin: purge tracked free servers, excluding paid and whitelisted servers")
