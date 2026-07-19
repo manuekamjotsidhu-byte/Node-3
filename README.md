@@ -59,7 +59,7 @@ python bot.py
 - `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.
 - `/renew` - guild admin-only renewal command with admin server autocomplete; tracked servers update the local DB, and panel-only servers still sync Saga/panel expiration by a time such as `30d`.
 - `/delete` - guild admin-only command to delete one specific tracked server with `confirm:True`.
-- `/deletesuspended` - guild admin-only cleanup command to delete suspended `free`, `paid`, or `all` servers after confirmation.
+- `/deletesuspended` - guild admin-only cleanup command that fetches live suspended servers from the panel and deletes suspended `free`, `paid`, or `all` servers after confirmation.
 - `/resize` - guild admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.
 - `/suspend` and `/unsuspend` - admin-only suspension controls. `/suspend` can suspend a direct server, show a selectable menu by Discord user/email, or bulk suspend all except paid/whitelisted servers.
 - `/stopall` - admin-only stop for all tracked servers except whitelisted servers.

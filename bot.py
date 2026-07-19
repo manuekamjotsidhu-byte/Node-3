@@ -65,6 +65,12 @@ def save_database() -> None:
     DB_PATH.write_text(json.dumps(database, indent=2), encoding="utf-8")
 
 
+def panel_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def db() -> sqlite3.Connection:
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(SQLITE_PATH)
@@ -192,7 +198,7 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         "databases": int(feature_limits.get("databases") or 0),
         "allocations": int(feature_limits.get("allocations") or 0),
         "backups": int(feature_limits.get("backups") or 0),
-        "suspended": int(bool(panel_server.get("suspended", False))),
+        "suspended": int(panel_bool(panel_server.get("suspended", False))),
         "deleted": 0,
     }
     with db() as connection:
@@ -1783,22 +1789,42 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
 @app_commands.choices(plan=[app_commands.Choice(name="free", value="free"), app_commands.Choice(name="paid", value="paid"), app_commands.Choice(name="all", value="all")])
 async def deletesuspended(interaction: discord.Interaction, plan: app_commands.Choice[str], confirm: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
-    victims = [row for row in fetch_all_servers() if row["suspended"] and (plan.value == "all" or row["plan"] == plan.value)]
+    if not ptero.session:
+        await ptero.start()
+    panel_servers = await ptero.list_servers()
+    tracked_by_id = {str(row["server_id"]): row for row in fetch_all_servers()}
+    victims: list[sqlite3.Row | dict[str, Any]] = []
+    for panel_server in panel_servers:
+        if not panel_bool(panel_server.get("suspended", False)):
+            continue
+        server_id = str(panel_server["id"])
+        tracked = tracked_by_id.get(server_id)
+        if tracked:
+            panel_user_id = int(panel_server.get("user") or 0)
+            panel_user = await ptero.get_user(panel_user_id, refresh=True) if panel_user_id else None
+            update_tracked_server_from_panel(server_id, panel_server, panel_user.get("email") if panel_user else None)
+            tracked = fetch_server(server_id) or tracked
+        record = tracked or panel_server_record(panel_server, "panel")
+        record_plan = str(record_value(record, "plan", "panel")).lower()
+        if plan.value != "all" and record_plan != plan.value:
+            continue
+        victims.append(record)
     if not confirm:
-        await interaction.followup.send(embed=branded_embed("Confirm Suspended Delete", f"Found **{len(victims)}** suspended **{plan.value}** server(s). Run `/deletesuspended plan:{plan.value} confirm:True` to permanently delete them from the panel.", 0xffcc00), ephemeral=True)
+        await interaction.followup.send(embed=branded_embed("Confirm Suspended Delete", f"Found **{len(victims)}** live suspended **{plan.value}** server(s). Run `/deletesuspended plan:{plan.value} confirm:True` to permanently delete them from the panel.", 0xffcc00), ephemeral=True)
         return
     deleted: list[str] = []
     failed: list[str] = []
     for row in victims:
+        server_id = str(record_value(row, "server_id"))
         try:
-            await (await ready_application_client_for(row)).delete_server(row["server_id"])
-            mark_server_deleted(row["server_id"])
-            clear_server_notifications(row["server_id"])
-            deleted.append(f"`{row['server_id']}` • {row['name']}")
+            await ptero.delete_server(server_id)
+            mark_server_deleted(server_id)
+            clear_server_notifications(server_id)
+            deleted.append(f"`{server_id}` • {record_value(row, 'name', server_id)}")
         except Exception as error:
-            failed.append(f"`{row['server_id']}` • {clean(str(error), 120)}")
+            failed.append(f"`{server_id}` • {clean(str(error), 120)}")
     save_database()
-    description = f"Deleted **{len(deleted)}** suspended server(s) for plan **{plan.value}**."
+    description = f"Deleted **{len(deleted)}** live suspended server(s) for plan **{plan.value}**."
     if deleted:
         description += "\n\n" + "\n".join(deleted[:15])
     if failed:
