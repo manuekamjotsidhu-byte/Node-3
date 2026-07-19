@@ -125,6 +125,11 @@ def emoji_from(raw: str):
         return None
 
 
+async def defer_if_needed(interaction: discord.Interaction, *, ephemeral: bool = True) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+
+
 class Store:
     def __init__(self):
         self.db = sqlite3.connect(DB_FILE)
@@ -324,17 +329,27 @@ class TicketBot(commands.Bot):
         return report
 
     def ticket_embed(self, ticket) -> discord.Embed:
-        e = discord.Embed(title=f"🎟️ ZeroX Host Ticket #{ticket['ticket_id']:04d}", color=0x5865F2, timestamp=utcnow())
-        e.add_field(name="Ticket ID", value=str(ticket["ticket_id"]), inline=True)
-        e.add_field(name="Ticket Opener", value=f"<@{ticket['opener_id']}>", inline=True)
-        e.add_field(name="User ID", value=str(ticket["opener_id"]), inline=True)
+        hours = self.cfg["tickets"]["inactivity_close_hours"]
+        e = discord.Embed(
+            title="🎟️ Ticket Opened",
+            description=(
+                "🛟 Please provide us with a detailed description of your issue.\n"
+                "🛟 ZeroX Host support staff are human, so please be patient — "
+                "you'll get an answer as soon as possible.\n\n"
+                "**Enter Your Reason For Opening This Ticket.**\n"
+                f"> {ticket['reason'][:900]}\n\n"
+                f"⏱️ **This ticket will be autoclosed when inactive for {hours}h!**"
+            ),
+            color=0xF59E0B,
+            timestamp=utcnow(),
+        )
+        e.add_field(name="Ticket ID", value=f"`{ticket['ticket_id']:04d}`", inline=True)
+        e.add_field(name="Opener", value=f"<@{ticket['opener_id']}>", inline=True)
         e.add_field(name="Category", value=ticket["category_name"], inline=True)
         e.add_field(name="Status", value=ticket["status"].title(), inline=True)
         e.add_field(name="Claimed", value=f"<@{ticket['claimed_by']}>" if ticket["claimed_by"] else "Unclaimed", inline=True)
         e.add_field(name="Pinned", value="Yes" if ticket["pinned"] else "No", inline=True)
-        e.add_field(name="Created", value=ticket["created_at"], inline=False)
-        e.add_field(name="Opening Reason", value=ticket["reason"][:1024], inline=False)
-        e.set_footer(text=f"This ticket will automatically close after {self.cfg['tickets']['inactivity_close_hours']} hours of inactivity.")
+        e.set_footer(text="ZeroX Host Support")
         return e
 
     async def create_ticket(self, interaction: discord.Interaction, key: str, reason: str):
@@ -368,7 +383,9 @@ class TicketBot(commands.Bot):
                 await ch.send(embed=self.ticket_embed(ticket), view=TicketControlView(self))
                 await self.log_event("Ticket opened", f"Channel: {ch.mention}", ticket)
                 view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=ch.jump_url))
-                await self.safe_send(interaction, "🎟️ **Ticket Created**\n\nYour ticket has been created. Click the button below to access it!", ephemeral=True, view=view)
+                created = discord.Embed(title="🎟️ Ticket Created", description="Your ticket has been created. Click the button below to access it!", color=0xF59E0B, timestamp=utcnow())
+                created.set_author(name="ZeroX Host Support")
+                await self.safe_send(interaction, embed=created, ephemeral=True, view=view)
             except Exception as e:
                 self.store.exec("DELETE FROM tickets WHERE ticket_id=?", (tid,))
                 if ch:
@@ -528,23 +545,23 @@ class TicketControlView(discord.ui.View):
         t = self.bot.ticket_by_channel(interaction.channel.id)
         if not t: await self.bot.safe_send(interaction, "This is not a valid ticket channel.", ephemeral=True); return None
         return t
-    @discord.ui.button(label="👋 Claim Ticket", style=discord.ButtonStyle.primary, custom_id="zerox:ticket:claim")
+    @discord.ui.button(label="👋 Claim Ticket", style=discord.ButtonStyle.success, custom_id="zerox:ticket:claim", row=0)
     async def claim(self, interaction, button): await claim_ticket(self.bot, interaction)
-    @discord.ui.button(label="📌 Pin Ticket", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:pin")
+    @discord.ui.button(label="📌 Pin Ticket", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:pin", row=1)
     async def pin(self, interaction, button): await pin_ticket(self.bot, interaction)
-    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:close")
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:close", row=1)
     async def close(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_modal(CloseModal(self.bot))
-    @discord.ui.button(label="➕ Add User", style=discord.ButtonStyle.success, custom_id="zerox:ticket:add")
+    @discord.ui.button(label="➕ Add User", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:add", row=2)
     async def add(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_message("Select a user to add.", view=UserActionView(self.bot, "add"), ephemeral=True)
-    @discord.ui.button(label="➖ Remove User", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:remove")
+    @discord.ui.button(label="➖ Remove User", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:remove", row=2)
     async def rem(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_message("Select a user to remove.", view=UserActionView(self.bot, "remove"), ephemeral=True)
-    @discord.ui.button(label="✏️ Rename Ticket", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:rename")
+    @discord.ui.button(label="✏️ Rename", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:rename", row=2)
     async def rename(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_modal(RenameModal(self.bot))
-    @discord.ui.button(label="🗑️ Delete Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:delete")
+    @discord.ui.button(label="❌ Delete Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:delete", row=3)
     async def delete(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_message("Confirm ticket deletion.", view=ConfirmDeleteView(self.bot), ephemeral=True)
 
@@ -573,6 +590,7 @@ async def require_staff(bot, interaction):
     return t
 
 async def claim_ticket(bot, interaction):
+    await defer_if_needed(interaction)
     t = await require_staff(bot, interaction)
     if not t: return
     if t["claimed_by"] and t["claimed_by"] != interaction.user.id and not bot.is_owner(interaction.user):
@@ -581,12 +599,14 @@ async def claim_ticket(bot, interaction):
     await bot.log_event("Ticket claimed", f"Claimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket claimed.", ephemeral=True)
 async def unclaim_ticket(bot, interaction):
+    await defer_if_needed(interaction)
     t = await require_staff(bot, interaction)
     if not t: return
     bot.store.exec("UPDATE tickets SET claimed_by=NULL, claim_at=NULL WHERE ticket_id=?", (t["ticket_id"],))
     await bot.log_event("Ticket unclaimed", f"Unclaimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket unclaimed.", ephemeral=True)
 async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
+    await defer_if_needed(interaction)
     t = await require_staff(bot, interaction)
     if not t: return
     new = (not bool(t["pinned"])) if desired is None else bool(desired)
@@ -603,6 +623,7 @@ async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
 async def pin_ticket(bot, interaction):
     await set_pin_ticket(bot, interaction, None)
 async def rename_channel(bot, interaction, name):
+    await defer_if_needed(interaction)
     t = await require_staff(bot, interaction)
     if not t: return
     clean = sanitize_name(name)
@@ -613,6 +634,7 @@ async def rename_channel(bot, interaction, name):
     await bot.log_event("Ticket renamed", f"By {interaction.user.mention}\nOld: {old}\nNew: {final}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket renamed.", ephemeral=True)
 async def user_action(bot, interaction, member, action):
+    await defer_if_needed(interaction)
     t = await require_staff(bot, interaction)
     if not t: return
     added = set(filter(None, (t["added_users"] or "").split(",")))
