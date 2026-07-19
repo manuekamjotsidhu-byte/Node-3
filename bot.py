@@ -1954,6 +1954,10 @@ async def server_expirations(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=branded_embed("Tracked Expirations", "\n".join(rows[:25]) or "No tracked servers."), ephemeral=True)
 
 
+def expiration_warning_lead(notification_type: str | None) -> str:
+    return "7 days" if notification_type == "suspend_7d" else "24 hours"
+
+
 async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, notification_type: str | None = None) -> None:
     try:
         user = await client.fetch_user(int(record["discord_user_id"]))
@@ -1963,13 +1967,13 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
     server_name = record["name"]
     timestamp = int(when.timestamp())
     if event == "suspension_warning":
+        lead = expiration_warning_lead(notification_type)
         if plan == "paid":
             title = "Paid Service Renewal Reminder"
-            lead = "7 days" if notification_type == "suspend_7d" else "24 hours"
             message = f"Your paid server **{server_name}** is scheduled for suspension in **{lead}** at <t:{timestamp}:F>. Please renew by clearing the recurring amount due to keep your service active."
         else:
             title = "Free Server Renewal Reminder"
-            message = f"Your free server **{server_name}** will be suspended in **24 hours** at <t:{timestamp}:F>. Please renew your server if you still need it."
+            message = f"Your free server **{server_name}** will be suspended in **{lead}** at <t:{timestamp}:F>. Please renew your server if you still need it."
     elif event == "suspended":
         title = "Server Suspended"
         message = f"Your server **{server_name}** expired and has been suspended. It will be deleted after 7 days if it is not renewed."
@@ -2030,9 +2034,7 @@ async def suspend_expired_servers() -> None:
         delete_at = expires_at + timedelta(days=7)
         try:
             if not record["suspended"]:
-                suspension_warnings = [("suspend_1d", timedelta(days=1))]
-                if record["plan"] == "paid":
-                    suspension_warnings.insert(0, ("suspend_7d", timedelta(days=7)))
+                suspension_warnings = [("suspend_7d", timedelta(days=7)), ("suspend_1d", timedelta(days=1))]
                 for notification_type, window in suspension_warnings:
                     if now <= expires_at and expires_at - now <= window and not notification_sent(server_id, notification_type):
                         await send_lifecycle_dm(record, "suspension_warning", expires_at, notification_type)

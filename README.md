@@ -19,7 +19,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
 - Tracked server details are refreshed from the live Pterodactyl panel before user lists and management actions, and a 60-second background sync refetches panel nodes, nests, eggs, servers, users, and updates tracked server names/specs/suspension/deletion status from panel activity.
 - Saga Auto Suspension can be synced during create, renew, and `/autosuspend` changes by configuring `saga_auto_suspend_enabled` and the panel field name in `saga_auto_suspend_field` (fallbacks try `suspended_at`, `expiration_date`, and `expires_at`).
-- Expired tracked servers are automatically suspended by the background task. Users receive renewal reminders before suspension, a deletion warning 24 hours before cleanup, and suspended servers are deleted after 7 days.
+- Expired tracked servers are automatically suspended by the background task. Users receive renewal reminders 7 days and 24 hours before suspension, a deletion warning 24 hours before cleanup, and suspended servers are deleted after 7 days.
 
 ## Files
 
