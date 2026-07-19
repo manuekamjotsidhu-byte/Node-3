@@ -67,8 +67,22 @@ def save_database() -> None:
 
 def panel_bool(value: Any) -> bool:
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
+        return value.strip().lower() in {"1", "true", "yes", "on", "suspended"}
     return bool(value)
+
+
+def panel_server_is_suspended(panel_server: dict[str, Any]) -> bool:
+    status_values = {
+        str(panel_server.get("status", "")).strip().lower(),
+        str(panel_server.get("state", "")).strip().lower(),
+        str((panel_server.get("container") or {}).get("status", "")).strip().lower(),
+    }
+    return (
+        panel_bool(panel_server.get("suspended", False))
+        or panel_bool(panel_server.get("is_suspended", False))
+        or bool(panel_server.get("suspended_at"))
+        or "suspended" in status_values
+    )
 
 
 def db() -> sqlite3.Connection:
@@ -198,7 +212,7 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         "databases": int(feature_limits.get("databases") or 0),
         "allocations": int(feature_limits.get("allocations") or 0),
         "backups": int(feature_limits.get("backups") or 0),
-        "suspended": int(panel_bool(panel_server.get("suspended", False))),
+        "suspended": int(panel_server_is_suspended(panel_server)),
         "deleted": 0,
     }
     with db() as connection:
@@ -1811,10 +1825,14 @@ async def deletesuspended(interaction: discord.Interaction, plan: app_commands.C
     panel_servers = await ptero.list_servers()
     tracked_by_id = {str(row["server_id"]): row for row in fetch_all_servers()}
     victims: list[sqlite3.Row | dict[str, Any]] = []
-    for panel_server in panel_servers:
-        if not panel_bool(panel_server.get("suspended", False)):
+    for listed_server in panel_servers:
+        server_id = str(listed_server["id"])
+        try:
+            panel_server = await ptero.get_server(server_id)
+        except RuntimeError:
+            panel_server = listed_server
+        if not panel_server_is_suspended(panel_server):
             continue
-        server_id = str(panel_server["id"])
         tracked = tracked_by_id.get(server_id)
         if tracked:
             panel_user_id = int(panel_server.get("user") or 0)
