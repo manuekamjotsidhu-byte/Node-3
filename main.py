@@ -293,8 +293,24 @@ class TicketBot(commands.Bot):
                     log.warning("category rename failed for %s: %s", name, e)
             else:
                 report.append(f"✅ Reused category `{cat.name}`.")
+            if can_manage:
+                try:
+                    await cat.set_permissions(guild.default_role, view_channel=False, reason="ZeroX Host ticket category privacy")
+                    if me:
+                        await cat.set_permissions(me, view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, reason="ZeroX Host ticket category bot access")
+                    staff_role = self.staff_role(guild)
+                    owner_role = self.owner_role(guild)
+                    if staff_role:
+                        await cat.set_permissions(staff_role, view_channel=True, send_messages=True, read_message_history=True, reason="ZeroX Host ticket category staff access")
+                    if owner_role:
+                        await cat.set_permissions(owner_role, view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, reason="ZeroX Host ticket category owner access")
+                    report.append(f"✅ Synced private permissions for `{cat.name}`.")
+                except Exception as e:
+                    report.append(f"⚠️ Could not sync permissions for `{cat.name}`: {type(e).__name__}.")
+                    log.warning("category permission sync failed for %s: %s", cat.name, e)
             self.cfg["ticket_categories"][CATEGORY_ID_KEYS[key]] = str(cat.id)
             resolved.append(cat)
+        report.append("ℹ️ Discord may hide empty categories from some users until a ticket channel exists inside them.")
         save_config(self.cfg)
         try:
             start = max(0, len(guild.categories) - len(resolved))
