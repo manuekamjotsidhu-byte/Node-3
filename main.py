@@ -52,7 +52,18 @@ def deep_defaults() -> dict[str, Any]:
         "roles": {"owner_role_id": "", "staff_role_id": ""},
         "channels": {"logs_channel_id": "", "panel_channel_id": ""},
         "ticket_categories": {"buy_orders_id": "", "general_support_id": "", "complaints_reports_id": "", "other_issues_id": ""},
-        "tickets": {"max_active_per_user": 1, "inactivity_close_hours": 24, "closed_delete_hours": 24, "channel_name_format": "ticket-{username}-{number}"},
+        "tickets": {
+            "max_active_per_user": 1,
+            "inactivity_close_hours": 24,
+            "closed_delete_hours": 24,
+            "channel_name_format": "ticket-{username}-{number}",
+            "category_channel_name_formats": {
+                "buy_orders": "paid-{username}",
+                "general_support": "support-{username}",
+                "complaints_reports": "report-{username}",
+                "other_issues": "other-{username}",
+            },
+        },
         "panel": {
             "title": "ZeroX Host Support",
             "description": "<a:fire_gif:1514165449275871393> **Need help? Open a ticket by choosing the correct category below. Our team will assist you as quickly as possible.**\n\n<:Store:1514165709616451696> **Buy / Orders**\n> Purchase items or services\n> Custom orders & payments\n> Order-related questions\n\n<a:support:1514165749097173074> **General Support**\n> Server-related help\n> Technical issues\n> General questions & guidance\n\n<a:hammer_gif:1514165780999180309> **Complaints / Reports**\n> Report rule breakers\n> Staff-related issues\n> Scams, abuse, or disputes\n\n<a:purchase:1528210165642432594> **Other Issues**\n> Anything not listed above\n> Suggestions or feedback\n> Miscellaneous problems\n\n<a:Minecraft_diamond:1528237013852225609> **Please provide clear details after opening a ticket to help us assist you faster.**\n",
@@ -407,7 +418,9 @@ class TicketBot(commands.Bot):
             cur = self.store.exec("INSERT INTO tickets(guild_id, channel_id, opener_id, category_key, category_name, discord_category_id, reason, status, created_at, last_activity_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (ALLOWED_GUILD_ID, None, interaction.user.id, key, self.cfg["categories"][key]["name"], cat.id if cat else None, reason, "open", iso(), iso()))
             tid = cur.lastrowid
             username = sanitize_name(interaction.user.name)
-            base = sanitize_name(self.cfg["tickets"]["channel_name_format"].format(username=username, number=f"{tid:04d}", id=tid))[:90]
+            formats = self.cfg["tickets"].get("category_channel_name_formats", {})
+            name_format = formats.get(key) or self.cfg["tickets"].get("channel_name_format", "ticket-{username}-{number}")
+            base = sanitize_name(name_format.format(username=username, number=f"{tid:04d}", id=tid, category=key))[:90]
             ch = None
             try:
                 ch = await guild.create_text_channel(base, category=cat, overwrites=overwrites, reason=f"Ticket #{tid}")

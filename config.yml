@@ -23,6 +23,11 @@ tickets:
   inactivity_close_hours: 24
   closed_delete_hours: 24
   channel_name_format: "ticket-{username}-{number}"
+  category_channel_name_formats:
+    buy_orders: "paid-{username}"
+    general_support: "support-{username}"
+    complaints_reports: "report-{username}"
+    other_issues: "other-{username}"
 
 panel:
   title: "ZeroX Host Support"
