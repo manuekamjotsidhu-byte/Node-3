@@ -634,6 +634,17 @@ def clean(text: str, limit: int = 80) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+def matches_purge_skip_keyword(server_name: str, keyword: str | None) -> bool:
+    if not keyword:
+        return False
+    normalized = keyword.strip().lower()
+    if not normalized:
+        return False
+    core = normalized.strip("[]")
+    prefixes = {normalized, core, f"[{core}]"}
+    return server_name.strip().lower().startswith(tuple(prefix for prefix in prefixes if prefix))
+
+
 def branded_embed(title: str, description: str, color: int = 0x00d4ff) -> discord.Embed:
     embed = discord.Embed(title=f"✨ {title}", description=description, color=color, timestamp=utc_now())
     if config.get("brand_icon_url"):
@@ -1720,13 +1731,18 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
 
 @tree.command(name="purge", description="Admin: purge tracked free servers, excluding paid and whitelisted servers")
 @admin_only()
-async def purge(interaction: discord.Interaction, confirm: bool = False) -> None:
+@app_commands.describe(skip_keyword="Optional name prefix to skip, for example smp skips names starting smp or [smp].")
+async def purge(interaction: discord.Interaction, confirm: bool = False, skip_keyword: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
+    normalized_skip = skip_keyword.strip() if skip_keyword else ""
+    normalized_core = normalized_skip.strip("[]")
+    bracketed_skip = f"[{normalized_core}]" if normalized_core else ""
+    keyword_note = f" Servers starting with `{normalized_core}` or `{bracketed_skip}` will also be skipped." if normalized_core else ""
     if not confirm:
-        await interaction.followup.send(embed=branded_embed("Confirmation Required", "Run `/purge confirm:True` to delete ONLY tracked free servers. Paid servers and anything whitelisted by ID, UUID, or identifier are always skipped.", 0xffcc00), ephemeral=True)
+        await interaction.followup.send(embed=branded_embed("Confirmation Required", f"Run `/purge confirm:True` to delete ONLY tracked free servers. Paid servers and anything whitelisted by ID, UUID, or identifier are always skipped.{keyword_note}", 0xffcc00), ephemeral=True)
         return
     all_rows = fetch_all_servers()
-    victims = [row for row in all_rows if str(row["plan"]).lower() == "free" and not is_server_protected(row)]
+    victims = [row for row in all_rows if str(row["plan"]).lower() == "free" and not is_server_protected(row) and not matches_purge_skip_keyword(row["name"], skip_keyword)]
     skipped = len(all_rows) - len(victims)
     deleted = []
     failed = []
@@ -1737,7 +1753,7 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
             if not live_row:
                 failed.append(f"{server_id}: already missing on panel; marked deleted")
                 continue
-            if str(live_row["plan"]).lower() != "free" or is_server_protected(live_row):
+            if str(live_row["plan"]).lower() != "free" or is_server_protected(live_row) or matches_purge_skip_keyword(live_row["name"], skip_keyword):
                 skipped += 1
                 continue
             await (await ready_application_client_for(live_row)).delete_server(server_id)
@@ -1747,7 +1763,8 @@ async def purge(interaction: discord.Interaction, confirm: bool = False) -> None
         except RuntimeError as error:
             failed.append(f"{server_id}: {error}")
     save_database()
-    description = f"Deleted free servers: **{len(deleted)}**\nSkipped paid/whitelisted/protected servers: **{skipped}**."
+    skip_line = f"\nSkipped name prefix: **{normalized_core}**" if normalized_core else ""
+    description = f"Deleted free servers: **{len(deleted)}**\nSkipped paid/whitelisted/protected/prefix-matched servers: **{skipped}**.{skip_line}"
     if deleted:
         description += "\n\n" + "\n".join(deleted[:15])
     if failed:
