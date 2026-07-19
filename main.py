@@ -589,16 +589,7 @@ class TicketControlView(discord.ui.View):
     @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:close", row=1)
     async def close(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_modal(CloseModal(self.bot))
-    @discord.ui.button(label="➕ Add User", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:add", row=2)
-    async def add(self, interaction, button):
-        if await self.guard(interaction): await interaction.response.send_message("Select a user to add.", view=UserActionView(self.bot, "add"), ephemeral=True)
-    @discord.ui.button(label="➖ Remove User", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:remove", row=2)
-    async def rem(self, interaction, button):
-        if await self.guard(interaction): await interaction.response.send_message("Select a user to remove.", view=UserActionView(self.bot, "remove"), ephemeral=True)
-    @discord.ui.button(label="✏️ Rename", style=discord.ButtonStyle.secondary, custom_id="zerox:ticket:rename", row=2)
-    async def rename(self, interaction, button):
-        if await self.guard(interaction): await interaction.response.send_modal(RenameModal(self.bot))
-    @discord.ui.button(label="❌ Delete Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:delete", row=3)
+    @discord.ui.button(label="❌ Delete Ticket", style=discord.ButtonStyle.danger, custom_id="zerox:ticket:delete", row=2)
     async def delete(self, interaction, button):
         if await self.guard(interaction): await interaction.response.send_message("Confirm ticket deletion.", view=ConfirmDeleteView(self.bot), ephemeral=True)
 
