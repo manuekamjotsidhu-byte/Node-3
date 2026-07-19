@@ -1777,8 +1777,9 @@ async def purge(interaction: discord.Interaction, confirm: bool = False, skip_ke
         except RuntimeError as error:
             failed.append(f"{server_id}: {error}")
     save_database()
+    skipped_reason = "paid/whitelisted/protected/prefix-matched" if normalized_core else "paid/whitelisted/protected"
     skip_line = f"\nSkipped name prefix: **{normalized_core}**" if normalized_core else ""
-    description = f"Deleted free servers: **{len(deleted)}**\nSkipped paid/whitelisted/protected/prefix-matched servers: **{skipped}**.{skip_line}"
+    description = f"Deleted free servers: **{len(deleted)}**\nSkipped {skipped_reason} servers: **{skipped}**.{skip_line}"
     if deleted:
         description += "\n\n" + "\n".join(deleted[:15])
     if failed:
