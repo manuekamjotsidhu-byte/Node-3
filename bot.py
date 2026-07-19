@@ -125,7 +125,8 @@ def init_db() -> None:
             expires_at TEXT NOT NULL,
             suspended INTEGER NOT NULL DEFAULT 0,
             deleted INTEGER NOT NULL DEFAULT 0,
-            autosuspend_enabled INTEGER NOT NULL DEFAULT 1
+            autosuspend_enabled INTEGER NOT NULL DEFAULT 1,
+            autosuspend_seconds INTEGER
         );
         CREATE TABLE IF NOT EXISTS whitelist (server_id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS autobackups (
@@ -153,14 +154,17 @@ def init_db() -> None:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_enabled INTEGER NOT NULL DEFAULT 1")
+        if "autosuspend_seconds" not in columns:
+            connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_seconds INTEGER")
         # Legacy databases may contain older link columns, but new installs use one panel only.
 
 
 def upsert_server_record(record: dict[str, Any]) -> None:
     with db() as connection:
         connection.execute("""
-        INSERT OR REPLACE INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (record["server_id"], record.get("identifier"), record.get("uuid"), record["name"], record["plan"], record["discord_user_id"], record["panel_user_id"], record["panel_email"], record["ram"], record["disk"], record["cpu"], record["nest_id"], record["nest_name"], record["egg_id"], record["egg_name"], record["node_id"], record["node_name"], record["databases"], record["allocations"], record["backups"], record["created_at"], record["expires_at"], int(record.get("suspended", False)), int(record.get("deleted", False)), int(record.get("autosuspend_enabled", True))))
+        INSERT OR REPLACE INTO servers (server_id, identifier, uuid, name, plan, discord_user_id, panel_user_id, panel_email, ram, disk, cpu, nest_id, nest_name, egg_id, egg_name, node_id, node_name, databases, allocations, backups, created_at, expires_at, suspended, deleted, autosuspend_enabled, autosuspend_seconds)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (record["server_id"], record.get("identifier"), record.get("uuid"), record["name"], record["plan"], record["discord_user_id"], record["panel_user_id"], record["panel_email"], record["ram"], record["disk"], record["cpu"], record["nest_id"], record["nest_name"], record["egg_id"], record["egg_name"], record["node_id"], record["node_name"], record["databases"], record["allocations"], record["backups"], record["created_at"], record["expires_at"], int(record.get("suspended", False)), int(record.get("deleted", False)), int(record.get("autosuspend_enabled", True)), record.get("autosuspend_seconds")))
 
 
 def fetch_server(server_id: str) -> sqlite3.Row | None:
@@ -1183,6 +1187,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         "suspended": False,
         "deleted": False,
         "autosuspend_enabled": True,
+        "autosuspend_seconds": duration_seconds,
     }
     database["servers"][server_id] = record
     database["users"].setdefault(str(user.id), {"servers": []})["servers"].append(server_id)
@@ -1497,7 +1502,10 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
     new_expiry = base + timedelta(seconds=seconds)
     if tracked_row:
         with db() as connection:
-            connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1 WHERE server_id=?", (new_expiry.isoformat(), server))
+            connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1, autosuspend_seconds=? WHERE server_id=?", (new_expiry.isoformat(), seconds, server))
+        if str(server) in database.get("servers", {}):
+            database["servers"][str(server)].update({"expires_at": new_expiry.isoformat(), "suspended": False, "autosuspend_enabled": True, "autosuspend_seconds": seconds})
+            save_database()
         clear_server_notifications(server)
     saga_synced = await (await ready_application_client_for(row)).set_saga_auto_suspend(server, new_expiry)
     try:
@@ -1830,6 +1838,7 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
     if state is None:
         enabled = bool(int(record_value(row, "autosuspend_enabled", 0) or 0))
         stored_expiry = record_value(row, "expires_at")
+        configured_seconds = record_value(row, "autosuspend_seconds")
         created_at_value = record_value(row, "created_at")
         details = [
             f"Server: **{record_value(row, 'name', server)}** (`{server}`)",
@@ -1840,7 +1849,9 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
             remaining = expires_at - utc_now()
             details.append(f"Suspension time: <t:{int(expires_at.timestamp())}:F> (<t:{int(expires_at.timestamp())}:R>)")
             details.append(f"Time remaining: **{describe_duration(int(remaining.total_seconds()))}**")
-            if created_at_value:
+            if configured_seconds:
+                details.append(f"Configured period: **{describe_duration(int(configured_seconds))}**")
+            elif created_at_value:
                 created_at = datetime.fromisoformat(str(created_at_value))
                 configured_period = expires_at - created_at
                 details.append(f"Configured period: **{describe_duration(int(configured_period.total_seconds()))}**")
@@ -1851,9 +1862,11 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
         return
     enabled = 1 if state.value == "on" else 0
     expires_at: datetime | None = None
+    configured_seconds: int | None = None
     if enabled:
         if time:
-            expires_at = utc_now() + timedelta(seconds=parse_duration(time))
+            configured_seconds = parse_duration(time)
+            expires_at = utc_now() + timedelta(seconds=configured_seconds)
         else:
             stored_expiry = record_value(row, "expires_at")
             if not stored_expiry:
@@ -1862,9 +1875,15 @@ async def autosuspend(interaction: discord.Interaction, server: str, state: app_
     if tracked_row:
         with db() as connection:
             if expires_at and time:
-                connection.execute("UPDATE servers SET autosuspend_enabled=?, expires_at=?, suspended=0 WHERE server_id=?", (enabled, expires_at.isoformat(), server))
+                connection.execute("UPDATE servers SET autosuspend_enabled=?, expires_at=?, suspended=0, autosuspend_seconds=? WHERE server_id=?", (enabled, expires_at.isoformat(), configured_seconds, server))
             else:
                 connection.execute("UPDATE servers SET autosuspend_enabled=? WHERE server_id=?", (enabled, server))
+        if str(server) in database.get("servers", {}):
+            mirror_update = {"autosuspend_enabled": bool(enabled)}
+            if expires_at and time:
+                mirror_update.update({"expires_at": expires_at.isoformat(), "suspended": False, "autosuspend_seconds": configured_seconds})
+            database["servers"][str(server)].update(mirror_update)
+            save_database()
     saga_synced = await (await ready_application_client_for(row)).set_saga_auto_suspend(server, expires_at if enabled else None)
     expiry_line = f"\nExpiration: <t:{int(expires_at.timestamp())}:F>" if expires_at else ""
     await interaction.followup.send(embed=branded_embed("Autosuspend Updated", f"Automatic expiration suspension for **{record_value(row, 'name', server)}** is now **{state.value.upper()}**.{expiry_line}\nSaga auto suspension: **{'synced' if saga_synced else 'cleared/not synced'}**"), ephemeral=True)
