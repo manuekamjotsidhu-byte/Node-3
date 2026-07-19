@@ -67,7 +67,7 @@ python bot.py
 - `/link` - admin-only link of an existing panel email to a Discord user.
 - `/nodes` - admin-only list of Pterodactyl deployment node names and IDs.
 - `/whitelist` - admin-only `add`, `remove`, or `list` command. Its `add` autocomplete only shows unprotected servers, `remove` only shows manually whitelisted servers, and `list` fetches the live `https://gp.zeroxhost.space` panel, labels paid servers as **Paid** and manually protected servers as **Whitelisted**, and automatically removes deleted servers from the whitelist. Purge protection checks server ID, UUID, and identifier.
-- `/purge confirm:True skip_keyword:smp` - admin-only purge for live panel servers; paid tracked servers, whitelist matches by server ID/UUID/identifier, and names starting with the optional prefix such as `smp` or `[smp]` are not deleted.
+- `/purge confirm:True skip_keyword:smp` - admin-only purge for live panel servers; the confirmation scans panel-created and tracked servers, paid tracked servers, whitelist matches by server ID/UUID/identifier, and names starting with the optional prefix such as `smp` or `[smp]` are not deleted.
 - `/autosuspend` - admin-only toggle to turn automatic expiration suspension on/off with admin server autocomplete; for panel-only servers, pass `time` like `30d` when turning it on so Saga has an expiration date.
 - `/server-expirations` - admin-only view of tracked server expiration and autosuspend status.
 

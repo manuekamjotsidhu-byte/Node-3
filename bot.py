@@ -1752,17 +1752,18 @@ async def purge(interaction: discord.Interaction, confirm: bool = False, skip_ke
     normalized_core = normalized_skip.strip("[]")
     bracketed_skip = f"[{normalized_core}]" if normalized_core else ""
     keyword_note = f" Servers starting with `{normalized_core}` or `{bracketed_skip}` will also be skipped." if normalized_core else ""
-    if not confirm:
-        await interaction.followup.send(embed=branded_embed("Confirmation Required", f"Run `/purge confirm:True` to delete live panel servers. Paid servers and anything whitelisted by ID, UUID, or identifier are always skipped.{keyword_note}", 0xffcc00), ephemeral=True)
-        return
     if not ptero.session:
         await ptero.start()
     panel_servers = await ptero.list_servers()
     tracked_by_id = {str(row["server_id"]): row for row in fetch_all_servers()}
     victims: list[sqlite3.Row | dict[str, Any]] = []
     skipped = 0
-    for panel_server in panel_servers:
-        server_id = str(panel_server["id"])
+    for listed_server in panel_servers:
+        server_id = str(listed_server["id"])
+        try:
+            panel_server = await ptero.get_server(server_id)
+        except RuntimeError:
+            panel_server = listed_server
         tracked = tracked_by_id.get(server_id)
         record = tracked or panel_server_record(panel_server, "panel")
         if tracked:
@@ -1774,6 +1775,13 @@ async def purge(interaction: discord.Interaction, confirm: bool = False, skip_ke
             skipped += 1
             continue
         victims.append(record)
+    if not confirm:
+        preview = "\n".join(f"{record_value(record, 'name', record_value(record, 'server_id'))} (`{record_value(record, 'server_id')}`)" for record in victims[:10])
+        description = f"Found **{len(victims)}** unprotected live panel server(s) that would be deleted. Skipped **{skipped}** paid/whitelisted/protected server(s).{keyword_note}\nRun `/purge confirm:True` to delete them."
+        if preview:
+            description += "\n\nWill delete:\n" + preview
+        await interaction.followup.send(embed=branded_embed("Confirmation Required", description, 0xffcc00), ephemeral=True)
+        return
     deleted = []
     failed = []
     for record in victims:
