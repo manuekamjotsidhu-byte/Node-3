@@ -2017,14 +2017,22 @@ def expiration_warning_lead(notification_type: str | None) -> str:
     return "7 days" if notification_type == "suspend_7d" else "24 hours"
 
 
+def warning_threshold_reached(now: datetime, expires_at: datetime, lead: timedelta) -> bool:
+    due_at = expires_at - lead
+    # The lifecycle task runs once per minute, so allow a small grace window after
+    # the exact threshold timestamp without sending broad "any time inside the
+    # window" reminders. This keeps paid 7-day and all-plan 24-hour alerts tied
+    # to their scheduled send time.
+    return due_at <= now < due_at + timedelta(seconds=90)
+
+
 def due_suspension_warnings(record: sqlite3.Row, now: datetime, expires_at: datetime) -> list[tuple[str, timedelta]]:
     if now > expires_at:
         return []
-    remaining = expires_at - now
     warnings: list[tuple[str, timedelta]] = []
-    if str(record["plan"]).lower() == "paid" and timedelta(days=1) < remaining <= timedelta(days=7):
+    if str(record["plan"]).lower() == "paid" and warning_threshold_reached(now, expires_at, timedelta(days=7)):
         warnings.append(("suspend_7d", timedelta(days=7)))
-    if remaining <= timedelta(days=1):
+    if warning_threshold_reached(now, expires_at, timedelta(days=1)):
         warnings.append(("suspend_1d", timedelta(days=1)))
     return warnings
 
