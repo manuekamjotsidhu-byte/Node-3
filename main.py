@@ -202,6 +202,12 @@ class TicketBot(commands.Bot):
         rows = self.active_tickets_for(uid)
         return rows[0] if rows else None
 
+    async def cleanup_stale_user_tickets(self, guild: discord.Guild, uid: int) -> None:
+        for ticket in self.active_tickets_for(uid):
+            if not guild.get_channel(ticket["channel_id"]):
+                self.store.exec("UPDATE tickets SET status='deleted', deleted_at=?, close_reason=? WHERE ticket_id=?", (iso(), "Ticket channel was missing during validation.", ticket["ticket_id"]))
+                await self.log_event("Stale ticket cleaned", "Ticket channel was missing; database record was released.", ticket)
+
     def ticket_by_channel(self, cid: int):
         return self.store.row("SELECT * FROM tickets WHERE channel_id=? AND guild_id=? AND status!='deleted'", (cid, ALLOWED_GUILD_ID))
 
@@ -213,7 +219,7 @@ class TicketBot(commands.Bot):
         except Exception as e:
             log.warning("interaction response failed: %s", e)
 
-    async def log_event(self, title: str, desc: str = "", ticket=None, file: Optional[discord.File] = None):
+    async def log_event(self, title: str, desc: str = "", ticket=None, file: Optional[discord.File] = None) -> bool:
         guild = self.get_guild(ALLOWED_GUILD_ID)
         ch = self.logs_channel(guild) if guild else None
         embed = discord.Embed(title=title, description=desc[:3500], color=0x5865F2, timestamp=utcnow())
@@ -232,10 +238,14 @@ class TicketBot(commands.Bot):
             embed.add_field(name="Close Reason", value=(ticket["close_reason"] or "—")[:1024], inline=False)
             embed.add_field(name="Transcript", value=ticket["transcript_status"], inline=True)
         if ch:
-            try: await ch.send(embed=embed, file=file)
-            except Exception as e: log.warning("log send failed: %s", e)
-        else:
-            log.warning("log channel missing: %s %s", title, desc)
+            try:
+                await ch.send(embed=embed, file=file)
+                return True
+            except Exception as e:
+                log.warning("log send failed: %s", e)
+                return False
+        log.warning("log channel missing: %s %s", title, desc)
+        return False
 
     def panel_embed(self) -> discord.Embed:
         p = self.cfg["panel"]
@@ -280,13 +290,14 @@ class TicketBot(commands.Bot):
     async def create_ticket(self, interaction: discord.Interaction, key: str, reason: str):
         lock = self.user_locks.setdefault(interaction.user.id, asyncio.Lock())
         async with lock:
+            guild = interaction.guild; assert guild
+            await self.cleanup_stale_user_tickets(guild, interaction.user.id)
             active = self.active_tickets_for(interaction.user.id)
             max_active = max(1, int(self.cfg["tickets"].get("max_active_per_user", 1)))
             if len(active) >= max_active:
                 existing = active[0]
                 view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=f"https://discord.com/channels/{ALLOWED_GUILD_ID}/{existing['channel_id']}"))
                 return await self.safe_send(interaction, "You already have an active ticket.", ephemeral=True, view=view)
-            guild = interaction.guild; assert guild
             cat = guild.get_channel(self.category_id(key) or 0)
             if not isinstance(cat, discord.CategoryChannel):
                 await self.ensure_categories(guild); cat = guild.get_channel(self.category_id(key) or 0)
@@ -294,18 +305,29 @@ class TicketBot(commands.Bot):
             overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True), interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)}
             if staff: overwrites[staff] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
             if owner: overwrites[owner] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-            cur = self.store.exec("INSERT INTO tickets(guild_id, channel_id, opener_id, category_key, category_name, discord_category_id, reason, status, created_at, last_activity_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (ALLOWED_GUILD_ID, 0, interaction.user.id, key, self.cfg["categories"][key]["name"], cat.id if cat else None, reason, "open", iso(), iso()))
+            cur = self.store.exec("INSERT INTO tickets(guild_id, channel_id, opener_id, category_key, category_name, discord_category_id, reason, status, created_at, last_activity_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (ALLOWED_GUILD_ID, None, interaction.user.id, key, self.cfg["categories"][key]["name"], cat.id if cat else None, reason, "open", iso(), iso()))
             tid = cur.lastrowid
             username = sanitize_name(interaction.user.name)
             base = sanitize_name(self.cfg["tickets"]["channel_name_format"].format(username=username, number=f"{tid:04d}", id=tid))[:90]
-            ch = await guild.create_text_channel(base, category=cat, overwrites=overwrites, reason=f"Ticket #{tid}")
-            self.store.exec("UPDATE tickets SET channel_id=?, custom_channel_name=? WHERE ticket_id=?", (ch.id, base, tid))
-            ticket = self.ticket_by_channel(ch.id)
-            await ch.send(f"{interaction.user.mention} {staff.mention if staff else ''}".strip(), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-            await ch.send(embed=self.ticket_embed(ticket), view=TicketControlView(self))
-            await self.log_event("Ticket opened", f"Channel: {ch.mention}", ticket)
-            view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=ch.jump_url))
-            await self.safe_send(interaction, "🎟️ **Ticket Created**\n\nYour ticket has been created. Click the button below to access it!", ephemeral=True, view=view)
+            ch = None
+            try:
+                ch = await guild.create_text_channel(base, category=cat, overwrites=overwrites, reason=f"Ticket #{tid}")
+                self.store.exec("UPDATE tickets SET channel_id=?, custom_channel_name=? WHERE ticket_id=?", (ch.id, base, tid))
+                ticket = self.ticket_by_channel(ch.id)
+                await ch.send(f"{interaction.user.mention} {staff.mention if staff else ''}".strip(), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+                await ch.send(embed=self.ticket_embed(ticket), view=TicketControlView(self))
+                await self.log_event("Ticket opened", f"Channel: {ch.mention}", ticket)
+                view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=ch.jump_url))
+                await self.safe_send(interaction, "🎟️ **Ticket Created**\n\nYour ticket has been created. Click the button below to access it!", ephemeral=True, view=view)
+            except Exception as e:
+                self.store.exec("DELETE FROM tickets WHERE ticket_id=?", (tid,))
+                if ch:
+                    try:
+                        await ch.delete(reason="Ticket creation rollback after setup failure")
+                    except Exception:
+                        pass
+                await self.log_event("Ticket creation failed", f"User: {interaction.user} ({interaction.user.id})\nError: {e}")
+                await self.safe_send(interaction, "❌ Ticket creation failed safely. Please contact staff or try again shortly.", ephemeral=True)
 
     async def transcript_file(self, channel: discord.TextChannel, ticket) -> discord.File:
         parts = ["<!doctype html><meta charset='utf-8'><style>body{font-family:Inter,Arial;background:#111827;color:#e5e7eb}.msg{border-bottom:1px solid #374151;padding:12px}.meta{color:#93c5fd}.att{color:#fbbf24}</style>", f"<h1>ZeroX Host Ticket #{ticket['ticket_id']:04d}</h1><p>Opener: {ticket['opener_id']} Category: {html.escape(ticket['category_name'])} Reason: {html.escape(ticket['reason'])}</p>"]
@@ -323,7 +345,10 @@ class TicketBot(commands.Bot):
             return True
         try:
             file = await self.transcript_file(channel, ticket)
-            await self.log_event(reason, "HTML transcript attached.", ticket, file)
+            logged = await self.log_event(reason, "HTML transcript attached.", ticket, file)
+            if not logged:
+                self.store.exec("UPDATE tickets SET transcript_status='failed' WHERE ticket_id=?", (ticket["ticket_id"],))
+                return False
             opener = channel.guild.get_member(ticket["opener_id"])
             if opener and self.cfg["transcripts"].get("send_to_opener_dm"):
                 try: await opener.send("Your ZeroX Host ticket transcript is attached.", file=await self.transcript_file(channel, ticket))
@@ -364,7 +389,10 @@ class TicketBot(commands.Bot):
         now = utcnow()
         for t in self.store.rows("SELECT * FROM tickets WHERE status='open'"):
             ch = guild.get_channel(t["channel_id"])
-            if not ch: continue
+            if not ch:
+                self.store.exec("UPDATE tickets SET status='deleted', deleted_at=?, close_reason=? WHERE ticket_id=?", (iso(), "Ticket channel was manually deleted.", t["ticket_id"]))
+                await self.log_event("Stale ticket cleaned", "Open ticket channel was missing during maintenance.", t)
+                continue
             last = parse_dt(t["last_activity_at"]) or now
             if now - last >= timedelta(hours=float(self.cfg["tickets"].get("inactivity_close_hours", 24))):
                 await self.close_ticket(ch, guild.me, "Closed automatically due to inactivity.", True)
@@ -390,21 +418,38 @@ class TicketBot(commands.Bot):
 class ReasonModal(discord.ui.Modal, title="Open ZeroX Host Ticket"):
     reason = discord.ui.TextInput(label="Reason For Opening This Ticket", style=discord.TextStyle.paragraph, required=True, max_length=1000)
     def __init__(self, bot: TicketBot, key: str): super().__init__(timeout=300); self.bot = bot; self.key = key
-    async def on_submit(self, interaction: discord.Interaction): await self.bot.create_ticket(interaction, self.key, str(self.reason.value))
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.bot.create_ticket(interaction, self.key, str(self.reason.value))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Reason modal failed", exc_info=(type(error), error, error.__traceback__))
+        await self.bot.safe_send(interaction, "❌ Something went wrong while opening your ticket. Please try again.", ephemeral=True)
 
 
 class RenameModal(discord.ui.Modal, title="Rename Ticket"):
     name = discord.ui.TextInput(label="New ticket name", required=True, max_length=90)
     def __init__(self, bot: TicketBot): super().__init__(timeout=300); self.bot = bot
-    async def on_submit(self, interaction: discord.Interaction): await rename_channel(self.bot, interaction, str(self.name.value))
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await rename_channel(self.bot, interaction, str(self.name.value))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Rename modal failed", exc_info=(type(error), error, error.__traceback__))
+        await self.bot.safe_send(interaction, "❌ Something went wrong while renaming this ticket.", ephemeral=True)
 
 
 class CloseModal(discord.ui.Modal, title="Close Ticket"):
     reason = discord.ui.TextInput(label="Close reason", style=discord.TextStyle.paragraph, required=True, max_length=1000)
     def __init__(self, bot: TicketBot): super().__init__(timeout=300); self.bot = bot
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ok = await self.bot.close_ticket(interaction.channel, interaction.user, str(self.reason.value))
         await self.bot.safe_send(interaction, "Ticket closed." if ok else "Unable to close ticket; transcript upload may have failed.", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Close modal failed", exc_info=(type(error), error, error.__traceback__))
+        await self.bot.safe_send(interaction, "❌ Something went wrong while closing this ticket.", ephemeral=True)
 
 
 class PanelSelect(discord.ui.Select):
@@ -458,11 +503,14 @@ class UserActionView(discord.ui.View):
     def __init__(self, bot: TicketBot, action: str): super().__init__(timeout=120); self.add_item(UserActionSelect(bot, action))
 class UserActionSelect(discord.ui.UserSelect):
     def __init__(self, bot: TicketBot, action: str): super().__init__(placeholder="Choose a user", min_values=1, max_values=1); self.bot=bot; self.action=action
-    async def callback(self, interaction): await user_action(self.bot, interaction, self.values[0], self.action)
+    async def callback(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await user_action(self.bot, interaction, self.values[0], self.action)
 class ConfirmDeleteView(discord.ui.View):
     def __init__(self, bot: TicketBot): super().__init__(timeout=120); self.bot=bot
     @discord.ui.button(label="Confirm Delete", style=discord.ButtonStyle.danger)
     async def yes(self, interaction, button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ok = await self.bot.delete_ticket(interaction.channel, interaction.user)
         if not ok: await self.bot.safe_send(interaction, "Delete blocked because transcript upload failed.", ephemeral=True)
 
@@ -551,6 +599,11 @@ async def setup_cmd(interaction: discord.Interaction):
 
 class SetupView(discord.ui.View):
     def __init__(self, bot): super().__init__(timeout=600); self.bot=bot
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not self.bot.is_owner(interaction.user):
+            await self.bot.safe_send(interaction, "Only the configured owner role can use setup controls.", ephemeral=True)
+            return False
+        return True
     @discord.ui.button(label="IDs", style=discord.ButtonStyle.primary)
     async def ids(self, i,b): await i.response.send_message("Choose roles and channels to save.", view=SetupSelectView(self.bot), ephemeral=True)
     @discord.ui.button(label="Panel Text", style=discord.ButtonStyle.secondary)
@@ -564,6 +617,11 @@ class SetupView(discord.ui.View):
 
 class SetupSelectView(discord.ui.View):
     def __init__(self, bot): super().__init__(timeout=300); self.bot=bot
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not self.bot.is_owner(interaction.user):
+            await self.bot.safe_send(interaction, "Only the configured owner role can use setup controls.", ephemeral=True)
+            return False
+        return True
     @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Owner role", min_values=1, max_values=1)
     async def owner(self, i, select): self.bot.cfg["roles"]["owner_role_id"]=str(select.values[0].id); save_config(self.bot.cfg); await self.bot.safe_send(i,"Owner role saved.",ephemeral=True)
     @discord.ui.select(cls=discord.ui.RoleSelect, placeholder="Staff role", min_values=1, max_values=1)
@@ -602,8 +660,15 @@ class ConfigModal(discord.ui.Modal):
             cur=self.bot.cfg; parts=path.split('.')
             for p in parts[:-1]: cur=cur[p]
             val=str(inp.value)
-            if parts[-1] in {"max_active_per_user"}: val=int(val or 1)
-            elif parts[-1].endswith("hours"): val=float(val or 24)
+            try:
+                if parts[-1] in {"max_active_per_user"}:
+                    val = max(1, int(val or 1))
+                elif parts[-1].endswith("hours"):
+                    val = max(0.1, float(val or 24))
+            except ValueError:
+                return await self.bot.safe_send(interaction, f"Invalid numeric value for {path}. Please enter only a number.", ephemeral=True)
+            if parts[-1].endswith("url") and val and not re.match(r"^https?://", val):
+                return await self.bot.safe_send(interaction, f"Invalid URL for {path}. URLs must start with http:// or https://.", ephemeral=True)
             cur[parts[-1]]=val
         save_config(self.bot.cfg); await self.bot.safe_send(interaction,"Settings saved.",ephemeral=True)
 
@@ -611,6 +676,7 @@ panel_group = app_commands.Group(name="panel", description="Manage the ZeroX Hos
 @panel_group.command(name="send", description="Send or replace the active ticket panel")
 @app_commands.check(owner_check)
 async def panel_send(interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     ch = bot.panel_channel(interaction.guild)
     if not ch: return await bot.safe_send(interaction, "Panel channel is invalid.", ephemeral=True)
     old_mid, old_cid = int_id(bot.cfg["panel_state"].get("message_id")), int_id(bot.cfg["panel_state"].get("channel_id"))
@@ -625,6 +691,7 @@ async def panel_send(interaction):
 @panel_group.command(name="update", description="Update the active ticket panel")
 @app_commands.check(owner_check)
 async def panel_update(interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     ch=interaction.guild.get_channel(int_id(bot.cfg["panel_state"].get("channel_id")) or 0)
     try: msg=await ch.fetch_message(int(bot.cfg["panel_state"].get("message_id") or 0)); await msg.edit(embed=bot.panel_embed(), view=PanelView(bot)); await bot.safe_send(interaction,"Panel updated.",ephemeral=True)
     except Exception: await bot.safe_send(interaction,"Saved panel message was not found. Use /panel send.",ephemeral=True)
@@ -647,19 +714,19 @@ bot.tree.add_command(panel_group)
 
 ticket_group = app_commands.Group(name="ticket", description="Manage ZeroX Host tickets", guild_ids=[ALLOWED_GUILD_ID])
 @ticket_group.command(name="claim")
-async def tc_claim(i): await claim_ticket(bot,i)
+async def tc_claim(i): await i.response.defer(ephemeral=True, thinking=True); await claim_ticket(bot,i)
 @ticket_group.command(name="unclaim")
-async def tc_unclaim(i): await unclaim_ticket(bot,i)
+async def tc_unclaim(i): await i.response.defer(ephemeral=True, thinking=True); await unclaim_ticket(bot,i)
 @ticket_group.command(name="pin")
-async def tc_pin(i): await set_pin_ticket(bot,i,True)
+async def tc_pin(i): await i.response.defer(ephemeral=True, thinking=True); await set_pin_ticket(bot,i,True)
 @ticket_group.command(name="unpin")
-async def tc_unpin(i): await set_pin_ticket(bot,i,False)
+async def tc_unpin(i): await i.response.defer(ephemeral=True, thinking=True); await set_pin_ticket(bot,i,False)
 @ticket_group.command(name="add")
-async def tc_add(i, user: discord.Member): await user_action(bot,i,user,"add")
+async def tc_add(i, user: discord.Member): await i.response.defer(ephemeral=True, thinking=True); await user_action(bot,i,user,"add")
 @ticket_group.command(name="remove")
-async def tc_remove(i, user: discord.Member): await user_action(bot,i,user,"remove")
+async def tc_remove(i, user: discord.Member): await i.response.defer(ephemeral=True, thinking=True); await user_action(bot,i,user,"remove")
 @ticket_group.command(name="rename")
-async def tc_rename(i, name: str): await rename_channel(bot,i,name)
+async def tc_rename(i, name: str): await i.response.defer(ephemeral=True, thinking=True); await rename_channel(bot,i,name)
 @ticket_group.command(name="close")
 async def tc_close(i): await i.response.send_modal(CloseModal(bot)) if await require_staff(bot,i) else None
 @ticket_group.command(name="delete")
