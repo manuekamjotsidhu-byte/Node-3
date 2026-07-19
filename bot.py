@@ -1958,12 +1958,14 @@ def expiration_warning_lead(notification_type: str | None) -> str:
     return "7 days" if notification_type == "suspend_7d" else "24 hours"
 
 
-async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, notification_type: str | None = None) -> None:
+async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, notification_type: str | None = None) -> bool:
+    user: discord.User | None = None
     try:
-        user = await client.fetch_user(int(record["discord_user_id"]))
-    except Exception:
-        return
-    plan = record["plan"]
+        discord_user_id = int(record["discord_user_id"])
+        user = await client.fetch_user(discord_user_id)
+    except Exception as error:
+        print(f"Failed to fetch lifecycle DM user for server {record['server_id']}: {error}")
+    plan = str(record["plan"]).lower()
     server_name = record["name"]
     timestamp = int(when.timestamp())
     if event == "suspension_warning":
@@ -1986,10 +1988,25 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
     else:
         title = "Server Deleted"
         message = f"Your server **{server_name}** was permanently deleted after remaining suspended for 7 days."
-    try:
-        await user.send(embed=branded_embed(title, message, 0xe67e22 if event != "deleted" else 0xe74c3c))
-    except discord.Forbidden:
-        pass
+    embed = branded_embed(title, message, 0xe67e22 if event != "deleted" else 0xe74c3c)
+    delivered = False
+    if user:
+        try:
+            await user.send(embed=embed)
+            delivered = True
+        except discord.Forbidden:
+            print(f"Lifecycle DM forbidden for user {record['discord_user_id']} on server {record['server_id']}.")
+        except Exception as error:
+            print(f"Failed to send lifecycle DM for server {record['server_id']}: {error}")
+    if plan == "paid":
+        try:
+            channel_id = int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))
+            channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+            await channel.send(embed=embed)
+            delivered = True
+        except Exception as error:
+            print(f"Failed to send paid lifecycle reminder for server {record['server_id']} to log channel: {error}")
+    return delivered
 
 
 
@@ -2034,11 +2051,13 @@ async def suspend_expired_servers() -> None:
         delete_at = expires_at + timedelta(days=7)
         try:
             if not record["suspended"]:
-                suspension_warnings = [("suspend_7d", timedelta(days=7)), ("suspend_1d", timedelta(days=1))]
+                suspension_warnings = [("suspend_1d", timedelta(days=1))]
+                if str(record["plan"]).lower() == "paid":
+                    suspension_warnings.insert(0, ("suspend_7d", timedelta(days=7)))
                 for notification_type, window in suspension_warnings:
                     if now <= expires_at and expires_at - now <= window and not notification_sent(server_id, notification_type):
-                        await send_lifecycle_dm(record, "suspension_warning", expires_at, notification_type)
-                        mark_notification_sent(server_id, notification_type)
+                        if await send_lifecycle_dm(record, "suspension_warning", expires_at, notification_type):
+                            mark_notification_sent(server_id, notification_type)
                 if not record["autosuspend_enabled"] or expires_at > now:
                     continue
                 await (await ready_application_client_for(record)).suspend_server(server_id)
@@ -2048,8 +2067,8 @@ async def suspend_expired_servers() -> None:
                 continue
 
             if delete_at - now <= timedelta(days=1) and now < delete_at and not notification_sent(server_id, "delete_1d"):
-                await send_lifecycle_dm(record, "delete_warning", delete_at)
-                mark_notification_sent(server_id, "delete_1d")
+                if await send_lifecycle_dm(record, "delete_warning", delete_at):
+                    mark_notification_sent(server_id, "delete_1d")
             if now >= delete_at:
                 await (await ready_application_client_for(record)).delete_server(server_id)
                 mark_server_deleted(server_id)
