@@ -426,8 +426,12 @@ class TicketBot(commands.Bot):
                 ch = await guild.create_text_channel(base, category=cat, overwrites=overwrites, reason=f"Ticket #{tid}")
                 self.store.exec("UPDATE tickets SET channel_id=?, custom_channel_name=? WHERE ticket_id=?", (ch.id, base, tid))
                 ticket = self.ticket_by_channel(ch.id)
-                await ch.send(f"{interaction.user.mention} {staff.mention if staff else ''}".strip(), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
-                await ch.send(embed=self.ticket_embed(ticket), view=TicketControlView(self))
+                await ch.send(
+                    content=f"{interaction.user.mention} {staff.mention if staff else ''}".strip(),
+                    embed=self.ticket_embed(ticket),
+                    view=TicketControlView(self),
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=True),
+                )
                 await self.log_event("Ticket opened", f"Channel: {ch.mention}", ticket)
                 view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=ch.jump_url))
                 created = discord.Embed(title="🎟️ Ticket Created", description="Your ticket has been created. Click the button below to access it!", color=0xF59E0B, timestamp=utcnow())
