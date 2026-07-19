@@ -200,6 +200,10 @@ class TicketBot(commands.Bot):
 
     def category_id(self, key: str) -> Optional[int]: return int_id(self.cfg["ticket_categories"].get(CATEGORY_ID_KEYS[key]))
 
+    def category_display(self, key: str) -> str:
+        data = self.cfg["categories"].get(key, {})
+        return f"{data.get('emoji', '').strip()} {data.get('name', key).strip()}".strip()
+
     def active_tickets_for(self, uid: int):
         return self.store.rows("SELECT * FROM tickets WHERE opener_id=? AND guild_id=? AND status='open'", (uid, ALLOWED_GUILD_ID))
 
@@ -330,26 +334,33 @@ class TicketBot(commands.Bot):
 
     def ticket_embed(self, ticket) -> discord.Embed:
         hours = self.cfg["tickets"]["inactivity_close_hours"]
+        category = self.category_display(ticket["category_key"])
+        opener = f"<@{ticket['opener_id']}>"
+        claimed = f"<@{ticket['claimed_by']}>" if ticket["claimed_by"] else "`Unclaimed`"
+        status_icon = "🟢" if ticket["status"] == "open" else "🔒"
         e = discord.Embed(
             title="🎟️ Ticket Opened",
             description=(
-                "🛟 Please provide us with a detailed description of your issue.\n"
-                "🛟 ZeroX Host support staff are human, so please be patient — "
-                "you'll get an answer as soon as possible.\n\n"
-                "**Enter Your Reason For Opening This Ticket.**\n"
+                "🛟 **Please provide a detailed description of your issue.**\n"
+                "💬 ZeroX Host support staff will reply as soon as possible — thank you for being patient.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "📝 **Reason For Opening This Ticket**\n"
                 f"> {ticket['reason'][:900]}\n\n"
-                f"⏱️ **This ticket will be autoclosed when inactive for {hours}h!**"
+                f"⏱️ **Auto-close:** inactive for `{hours}h`"
             ),
             color=0xF59E0B,
             timestamp=utcnow(),
         )
-        e.add_field(name="Ticket ID", value=f"`{ticket['ticket_id']:04d}`", inline=True)
-        e.add_field(name="Opener", value=f"<@{ticket['opener_id']}>", inline=True)
-        e.add_field(name="Category", value=ticket["category_name"], inline=True)
-        e.add_field(name="Status", value=ticket["status"].title(), inline=True)
-        e.add_field(name="Claimed", value=f"<@{ticket['claimed_by']}>" if ticket["claimed_by"] else "Unclaimed", inline=True)
-        e.add_field(name="Pinned", value="Yes" if ticket["pinned"] else "No", inline=True)
-        e.set_footer(text="ZeroX Host Support")
+        e.set_author(name=f"ZeroX Host Support • {ticket['category_name']}")
+        if self.cfg["panel"].get("thumbnail_url"):
+            e.set_thumbnail(url=self.cfg["panel"]["thumbnail_url"])
+        e.add_field(name="🎫 Ticket", value=f"`#{ticket['ticket_id']:04d}`", inline=True)
+        e.add_field(name="👤 Opened By", value=opener, inline=True)
+        e.add_field(name="📂 Category", value=category, inline=True)
+        e.add_field(name="📌 Status", value=f"{status_icon} `{ticket['status'].title()}`", inline=True)
+        e.add_field(name="👋 Claimed", value=claimed, inline=True)
+        e.add_field(name="📍 Pinned", value="`Yes`" if ticket["pinned"] else "`No`", inline=True)
+        e.set_footer(text="ZeroX Host • Premium Support")
         return e
 
     async def create_ticket(self, interaction: discord.Interaction, key: str, reason: str):
@@ -385,6 +396,7 @@ class TicketBot(commands.Bot):
                 view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=ch.jump_url))
                 created = discord.Embed(title="🎟️ Ticket Created", description="Your ticket has been created. Click the button below to access it!", color=0xF59E0B, timestamp=utcnow())
                 created.set_author(name="ZeroX Host Support")
+                created.set_footer(text="ZeroX Host • Fast, clean support")
                 await self.safe_send(interaction, embed=created, ephemeral=True, view=view)
             except Exception as e:
                 self.store.exec("DELETE FROM tickets WHERE ticket_id=?", (tid,))
@@ -464,7 +476,9 @@ class TicketBot(commands.Bot):
             self.store.exec("UPDATE tickets SET status='closed', closed_at=?, scheduled_delete_at=?, closed_by=?, close_reason=?, transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), iso(delete_at), actor.id, reason, iso(), ticket["ticket_id"]))
             try: await channel.set_permissions(channel.guild.get_member(ticket["opener_id"]), send_messages=False, view_channel=True)
             except Exception: pass
-            await channel.send(embed=discord.Embed(title="🔒 Ticket Closed", description=reason or "No reason provided", color=0xED4245))
+            closed_embed = discord.Embed(title="🔒 Ticket Closed", description=f"**Reason:** {reason or 'No reason provided'}\n\n📄 Transcript has been saved and sent where configured.", color=0xED4245, timestamp=utcnow())
+            closed_embed.set_footer(text="ZeroX Host • Ticket Locked")
+            await channel.send(embed=closed_embed)
             return True
         except Exception as e:
             await self.log_event("Transcript upload failed", str(e), ticket)
