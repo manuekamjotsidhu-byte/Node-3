@@ -1572,8 +1572,15 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
             await user.send(embed=branded_embed("Service Renewed", f"Your server **{record_value(row, 'name', server)}** was renewed until <t:{int(new_expiry.timestamp())}:F>."))
         except Exception:
             pass
+    warning_note = "No renewal warning due"
+    if tracked_row:
+        refreshed_row = fetch_server(server)
+        if refreshed_row:
+            sent_warnings = await send_due_suspension_warnings(refreshed_row)
+            if sent_warnings:
+                warning_note = "Sent " + ", ".join(expiration_warning_lead(notification_type) for notification_type in sent_warnings) + " renewal warning(s)"
     tracking_note = "Local DB updated" if tracked_row else "Panel/Saga updated only (server is not locally tracked)"
-    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
 
 
 @tree.command(name="delete", description="Admin delete one server")
@@ -2010,6 +2017,31 @@ def expiration_warning_lead(notification_type: str | None) -> str:
     return "7 days" if notification_type == "suspend_7d" else "24 hours"
 
 
+def due_suspension_warnings(record: sqlite3.Row, now: datetime, expires_at: datetime) -> list[tuple[str, timedelta]]:
+    if now > expires_at:
+        return []
+    remaining = expires_at - now
+    warnings: list[tuple[str, timedelta]] = []
+    if str(record["plan"]).lower() == "paid" and timedelta(days=1) < remaining <= timedelta(days=7):
+        warnings.append(("suspend_7d", timedelta(days=7)))
+    if remaining <= timedelta(days=1):
+        warnings.append(("suspend_1d", timedelta(days=1)))
+    return warnings
+
+
+async def send_due_suspension_warnings(record: sqlite3.Row, now: datetime | None = None) -> list[str]:
+    now = now or utc_now()
+    expires_at = datetime.fromisoformat(record["expires_at"])
+    sent: list[str] = []
+    for notification_type, _window in due_suspension_warnings(record, now, expires_at):
+        if notification_sent(record["server_id"], notification_type):
+            continue
+        if await send_lifecycle_dm(record, "suspension_warning", expires_at, notification_type):
+            mark_notification_sent(record["server_id"], notification_type)
+            sent.append(notification_type)
+    return sent
+
+
 async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, notification_type: str | None = None) -> bool:
     user: discord.User | None = None
     try:
@@ -2108,13 +2140,7 @@ async def suspend_expired_servers() -> None:
         delete_at = expires_at + timedelta(days=7)
         try:
             if not record["suspended"]:
-                suspension_warnings = [("suspend_1d", timedelta(days=1))]
-                if str(record["plan"]).lower() == "paid":
-                    suspension_warnings.insert(0, ("suspend_7d", timedelta(days=7)))
-                for notification_type, window in suspension_warnings:
-                    if now <= expires_at and expires_at - now <= window and not notification_sent(server_id, notification_type):
-                        if await send_lifecycle_dm(record, "suspension_warning", expires_at, notification_type):
-                            mark_notification_sent(server_id, notification_type)
+                await send_due_suspension_warnings(record, now)
                 if not record["autosuspend_enabled"] or expires_at > now:
                     continue
                 await (await ready_application_client_for(record)).suspend_server(server_id)
