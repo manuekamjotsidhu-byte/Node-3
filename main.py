@@ -55,14 +55,14 @@ def deep_defaults() -> dict[str, Any]:
         "tickets": {"max_active_per_user": 1, "inactivity_close_hours": 24, "closed_delete_hours": 24, "channel_name_format": "ticket-{username}-{number}"},
         "panel": {
             "title": "ZeroX Host Support",
-            "description": "<a:fire_gif:1514165449275871393> **Need help? Open a ticket by choosing the correct category below. Our team will assist you as quickly as possible.**\n\n<:Store:1514165709616451696> **Buy / Orders**\n> Purchase items or services\n> Custom orders & payments\n> Order-related questions\n\n<a:support:1514165749097173074> **General Support**\n> Server-related help\n> Technical issues\n> General questions & guidance\n\n<a:hammer_gif:1514165780999180309> **Complaints / Reports**\n> Report rule breakers\n> Staff-related issues\n> Scams, abuse, or disputes\n\n<a:purchase:1455165990508953654> **Other Issues**\n> Anything not listed above\n> Suggestions or feedback\n> Miscellaneous problems\n\n<a:Minecraft_diamond:1421791061629468824> **Please provide clear details after opening a ticket to help us assist you faster.**\n",
+            "description": "<a:fire_gif:1514165449275871393> **Need help? Open a ticket by choosing the correct category below. Our team will assist you as quickly as possible.**\n\n<:Store:1514165709616451696> **Buy / Orders**\n> Purchase items or services\n> Custom orders & payments\n> Order-related questions\n\n<a:support:1514165749097173074> **General Support**\n> Server-related help\n> Technical issues\n> General questions & guidance\n\n<a:hammer_gif:1514165780999180309> **Complaints / Reports**\n> Report rule breakers\n> Staff-related issues\n> Scams, abuse, or disputes\n\n<a:purchase:1528210165642432594> **Other Issues**\n> Anything not listed above\n> Suggestions or feedback\n> Miscellaneous problems\n\n<a:Minecraft_diamond:1528237013852225609> **Please provide clear details after opening a ticket to help us assist you faster.**\n",
             "color": "#5865F2", "thumbnail_url": "", "image_url": "", "footer_text": "ZeroX Host Support", "footer_icon_url": "", "dropdown_placeholder": "Select the correct ticket category",
         },
         "categories": {
             "buy_orders": {"name": "Buy / Orders", "emoji": "<:Store:1514165709616451696>"},
             "general_support": {"name": "General Support", "emoji": "<a:support:1514165749097173074>"},
             "complaints_reports": {"name": "Complaints / Reports", "emoji": "<a:hammer_gif:1514165780999180309>"},
-            "other_issues": {"name": "Other Issues", "emoji": "<a:purchase:1455165990508953654>"},
+            "other_issues": {"name": "Other Issues", "emoji": "<a:purchase:1528210165642432594>"},
         },
         "transcripts": {"enabled": True, "mandatory": True, "format": "html", "send_to_opener_dm": True},
         "panel_state": {"message_id": "", "channel_id": ""},

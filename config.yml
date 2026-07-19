@@ -44,12 +44,12 @@ panel:
     > Staff-related issues
     > Scams, abuse, or disputes
 
-    <a:purchase:1455165990508953654> **Other Issues**
+    <a:purchase:1528210165642432594> **Other Issues**
     > Anything not listed above
     > Suggestions or feedback
     > Miscellaneous problems
 
-    <a:Minecraft_diamond:1421791061629468824> **Please provide clear details after opening a ticket to help us assist you faster.**
+    <a:Minecraft_diamond:1528237013852225609> **Please provide clear details after opening a ticket to help us assist you faster.**
 
   color: "#5865F2"
   thumbnail_url: ""
@@ -73,7 +73,7 @@ categories:
 
   other_issues:
     name: "Other Issues"
-    emoji: "<a:purchase:1455165990508953654>"
+    emoji: "<a:purchase:1528210165642432594>"
 
 transcripts:
   enabled: true
