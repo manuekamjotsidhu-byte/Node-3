@@ -255,23 +255,56 @@ class TicketBot(commands.Bot):
         e.set_footer(text=p.get("footer_text") or "ZeroX Host Support", icon_url=p.get("footer_icon_url") or None)
         return e
 
-    async def ensure_categories(self, guild: discord.Guild):
+    async def ensure_categories(self, guild: discord.Guild) -> list[str]:
+        report: list[str] = []
+        me = guild.me or guild.get_member(self.user.id if self.user else 0)
+        can_manage = bool(me and me.guild_permissions.manage_channels)
+        if not can_manage:
+            report.append("⚠️ Bot is missing Manage Channels; existing categories can be reused but missing categories cannot be created.")
+        resolved: list[discord.CategoryChannel] = []
         for key in CATEGORY_KEYS:
             name = self.cfg["categories"][key]["name"]
             cat = guild.get_channel(self.category_id(key) or 0)
             if not isinstance(cat, discord.CategoryChannel):
                 cat = discord.utils.get(guild.categories, name=name)
-            if not cat:
-                cat = await guild.create_category(name=name, reason="ZeroX Host ticket setup")
+            if not isinstance(cat, discord.CategoryChannel):
+                if not can_manage:
+                    report.append(f"❌ Missing category `{name}` and bot cannot create it.")
+                    continue
+                try:
+                    cat = await guild.create_category(name=name, reason="ZeroX Host ticket setup")
+                    report.append(f"✅ Created category `{name}`.")
+                except discord.Forbidden:
+                    report.append(f"❌ Discord denied permission to create `{name}`.")
+                    log.warning("Forbidden while creating category %s", name)
+                    continue
+                except Exception as e:
+                    report.append(f"❌ Failed to create `{name}`: {type(e).__name__}.")
+                    log.warning("category create failed for %s: %s", name, e)
+                    continue
+            elif cat.name != name and can_manage:
+                try:
+                    old_name = cat.name
+                    await cat.edit(name=name, reason="ZeroX Host ticket category name sync")
+                    report.append(f"✅ Renamed category `{old_name}` to `{name}`.")
+                except Exception as e:
+                    report.append(f"⚠️ Reused `{cat.name}` but could not rename it to `{name}`.")
+                    log.warning("category rename failed for %s: %s", name, e)
+            else:
+                report.append(f"✅ Reused category `{cat.name}`.")
             self.cfg["ticket_categories"][CATEGORY_ID_KEYS[key]] = str(cat.id)
+            resolved.append(cat)
         save_config(self.cfg)
         try:
-            start = len(guild.categories) - len(CATEGORY_KEYS)
-            for i, key in enumerate(CATEGORY_KEYS):
-                cat = guild.get_channel(self.category_id(key) or 0)
-                if isinstance(cat, discord.CategoryChannel): await cat.edit(position=max(0, start + i))
+            start = max(0, len(guild.categories) - len(resolved))
+            for i, cat in enumerate(resolved):
+                await cat.edit(position=start + i, reason="ZeroX Host ticket category ordering")
+            if resolved:
+                report.append("✅ Ticket categories were grouped near the bottom where Discord permissions allowed.")
         except Exception as e:
+            report.append("⚠️ Category reordering failed, but ticket categories were still saved.")
             log.warning("category reorder failed: %s", e)
+        return report
 
     def ticket_embed(self, ticket) -> discord.Embed:
         e = discord.Embed(title=f"🎟️ ZeroX Host Ticket #{ticket['ticket_id']:04d}", color=0x5865F2, timestamp=utcnow())
@@ -589,13 +622,14 @@ async def owner_check(interaction: discord.Interaction) -> bool:
 @bot.tree.command(name="setup", guild=discord.Object(id=ALLOWED_GUILD_ID), description="Configure and validate the ZeroX Host ticket bot.")
 @app_commands.check(owner_check)
 async def setup_cmd(interaction: discord.Interaction):
-    guild = interaction.guild; await interaction.response.defer(ephemeral=True)
-    await bot.ensure_categories(guild)
+    guild = interaction.guild; await interaction.response.defer(ephemeral=True, thinking=True)
+    category_report = await bot.ensure_categories(guild)
     issues = []
     for label, getter in [("owner role", bot.owner_role), ("staff role", bot.staff_role), ("logs channel", bot.logs_channel), ("panel channel", bot.panel_channel)]:
         if not getter(guild): issues.append(f"Missing or invalid {label}")
     view = SetupView(bot)
-    await interaction.followup.send("✅ Setup validation complete. " + ("Issues: " + "; ".join(issues) if issues else "All required Discord objects are valid.") + "\nUse the controls below to edit settings.", view=view, ephemeral=True)
+    details = "\n".join(category_report) if category_report else "No category changes were needed."
+    await interaction.followup.send("✅ Setup validation complete. " + ("Issues: " + "; ".join(issues) if issues else "All required Discord objects are valid.") + f"\n\n**Ticket category setup**\n{details}" + "\n\nUse the controls below to edit settings.", view=view, ephemeral=True)
 
 class SetupView(discord.ui.View):
     def __init__(self, bot): super().__init__(timeout=600); self.bot=bot
@@ -645,8 +679,9 @@ class CategoryConfigModal(discord.ui.Modal, title="Ticket Categories"):
             self.bot.cfg["categories"][key]["name"] = name.strip() or self.bot.cfg["categories"][key]["name"]
             self.bot.cfg["categories"][key]["emoji"] = emoji.strip()
         save_config(self.bot.cfg)
-        await self.bot.ensure_categories(interaction.guild)
-        await self.bot.safe_send(interaction,"Category names/emojis saved and Discord categories validated. Use name|emoji in each field.",ephemeral=True)
+        report = await self.bot.ensure_categories(interaction.guild)
+        details = "\n".join(report) if report else "No category changes were needed."
+        await self.bot.safe_send(interaction,"Category names/emojis saved and Discord categories validated. Use name|emoji in each field.\n\n" + details,ephemeral=True)
 class ConfigModal(discord.ui.Modal):
     def __init__(self, bot, title, fields):
         super().__init__(title=title, timeout=300); self.bot=bot; self.fields=fields; self.inputs=[]
