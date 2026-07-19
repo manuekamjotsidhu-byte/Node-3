@@ -200,9 +200,31 @@ class TicketBot(commands.Bot):
 
     def category_id(self, key: str) -> Optional[int]: return int_id(self.cfg["ticket_categories"].get(CATEGORY_ID_KEYS[key]))
 
-    def category_display(self, key: str) -> str:
+    def emoji_display(self, raw: str, guild: Optional[discord.Guild] = None) -> str:
+        raw = (raw or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = discord.PartialEmoji.from_str(raw)
+            if guild and parsed.id:
+                found = guild.get_emoji(parsed.id) or discord.utils.get(guild.emojis, name=parsed.name)
+                return str(found or parsed)
+            if guild and parsed.name:
+                found = discord.utils.get(guild.emojis, name=parsed.name)
+                if found:
+                    return str(found)
+            return str(parsed)
+        except Exception:
+            if guild:
+                found = discord.utils.get(guild.emojis, name=raw.strip(":<>"))
+                if found:
+                    return str(found)
+            return raw
+
+    def category_display(self, key: str, guild: Optional[discord.Guild] = None) -> str:
         data = self.cfg["categories"].get(key, {})
-        return f"{data.get('emoji', '').strip()} {data.get('name', key).strip()}".strip()
+        emoji = self.emoji_display(data.get("emoji", ""), guild)
+        return f"{emoji} {data.get('name', key).strip()}".strip()
 
     def active_tickets_for(self, uid: int):
         return self.store.rows("SELECT * FROM tickets WHERE opener_id=? AND guild_id=? AND status='open'", (uid, ALLOWED_GUILD_ID))
@@ -334,15 +356,16 @@ class TicketBot(commands.Bot):
 
     def ticket_embed(self, ticket) -> discord.Embed:
         hours = self.cfg["tickets"]["inactivity_close_hours"]
-        category = self.category_display(ticket["category_key"])
+        guild = self.get_guild(ticket["guild_id"])
+        category = self.category_display(ticket["category_key"], guild)
         opener = f"<@{ticket['opener_id']}>"
         claimed = f"<@{ticket['claimed_by']}>" if ticket["claimed_by"] else "`Unclaimed`"
         status_icon = "🟢" if ticket["status"] == "open" else "🔒"
         e = discord.Embed(
             title="🎟️ Ticket Opened",
             description=(
-                "🛟 **Please provide a detailed description of your issue.**\n"
-                "💬 ZeroX Host support staff will reply as soon as possible — thank you for being patient.\n\n"
+                "**Please provide a detailed description of your issue.**\n"
+                "ZeroX Host support staff will reply as soon as possible — thank you for being patient.\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 "📝 **Reason For Opening This Ticket**\n"
                 f"> {ticket['reason'][:900]}\n\n"
@@ -354,12 +377,12 @@ class TicketBot(commands.Bot):
         e.set_author(name=f"ZeroX Host Support • {ticket['category_name']}")
         if self.cfg["panel"].get("thumbnail_url"):
             e.set_thumbnail(url=self.cfg["panel"]["thumbnail_url"])
-        e.add_field(name="🎫 Ticket", value=f"`#{ticket['ticket_id']:04d}`", inline=True)
-        e.add_field(name="👤 Opened By", value=opener, inline=True)
-        e.add_field(name="📂 Category", value=category, inline=True)
-        e.add_field(name="📌 Status", value=f"{status_icon} `{ticket['status'].title()}`", inline=True)
-        e.add_field(name="👋 Claimed", value=claimed, inline=True)
-        e.add_field(name="📍 Pinned", value="`Yes`" if ticket["pinned"] else "`No`", inline=True)
+        e.add_field(name="Ticket", value=f"`#{ticket['ticket_id']:04d}`", inline=True)
+        e.add_field(name="Opened By", value=opener, inline=True)
+        e.add_field(name="Category", value=category, inline=True)
+        e.add_field(name="Status", value=f"{status_icon} `{ticket['status'].title()}`", inline=True)
+        e.add_field(name="Claimed", value=claimed, inline=True)
+        e.add_field(name="Pinned", value="`Yes`" if ticket["pinned"] else "`No`", inline=True)
         e.set_footer(text="ZeroX Host • Premium Support")
         return e
 
