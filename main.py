@@ -260,7 +260,7 @@ class TicketBot(commands.Bot):
         me = guild.me or guild.get_member(self.user.id if self.user else 0)
         can_manage = bool(me and me.guild_permissions.manage_channels)
         if not can_manage:
-            report.append("⚠️ Bot is missing Manage Channels; existing categories can be reused but missing categories cannot be created.")
+            report.append("⚠️ Manage Channels is not visible in the bot member cache; creation will still be attempted and Discord will return the real permission result.")
         resolved: list[discord.CategoryChannel] = []
         for key in CATEGORY_KEYS:
             name = self.cfg["categories"][key]["name"]
@@ -268,18 +268,19 @@ class TicketBot(commands.Bot):
             if not isinstance(cat, discord.CategoryChannel):
                 cat = discord.utils.get(guild.categories, name=name)
             if not isinstance(cat, discord.CategoryChannel):
-                if not can_manage:
-                    report.append(f"❌ Missing category `{name}` and bot cannot create it.")
-                    continue
                 try:
-                    cat = await guild.create_category(name=name, reason="ZeroX Host ticket setup")
-                    report.append(f"✅ Created category `{name}`.")
+                    cat = await guild.create_category_channel(name=name, reason="ZeroX Host ticket setup")
+                    report.append(f"✅ Created category `{name}` (`{cat.id}`).")
                 except discord.Forbidden:
-                    report.append(f"❌ Discord denied permission to create `{name}`.")
+                    report.append(f"❌ Discord denied permission to create `{name}`. Give the bot Manage Channels or Administrator, then run `/setup` again.")
                     log.warning("Forbidden while creating category %s", name)
                     continue
+                except discord.HTTPException as e:
+                    report.append(f"❌ Discord API failed to create `{name}`: {e.status} {e.text[:120]}.")
+                    log.warning("HTTP error creating category %s: %s", name, e)
+                    continue
                 except Exception as e:
-                    report.append(f"❌ Failed to create `{name}`: {type(e).__name__}.")
+                    report.append(f"❌ Failed to create `{name}`: {type(e).__name__}: {e}.")
                     log.warning("category create failed for %s: %s", name, e)
                     continue
             elif cat.name != name and can_manage:
@@ -679,6 +680,7 @@ class CategoryConfigModal(discord.ui.Modal, title="Ticket Categories"):
             self.bot.cfg["categories"][key]["name"] = name.strip() or self.bot.cfg["categories"][key]["name"]
             self.bot.cfg["categories"][key]["emoji"] = emoji.strip()
         save_config(self.bot.cfg)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         report = await self.bot.ensure_categories(interaction.guild)
         details = "\n".join(report) if report else "No category changes were needed."
         await self.bot.safe_send(interaction,"Category names/emojis saved and Discord categories validated. Use name|emoji in each field.\n\n" + details,ephemeral=True)
