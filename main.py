@@ -456,19 +456,33 @@ class TicketBot(commands.Bot):
         return discord.File(io.BytesIO(data), filename=f"zerox-ticket-{ticket['ticket_id']:04d}.html")
 
     async def send_transcript_dm(self, channel: discord.TextChannel, ticket, file: discord.File, status_text: str, actor: Optional[discord.abc.User] = None, reason: str = "No reason provided") -> None:
-        opener = channel.guild.get_member(ticket["opener_id"])
-        if not opener or not self.cfg["transcripts"].get("send_to_opener_dm"):
+        if not self.cfg["transcripts"].get("send_to_opener_dm"):
             return
+        opener = channel.guild.get_member(ticket["opener_id"])
+        if not opener:
+            try:
+                opener = await self.fetch_user(ticket["opener_id"])
+            except Exception as e:
+                log.warning("could not fetch opener for transcript DM on ticket %s: %s", ticket["ticket_id"], e)
+                return
         try:
             created = parse_dt(ticket["created_at"]) or utcnow()
-            taken = max(0, int((utcnow() - created).total_seconds()))
+            finished = parse_dt(ticket["deleted_at"] or ticket["closed_at"]) or utcnow()
+            taken = max(0, int((finished - created).total_seconds()))
+            closed_by = f"<@{ticket['closed_by']}>" if ticket["closed_by"] else "—"
+            deleted_by = f"<@{ticket['deleted_by']}>" if ticket["deleted_by"] else "—"
             embed = discord.Embed(
                 title=channel.name,
                 description=(
                     f"Ticket **{channel.name}** is {status_text}.\n\n"
-                    f"**Created by :**\n{opener.mention} - {opener.name}\n\n"
-                    f"**{status_text.title()} by :**\n{actor.mention if actor else 'System'} - {getattr(actor, 'name', 'System')}\n\n"
-                    f"**Reason :**\n{reason or 'No reason provided'}\n\n"
+                    f"**Created by :**\n<@{ticket['opener_id']}> - {getattr(opener, 'name', ticket['opener_id'])}\n"
+                    f"**Opened at :**\n{ticket['created_at']}\n\n"
+                    f"**Closed by :**\n{closed_by}\n"
+                    f"**Closed at :**\n{ticket['closed_at'] or '—'}\n\n"
+                    f"**Deleted by :**\n{deleted_by}\n"
+                    f"**Deleted at :**\n{ticket['deleted_at'] or '—'}\n\n"
+                    f"**Action by :**\n{actor.mention if actor else 'System'} - {getattr(actor, 'name', 'System')}\n\n"
+                    f"**Reason :**\n{reason or ticket['close_reason'] or 'No reason provided'}\n\n"
                     f"**Time taken :**\n{taken}s"
                 ),
                 color=0x7C3AED,
@@ -504,12 +518,17 @@ class TicketBot(commands.Bot):
         if not ticket or ticket["status"] != "open": return False
         try:
             transcript = await self.transcript_file(channel, ticket)
-            log_ok = await self.log_event("Ticket auto-closed" if auto else "Ticket closed", reason or "No reason provided", ticket, transcript)
-            if self.cfg["transcripts"].get("mandatory") and not log_ok: return False
-            dm_file = await self.transcript_file(channel, ticket)
-            await self.send_transcript_dm(channel, ticket, dm_file, "closed", actor, reason or "No reason provided")
             delete_at = utcnow() + timedelta(hours=float(self.cfg["tickets"].get("closed_delete_hours", 24)))
-            self.store.exec("UPDATE tickets SET status='closed', closed_at=?, scheduled_delete_at=?, closed_by=?, close_reason=?, transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), iso(delete_at), actor.id, reason, iso(), ticket["ticket_id"]))
+            self.store.exec("UPDATE tickets SET status='closed', closed_at=?, scheduled_delete_at=?, closed_by=?, close_reason=?, transcript_status='pending' WHERE ticket_id=?", (iso(), iso(delete_at), actor.id, reason, ticket["ticket_id"]))
+            updated = self.ticket_by_channel(channel.id)
+            log_ok = await self.log_event("Ticket auto-closed" if auto else "Ticket closed", reason or "No reason provided", updated, transcript)
+            if self.cfg["transcripts"].get("mandatory") and not log_ok:
+                self.store.exec("UPDATE tickets SET status='open', closed_at=NULL, scheduled_delete_at=NULL, closed_by=NULL, close_reason=?, transcript_status='failed' WHERE ticket_id=?", (reason, ticket["ticket_id"]))
+                return False
+            dm_file = await self.transcript_file(channel, updated)
+            self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
+            updated = self.ticket_by_channel(channel.id)
+            await self.send_transcript_dm(channel, updated, dm_file, "closed", actor, reason or "No reason provided")
             try: await channel.set_permissions(channel.guild.get_member(ticket["opener_id"]), send_messages=False, view_channel=True)
             except Exception: pass
             closed_embed = discord.Embed(title="🔒 Ticket Closed", description=f"**Reason:** {reason or 'No reason provided'}\n\n📄 Transcript has been saved and sent where configured.", color=0xED4245, timestamp=utcnow())
@@ -523,13 +542,20 @@ class TicketBot(commands.Bot):
     async def delete_ticket(self, channel: discord.TextChannel, actor: discord.abc.User, auto=False):
         ticket = self.ticket_by_channel(channel.id)
         if not ticket: return False
+        old_status = ticket["status"]
         try:
-            file = None if ticket["transcript_status"] == "uploaded" and ticket["transcript_reference"] else await self.transcript_file(channel, ticket)
-            log_ok = await self.log_event("Ticket auto-deleted" if auto else "Ticket deleted", f"Channel: #{channel.name}", ticket, file)
-            if self.cfg["transcripts"].get("mandatory") and not log_ok: return False
-            if file:
-                self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
+            transcript = await self.transcript_file(channel, ticket)
             self.store.exec("UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=? WHERE ticket_id=?", (actor.id, iso(), ticket["ticket_id"]))
+            updated = self.store.row("SELECT * FROM tickets WHERE ticket_id=?", (ticket["ticket_id"],))
+            attach_file = None if ticket["transcript_status"] == "uploaded" and ticket["transcript_reference"] else transcript
+            log_ok = await self.log_event("Ticket auto-deleted" if auto else "Ticket deleted", f"Channel: #{channel.name}", updated, attach_file)
+            if self.cfg["transcripts"].get("mandatory") and not log_ok:
+                self.store.exec("UPDATE tickets SET status=?, deleted_by=NULL, deleted_at=NULL WHERE ticket_id=?", (old_status, ticket["ticket_id"]))
+                return False
+            if attach_file:
+                self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
+            updated = self.store.row("SELECT * FROM tickets WHERE ticket_id=?", (ticket["ticket_id"],))
+            await self.send_transcript_dm(channel, updated, await self.transcript_file(channel, updated), "deleted", actor, updated["close_reason"] or "No reason provided")
             await channel.delete(reason="ZeroX Host ticket deleted")
             return True
         except Exception as e:
