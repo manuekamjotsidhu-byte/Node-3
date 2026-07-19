@@ -884,6 +884,21 @@ def parse_duration(value: str) -> int:
     return total
 
 
+def describe_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
 def is_not_found_error(error: Exception) -> bool:
     message = str(error).lower()
     return " 404" in message or "not found" in message or "could not be found" in message
@@ -1808,11 +1823,33 @@ async def purge(interaction: discord.Interaction, confirm: bool = False, skip_ke
 @admin_only()
 @app_commands.autocomplete(server=admin_tracked_server_autocomplete)
 @app_commands.choices(state=[app_commands.Choice(name="on", value="on"), app_commands.Choice(name="off", value="off")])
-async def autosuspend(interaction: discord.Interaction, server: str, state: app_commands.Choice[str], time: str | None = None) -> None:
+async def autosuspend(interaction: discord.Interaction, server: str, state: app_commands.Choice[str] | None = None, time: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
-    enabled = 1 if state.value == "on" else 0
     row = await ensure_server_access(interaction, server, allow_admin=True)
     tracked_row = fetch_server(server)
+    if state is None:
+        enabled = bool(int(record_value(row, "autosuspend_enabled", 0) or 0))
+        stored_expiry = record_value(row, "expires_at")
+        created_at_value = record_value(row, "created_at")
+        details = [
+            f"Server: **{record_value(row, 'name', server)}** (`{server}`)",
+            f"Auto suspend: **{'ON' if enabled else 'OFF'}**",
+        ]
+        if stored_expiry:
+            expires_at = datetime.fromisoformat(str(stored_expiry))
+            remaining = expires_at - utc_now()
+            details.append(f"Suspension time: <t:{int(expires_at.timestamp())}:F> (<t:{int(expires_at.timestamp())}:R>)")
+            details.append(f"Time remaining: **{describe_duration(int(remaining.total_seconds()))}**")
+            if created_at_value:
+                created_at = datetime.fromisoformat(str(created_at_value))
+                configured_period = expires_at - created_at
+                details.append(f"Configured period: **{describe_duration(int(configured_period.total_seconds()))}**")
+        else:
+            details.append("Suspension time: **not set**")
+            details.append("Configured period: **unknown for panel-only server**")
+        await interaction.followup.send(embed=branded_embed("Autosuspend Details", "\n".join(details)), ephemeral=True)
+        return
+    enabled = 1 if state.value == "on" else 0
     expires_at: datetime | None = None
     if enabled:
         if time:
