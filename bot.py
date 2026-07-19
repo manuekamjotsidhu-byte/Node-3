@@ -295,6 +295,53 @@ def clear_server_notifications(server_id: str) -> None:
         connection.execute("DELETE FROM server_notifications WHERE server_id=?", (server_id,))
 
 
+
+
+def discord_owner_label(record: sqlite3.Row | dict[str, Any], user: discord.User | None = None) -> str:
+    discord_id = str(record_value(record, "discord_user_id", "")).strip()
+    if not discord_id:
+        return "Unknown"
+    if user:
+        return f"{user.mention} (`{discord_id}`)"
+    return f"<@{discord_id}> (`{discord_id}`)"
+
+
+def server_admin_details(record: sqlite3.Row | dict[str, Any], *, user: discord.User | None = None, event_when: datetime | None = None, reason: str | None = None) -> str:
+    created_at_raw = str(record_value(record, "created_at", "")).strip()
+    expires_at_raw = str(record_value(record, "expires_at", "")).strip()
+    created_line = clean(created_at_raw) or "Unknown"
+    expires_line = clean(expires_at_raw) or "Unknown"
+    try:
+        created_line = f"<t:{int(datetime.fromisoformat(created_at_raw).timestamp())}:F>"
+    except (TypeError, ValueError):
+        pass
+    try:
+        expires_line = f"<t:{int(datetime.fromisoformat(expires_at_raw).timestamp())}:F>"
+    except (TypeError, ValueError):
+        pass
+    event_line = ""
+    if event_when is not None:
+        event_line = f"\nEvent time: <t:{int(event_when.timestamp())}:F>"
+    reason_line = f"\nReason: {clean(reason, 300)}" if reason else ""
+    return (
+        f"Server: **{clean(str(record_value(record, 'name', 'Unknown')), 120)}** (`{record_value(record, 'server_id', 'unknown')}`)\n"
+        f"UUID: `{record_value(record, 'uuid', 'unknown') or 'unknown'}`\n"
+        f"Identifier: `{record_value(record, 'identifier', 'unknown') or 'unknown'}`\n"
+        f"Plan: **{clean(str(record_value(record, 'plan', 'unknown')).title())}**\n"
+        f"Owner Discord: {discord_owner_label(record, user)}\n"
+        f"Owner Email: `{clean(str(record_value(record, 'panel_email', 'unknown')), 120)}`\n"
+        f"Panel User ID: `{record_value(record, 'panel_user_id', 'unknown')}`\n"
+        f"Created: {created_line}\n"
+        f"Suspension/Expiry: {expires_line}{event_line}{reason_line}\n"
+        f"Node: **{clean(str(record_value(record, 'node_name', 'Unknown')), 80)}** (`{record_value(record, 'node_id', 'unknown')}`)\n"
+        f"Nest: **{clean(str(record_value(record, 'nest_name', 'Unknown')), 80)}** (`{record_value(record, 'nest_id', 'unknown')}`)\n"
+        f"Egg: **{clean(str(record_value(record, 'egg_name', 'Unknown')), 80)}** (`{record_value(record, 'egg_id', 'unknown')}`)\n"
+        f"Specs: RAM `{record_value(record, 'ram', 0)} MB` / Disk `{record_value(record, 'disk', 0)} MB` / CPU `{record_value(record, 'cpu', 0)}%`\n"
+        f"Extras: DB `{record_value(record, 'databases', 0)}` / Alloc `{record_value(record, 'allocations', 0)}` / Backups `{record_value(record, 'backups', 0)}`\n"
+        f"State: suspended=`{bool(record_value(record, 'suspended', False))}` deleted=`{bool(record_value(record, 'deleted', False))}` autosuspend=`{bool(record_value(record, 'autosuspend_enabled', True))}`"
+    )
+
+
 def fetch_servers_by_email(email: str) -> list[sqlite3.Row]:
     with db() as connection:
         return connection.execute("SELECT * FROM servers WHERE panel_email = ? AND deleted = 0 ORDER BY created_at DESC", (email,)).fetchall()
@@ -1218,7 +1265,12 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
 
     if plan == "paid":
         channel = client.get_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))) or await client.fetch_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID)))
-        await channel.send(embed=branded_embed("Paid Server Created", f"Discord User: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nServer: **{name}** (`{server_id}`)\nSpecs: {ram_mb}MB RAM / {disk_mb}MB Disk / {cpu}% CPU\nExtras: DB {databases} / Alloc {allocations} / Backups {backups}\nNode: {node_name}\nNext renewal: <t:{int(expires_at.timestamp())}:F>\nSaga auto suspension: {'synced' if saga_synced else 'not synced'}", 0xf1c40f))
+        log_embed = branded_embed(
+            "Paid Server Created",
+            server_admin_details(record, user=user, event_when=expires_at, reason=f"Paid server created; Saga auto suspension {'synced' if saga_synced else 'not synced'}"),
+            0xf1c40f,
+        )
+        await channel.send(embed=log_embed)
 
 
 @tree.command(name="create-free", description="Create free server")
@@ -2002,7 +2054,12 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
         try:
             channel_id = int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))
             channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-            await channel.send(embed=embed)
+            admin_embed = branded_embed(
+                f"Admin Log: {title}",
+                server_admin_details(record, user=user, event_when=when, reason=message),
+                0xe67e22 if event != "deleted" else 0xe74c3c,
+            )
+            await channel.send(embed=admin_embed)
             delivered = True
         except Exception as error:
             print(f"Failed to send paid lifecycle reminder for server {record['server_id']} to log channel: {error}")
