@@ -24,6 +24,7 @@ CATEGORY_ID_KEYS = {
     "other_issues": "other_issues_id",
 }
 PIN_PREFIX = "📌・"
+SHIELD_PREFIX = "🛡️・"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("zerox-ticket-bot")
 
@@ -148,6 +149,19 @@ def sanitize_name(name: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip().lower().replace(" ", "-")
     name = re.sub(r"-+", "-", name).strip("-")
     return (name or "ticket")[:90]
+
+
+def strip_ticket_prefixes(name: str) -> str:
+    previous = None
+    while previous != name:
+        previous = name
+        for prefix in (SHIELD_PREFIX, PIN_PREFIX):
+            name = name.removeprefix(prefix)
+    return name
+
+
+def ticket_channel_name(base: str, *, pinned: bool = False, no_close: bool = False) -> str:
+    return ((SHIELD_PREFIX if no_close else "") + (PIN_PREFIX if pinned else "") + base)[:100]
 
 
 def emoji_from(raw: str):
@@ -740,6 +754,49 @@ class TicketControlView(discord.ui.View):
         if await self.guard(interaction): await interaction.response.send_message("Confirm ticket deletion.", view=ConfirmDeleteView(self.bot), ephemeral=True)
 
 
+
+class ConfirmPurgeView(discord.ui.View):
+    def __init__(self, bot: TicketBot, category_key: Optional[str] = None):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.category_key = category_key
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not is_admin_or_staff(self.bot, interaction.user):
+            await self.bot.safe_send(interaction, "You do not have permission.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, purge tickets", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        where = "guild_id=? AND status!='deleted'"
+        args: list[Any] = [ALLOWED_GUILD_ID]
+        if self.category_key:
+            where += " AND category_key=?"
+            args.append(self.category_key)
+        tickets = self.bot.store.rows(f"SELECT * FROM tickets WHERE {where} ORDER BY ticket_id", tuple(args))
+        deleted = 0
+        failed = 0
+        missing = 0
+        for ticket in tickets:
+            channel = interaction.guild.get_channel(ticket["channel_id"]) if interaction.guild else None
+            if isinstance(channel, discord.TextChannel):
+                if await self.bot.delete_ticket(channel, interaction.user):
+                    deleted += 1
+                else:
+                    failed += 1
+            else:
+                self.bot.store.exec("UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=?, close_reason=? WHERE ticket_id=?", (interaction.user.id, iso(), "Ticket purged while channel was missing.", ticket["ticket_id"]))
+                missing += 1
+        scope = self.bot.cfg["categories"].get(self.category_key, {}).get("name", "all categories") if self.category_key else "all categories"
+        await self.bot.log_event("Ticket purge completed", f"By {interaction.user.mention}\nScope: {scope}\nDeleted channels: {deleted}\nMissing channels marked deleted: {missing}\nFailed: {failed}")
+        await self.bot.safe_send(interaction, f"Purge finished for **{scope}**. Deleted: `{deleted}`, missing marked deleted: `{missing}`, failed: `{failed}`.", ephemeral=True)
+
+    @discord.ui.button(label="No, cancel", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.bot.safe_send(interaction, "Ticket purge cancelled.", ephemeral=True)
+
 class UserActionView(discord.ui.View):
     def __init__(self, bot: TicketBot, action: str): super().__init__(timeout=120); self.add_item(UserActionSelect(bot, action))
 class UserActionSelect(discord.ui.UserSelect):
@@ -791,8 +848,8 @@ async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
     new = (not bool(t["pinned"])) if desired is None else bool(desired)
     if bool(t["pinned"]) == new:
         return await bot.safe_send(interaction, "Ticket is already pinned." if new else "Ticket is already unpinned.", ephemeral=True)
-    base = t["custom_channel_name"] or interaction.channel.name.removeprefix(PIN_PREFIX)
-    name = (PIN_PREFIX + base) if new else base
+    base = t["custom_channel_name"] or strip_ticket_prefixes(interaction.channel.name)
+    name = ticket_channel_name(base, pinned=new, no_close=bool(t["no_close"]))
     bot.store.exec("UPDATE tickets SET pinned=?, custom_channel_name=? WHERE ticket_id=?", (1 if new else 0, base, t["ticket_id"]))
     try: await interaction.channel.edit(name=name[:100], position=0 if new else None)
     except Exception as e: log.warning("pin reorder/rename failed: %s", e)
@@ -813,8 +870,13 @@ async def set_no_close_ticket(bot, interaction, channel: Optional[discord.TextCh
         return await bot.safe_send(interaction, "That channel is not a valid ticket channel.", ephemeral=True)
     if t["status"] == "deleted":
         return await bot.safe_send(interaction, "Deleted tickets cannot be protected.", ephemeral=True)
-    bot.store.exec("UPDATE tickets SET no_close=1 WHERE ticket_id=?", (t["ticket_id"],))
+    base = t["custom_channel_name"] or strip_ticket_prefixes(target.name)
+    bot.store.exec("UPDATE tickets SET no_close=1, custom_channel_name=? WHERE ticket_id=?", (base, t["ticket_id"]))
     updated = bot.ticket_by_channel(target.id)
+    try:
+        await target.edit(name=ticket_channel_name(base, pinned=bool(t["pinned"]), no_close=True), reason="Ticket protected from auto-close")
+    except Exception as e:
+        log.warning("no-close shield rename failed for channel %s: %s", target.id, e)
     await bot.refresh_ticket_message(target)
     open_rows = bot.store.rows("SELECT * FROM tickets WHERE guild_id=? AND status!='deleted' ORDER BY no_close DESC, ticket_id DESC LIMIT 25", (ALLOWED_GUILD_ID,))
     lines = []
@@ -837,7 +899,7 @@ async def rename_channel(bot, interaction, name):
     t = await require_staff(bot, interaction)
     if not t: return
     clean = sanitize_name(name)
-    final = (PIN_PREFIX if t["pinned"] else "") + clean
+    final = ticket_channel_name(clean, pinned=bool(t["pinned"]), no_close=bool(t["no_close"]))
     old = interaction.channel.name
     await interaction.channel.edit(name=final[:100])
     bot.store.exec("UPDATE tickets SET custom_channel_name=? WHERE ticket_id=?", (clean, t["ticket_id"]))
@@ -1030,6 +1092,27 @@ async def tc_transcript(i):
         ok=await bot.ensure_transcript(i.channel,t,"Transcript generated by command")
         await i.followup.send("Transcript uploaded." if ok else "Transcript upload failed.",ephemeral=True)
 bot.tree.add_command(ticket_group)
+
+
+@bot.tree.command(name="purge", guild=discord.Object(id=ALLOWED_GUILD_ID), description="Delete all tickets, optionally limited to a category.")
+@app_commands.choices(category=[
+    app_commands.Choice(name="Buy / Orders", value="buy_orders"),
+    app_commands.Choice(name="General Support", value="general_support"),
+    app_commands.Choice(name="Complaints / Reports", value="complaints_reports"),
+    app_commands.Choice(name="Other Issues", value="other_issues"),
+])
+async def purge_cmd(interaction: discord.Interaction, category: Optional[str] = None):
+    if not isinstance(interaction.user, discord.Member) or not is_admin_or_staff(bot, interaction.user):
+        return await bot.safe_send(interaction, "You do not have permission.", ephemeral=True)
+    category_key = category
+    args: list[Any] = [ALLOWED_GUILD_ID]
+    where = "guild_id=? AND status!='deleted'"
+    if category_key:
+        where += " AND category_key=?"
+        args.append(category_key)
+    count = bot.store.row(f"SELECT COUNT(*) AS total FROM tickets WHERE {where}", tuple(args))["total"]
+    scope = bot.cfg["categories"].get(category_key, {}).get("name", "all categories") if category_key else "all categories"
+    await bot.safe_send(interaction, f"Are you sure you want to purge `{count}` ticket(s) from **{scope}**? This will delete ticket channels. Choose yes or no.", view=ConfirmPurgeView(bot, category_key), ephemeral=True)
 
 @bot.tree.command(name="noclose", guild=discord.Object(id=ALLOWED_GUILD_ID), description="Protect a ticket from inactivity auto-close/delete.")
 async def noclose_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
