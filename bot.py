@@ -981,6 +981,16 @@ async def refresh_user_servers(discord_user_id: int) -> list[sqlite3.Row]:
     return refreshed
 
 
+async def refresh_email_servers(email: str) -> list[sqlite3.Row]:
+    normalized_email = email.strip().lower()
+    refreshed: list[sqlite3.Row] = []
+    for row in fetch_servers_by_email(normalized_email):
+        live_row = await refresh_tracked_server(row)
+        if live_row and str(live_row["panel_email"]).strip().lower() == normalized_email:
+            refreshed.append(live_row)
+    return refreshed
+
+
 def server_row_to_line(row: sqlite3.Row) -> str:
     expires = int(datetime.fromisoformat(row["expires_at"]).timestamp())
     return f"`{row['server_id']}` • **{row['name']}** • {row['plan']} • <t:{expires}:R>"
@@ -1454,30 +1464,50 @@ async def admin_rename(interaction: discord.Interaction, server: str, new_name: 
 tree.add_command(admin_group)
 
 
-@tree.command(name="list", description="List your servers")
-async def list_mine(interaction: discord.Interaction) -> None:
-    await interaction.response.defer()
-    rows = await refresh_user_servers(interaction.user.id)
+@tree.command(name="list", description="List your servers, or filter by user/email as an admin")
+@app_commands.describe(user="Admin-only: Discord user whose servers should be shown", email="Admin-only: panel email whose servers should be shown")
+async def list_mine(interaction: discord.Interaction, user: discord.User | None = None, email: str | None = None) -> None:
+    admin_filter_requested = user is not None or bool(email and email.strip())
+    await interaction.response.defer(ephemeral=admin_filter_requested)
+    if admin_filter_requested and not command_allows_admin_access(interaction):
+        raise RuntimeError("Only admins can filter /list by Discord user or panel email.")
+    if user and email and email.strip():
+        raise RuntimeError("Use either user or email for /list, not both.")
+
+    if user:
+        rows = await refresh_user_servers(user.id)
+        title = f"Servers For {user.display_name}"
+        description = f"Tracked servers linked to {user.mention}."
+    elif email and email.strip():
+        normalized_email = email.strip().lower()
+        rows = await refresh_email_servers(normalized_email)
+        title = "Servers For Email"
+        description = f"Tracked servers linked to panel email `{clean(normalized_email, 120)}`."
+    else:
+        rows = await refresh_user_servers(interaction.user.id)
+        title = "Your Servers"
+        description = "Only your own linked/tracked servers are shown here."
+
     if not rows:
-        await interaction.followup.send(embed=branded_embed("Your Servers", "No servers found."))
+        await interaction.followup.send(embed=branded_embed(title, "No servers found."), ephemeral=admin_filter_requested)
         return
     embeds: list[discord.Embed] = []
     pages = chunked(rows, 10)
     for page_number, page in enumerate(pages, start=1):
-        embed = branded_embed("Your Servers", "Only your own linked/tracked servers are shown here.")
+        embed = branded_embed(title, description)
         for row in page:
             expires = int(datetime.fromisoformat(row["expires_at"]).timestamp())
             embed.add_field(
                 name=f"#{row['server_id']} • {row['name']}",
-                value=f"**Plan:** {row['plan']}\n**UUID:** `{row['uuid'] or 'unknown'}`\n**Specs:** {row['ram']:,} MB RAM / {row['disk']:,} MB Disk / {row['cpu']}% CPU\n**Expires:** <t:{expires}:R>",
+                value=f"**Plan:** {row['plan']}\n**UUID:** `{row['uuid'] or 'unknown'}`\n**Owner:** <@{row['discord_user_id']}>\n**Email:** `{row['panel_email']}`\n**Specs:** {row['ram']:,} MB RAM / {row['disk']:,} MB Disk / {row['cpu']}% CPU\n**Expires:** <t:{expires}:R>",
                 inline=False,
             )
         embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(rows)} server(s) • Developer: {DEVELOPER}")
         embeds.append(embed)
     if len(embeds) > 1:
-        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds))
+        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds), ephemeral=admin_filter_requested)
     else:
-        await interaction.followup.send(embed=embeds[0])
+        await interaction.followup.send(embed=embeds[0], ephemeral=admin_filter_requested)
 
 @tree.command(name="manage", description="Open server manager")
 @app_commands.autocomplete(server=accessible_server_autocomplete)
