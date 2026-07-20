@@ -175,8 +175,12 @@ class Store:
             reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL, last_activity_at TEXT NOT NULL,
             closed_at TEXT, scheduled_delete_at TEXT, claimed_by INTEGER, claim_at TEXT, pinned INTEGER NOT NULL DEFAULT 0,
             added_users TEXT NOT NULL DEFAULT '', custom_channel_name TEXT, transcript_status TEXT NOT NULL DEFAULT 'missing',
-            transcript_reference TEXT, closed_by INTEGER, deleted_by INTEGER, deleted_at TEXT, close_reason TEXT
+            transcript_reference TEXT, closed_by INTEGER, deleted_by INTEGER, deleted_at TEXT, close_reason TEXT,
+            no_close INTEGER NOT NULL DEFAULT 0
         )""")
+        existing_columns = {row[1] for row in self.db.execute("PRAGMA table_info(tickets)").fetchall()}
+        if "no_close" not in existing_columns:
+            self.db.execute("ALTER TABLE tickets ADD COLUMN no_close INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def row(self, q: str, args=()):
@@ -306,6 +310,7 @@ class TicketBot(commands.Bot):
             embed.add_field(name="Closed By", value=f"<@{ticket['closed_by']}>" if ticket["closed_by"] else "—", inline=True)
             embed.add_field(name="Deleted By", value=f"<@{ticket['deleted_by']}>" if ticket["deleted_by"] else "—", inline=True)
             embed.add_field(name="Pinned", value="Yes" if ticket["pinned"] else "No", inline=True)
+            embed.add_field(name="No Close", value="Yes" if ticket["no_close"] else "No", inline=True)
             embed.add_field(name="Close Reason", value=(ticket["close_reason"] or "—")[:1024], inline=False)
             embed.add_field(name="Transcript", value=ticket["transcript_status"], inline=True)
         if ch:
@@ -423,6 +428,7 @@ class TicketBot(commands.Bot):
         e.add_field(name="Status", value=f"{status_icon} `{ticket['status'].title()}`", inline=True)
         e.add_field(name="Claimed", value=claimed, inline=True)
         e.add_field(name="Pinned", value="`Yes`" if ticket["pinned"] else "`No`", inline=True)
+        e.add_field(name="No Close", value="`Yes`" if ticket["no_close"] else "`No`", inline=True)
         e.set_footer(text="ZeroX Host • Premium Support")
         return e
 
@@ -635,10 +641,12 @@ class TicketBot(commands.Bot):
                 self.store.exec("UPDATE tickets SET status='deleted', deleted_at=?, close_reason=? WHERE ticket_id=?", (iso(), "Ticket channel was manually deleted.", t["ticket_id"]))
                 await self.log_event("Stale ticket cleaned", "Open ticket channel was missing during maintenance.", t)
                 continue
+            if t["no_close"]:
+                continue
             last = parse_dt(t["last_activity_at"]) or now
             if now - last >= timedelta(hours=self.inactivity_close_hours()):
                 await self.close_ticket(ch, guild.me, "Closed automatically due to inactivity.", True)
-        for t in self.store.rows("SELECT * FROM tickets WHERE status='closed' AND scheduled_delete_at IS NOT NULL"):
+        for t in self.store.rows("SELECT * FROM tickets WHERE status='closed' AND scheduled_delete_at IS NOT NULL AND no_close=0"):
             ch = guild.get_channel(t["channel_id"])
             due = parse_dt(t["scheduled_delete_at"])
             if ch and due and now >= due:
@@ -748,8 +756,11 @@ class ConfirmDeleteView(discord.ui.View):
         if not ok: await self.bot.safe_send(interaction, "Delete blocked because transcript upload failed.", ephemeral=True)
 
 
+def is_admin_or_staff(bot, member: discord.Member) -> bool:
+    return bool(member.guild_permissions.administrator or bot.is_staff(member))
+
 async def require_staff(bot, interaction):
-    if not isinstance(interaction.user, discord.Member) or not bot.is_staff(interaction.user):
+    if not isinstance(interaction.user, discord.Member) or not is_admin_or_staff(bot, interaction.user):
         await bot.safe_send(interaction, "You do not have permission.", ephemeral=True); return None
     t = bot.ticket_by_channel(interaction.channel.id)
     if not t: await bot.safe_send(interaction, "Use this inside a valid ticket channel.", ephemeral=True); return None
@@ -788,6 +799,36 @@ async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
     await bot.refresh_ticket_message(interaction.channel)
     await bot.log_event("Ticket pinned" if new else "Ticket unpinned", f"By {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Pinned." if new else "Unpinned.", ephemeral=True)
+
+
+async def set_no_close_ticket(bot, interaction, channel: Optional[discord.TextChannel] = None):
+    await defer_if_needed(interaction)
+    if not isinstance(interaction.user, discord.Member) or not is_admin_or_staff(bot, interaction.user):
+        return await bot.safe_send(interaction, "You do not have permission.", ephemeral=True)
+    target = channel or interaction.channel
+    if not isinstance(target, discord.TextChannel):
+        return await bot.safe_send(interaction, "Choose a text channel or run this in a ticket channel.", ephemeral=True)
+    t = bot.ticket_by_channel(target.id)
+    if not t:
+        return await bot.safe_send(interaction, "That channel is not a valid ticket channel.", ephemeral=True)
+    if t["status"] == "deleted":
+        return await bot.safe_send(interaction, "Deleted tickets cannot be protected.", ephemeral=True)
+    bot.store.exec("UPDATE tickets SET no_close=1 WHERE ticket_id=?", (t["ticket_id"],))
+    updated = bot.ticket_by_channel(target.id)
+    await bot.refresh_ticket_message(target)
+    open_rows = bot.store.rows("SELECT * FROM tickets WHERE guild_id=? AND status!='deleted' ORDER BY no_close DESC, ticket_id DESC LIMIT 25", (ALLOWED_GUILD_ID,))
+    lines = []
+    for row in open_rows:
+        marker = "🛡️" if row["no_close"] else "•"
+        status = row["status"].title()
+        channel_text = f"<#{row['channel_id']}>" if row["channel_id"] else "Missing channel"
+        lines.append(f"{marker} `#{row['ticket_id']:04d}` {channel_text} — {status} — {row['category_name']}")
+    desc = f"Protected {target.mention} from inactivity auto-close and scheduled auto-delete.\n\n"
+    desc += "**Recent tickets**\n" + ("\n".join(lines) if lines else "No tickets found.")
+    embed = discord.Embed(title="🛡️ Ticket No-Close Enabled", description=desc[:4000], color=0x57F287, timestamp=utcnow())
+    embed.set_footer(text="No-close tickets are skipped by automated maintenance.")
+    await bot.log_event("Ticket no-close enabled", f"By {interaction.user.mention}\nChannel: {target.mention}", updated)
+    await bot.safe_send(interaction, embed=embed, ephemeral=True)
 
 async def pin_ticket(bot, interaction):
     await set_pin_ticket(bot, interaction, None)
@@ -971,6 +1012,8 @@ async def tc_add(i, user: discord.Member): await i.response.defer(ephemeral=True
 async def tc_remove(i, user: discord.Member): await i.response.defer(ephemeral=True, thinking=True); await user_action(bot,i,user,"remove")
 @ticket_group.command(name="rename")
 async def tc_rename(i, name: str): await i.response.defer(ephemeral=True, thinking=True); await rename_channel(bot,i,name)
+@ticket_group.command(name="noclose", description="Protect a ticket from inactivity auto-close/delete.")
+async def tc_noclose(i, channel: Optional[discord.TextChannel] = None): await i.response.defer(ephemeral=True, thinking=True); await set_no_close_ticket(bot,i,channel)
 @ticket_group.command(name="close")
 async def tc_close(i): await i.response.send_modal(CloseModal(bot)) if await require_staff(bot,i) else None
 @ticket_group.command(name="delete")
@@ -987,6 +1030,11 @@ async def tc_transcript(i):
         ok=await bot.ensure_transcript(i.channel,t,"Transcript generated by command")
         await i.followup.send("Transcript uploaded." if ok else "Transcript upload failed.",ephemeral=True)
 bot.tree.add_command(ticket_group)
+
+@bot.tree.command(name="noclose", guild=discord.Object(id=ALLOWED_GUILD_ID), description="Protect a ticket from inactivity auto-close/delete.")
+async def noclose_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await set_no_close_ticket(bot, interaction, channel)
 
 @bot.tree.command(name="reopen", guild=discord.Object(id=ALLOWED_GUILD_ID), description="Reopen the current closed ticket.")
 async def reopen_cmd(interaction: discord.Interaction, reason: str = "Ticket reopened"):
