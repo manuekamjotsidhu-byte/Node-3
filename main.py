@@ -136,6 +136,14 @@ def color_value(s: str) -> int:
         return 0x5865F2
 
 
+def positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+        return parsed if parsed > 0 else default
+    except Exception:
+        return default
+
+
 def sanitize_name(name: str) -> str:
     name = re.sub(r"[^a-zA-Z0-9_\- ]+", "", name).strip().lower().replace(" ", "-")
     name = re.sub(r"-+", "-", name).strip("-")
@@ -251,6 +259,12 @@ class TicketBot(commands.Bot):
         data = self.cfg["categories"].get(key, {})
         emoji = self.emoji_display(data.get("emoji", ""), guild)
         return f"{emoji} {data.get('name', key).strip()}".strip()
+
+    def inactivity_close_hours(self) -> float:
+        return positive_float(self.cfg["tickets"].get("inactivity_close_hours", 24), 24)
+
+    def closed_delete_hours(self) -> float:
+        return positive_float(self.cfg["tickets"].get("closed_delete_hours", 24), 24)
 
     def active_tickets_for(self, uid: int):
         return self.store.rows("SELECT * FROM tickets WHERE opener_id=? AND guild_id=? AND status='open'", (uid, ALLOWED_GUILD_ID))
@@ -381,7 +395,7 @@ class TicketBot(commands.Bot):
         return report
 
     def ticket_embed(self, ticket) -> discord.Embed:
-        hours = self.cfg["tickets"]["inactivity_close_hours"]
+        hours = self.inactivity_close_hours()
         guild = self.get_guild(ticket["guild_id"])
         category = self.category_display(ticket["category_key"], guild)
         opener = f"<@{ticket['opener_id']}>"
@@ -548,7 +562,7 @@ class TicketBot(commands.Bot):
         if not ticket or ticket["status"] != "open": return False
         try:
             transcript = await self.transcript_file(channel, ticket)
-            delete_at = utcnow() + timedelta(hours=float(self.cfg["tickets"].get("closed_delete_hours", 24)))
+            delete_at = utcnow() + timedelta(hours=self.closed_delete_hours())
             self.store.exec("UPDATE tickets SET status='closed', closed_at=?, scheduled_delete_at=?, closed_by=?, close_reason=?, transcript_status='pending' WHERE ticket_id=?", (iso(), iso(delete_at), actor.id, reason, ticket["ticket_id"]))
             updated = self.ticket_by_channel(channel.id)
             log_ok = await self.log_event("Ticket auto-closed" if auto else "Ticket closed", reason or "No reason provided", updated, transcript)
@@ -622,7 +636,7 @@ class TicketBot(commands.Bot):
                 await self.log_event("Stale ticket cleaned", "Open ticket channel was missing during maintenance.", t)
                 continue
             last = parse_dt(t["last_activity_at"]) or now
-            if now - last >= timedelta(hours=float(self.cfg["tickets"].get("inactivity_close_hours", 24))):
+            if now - last >= timedelta(hours=self.inactivity_close_hours()):
                 await self.close_ticket(ch, guild.me, "Closed automatically due to inactivity.", True)
         for t in self.store.rows("SELECT * FROM tickets WHERE status='closed' AND scheduled_delete_at IS NOT NULL"):
             ch = guild.get_channel(t["channel_id"])
