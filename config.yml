@@ -1,0 +1,91 @@
+bot:
+  token: ""
+
+guild:
+  guild_id: "1504088095220568094"
+
+roles:
+  owner_role_id: "1504092176492265553"
+  staff_role_id: "1504092206095532242"
+
+channels:
+  logs_channel_id: ""
+  panel_channel_id: ""
+
+ticket_categories:
+  buy_orders_id: ""
+  general_support_id: ""
+  complaints_reports_id: ""
+  other_issues_id: ""
+
+tickets:
+  max_active_per_user: 1
+  inactivity_close_hours: 24
+  closed_delete_hours: 24
+  channel_name_format: "ticket-{username}-{number}"
+  category_channel_name_formats:
+    buy_orders: "paid-{username}"
+    general_support: "support-{username}"
+    complaints_reports: "report-{username}"
+    other_issues: "other-{username}"
+
+panel:
+  title: "ZeroX Host Support"
+  description: |
+    <a:fire_gif:1514165449275871393> **Need help? Open a ticket by choosing the correct category below. Our team will assist you as quickly as possible.**
+
+    <:Store:1514165709616451696> **Buy / Orders**
+    > Purchase items or services
+    > Custom orders & payments
+    > Order-related questions
+
+    <a:support:1514165749097173074> **General Support**
+    > Server-related help
+    > Technical issues
+    > General questions & guidance
+
+    <a:hammer_gif:1514165780999180309> **Complaints / Reports**
+    > Report rule breakers
+    > Staff-related issues
+    > Scams, abuse, or disputes
+
+    <a:purchase:1528210165642432594> **Other Issues**
+    > Anything not listed above
+    > Suggestions or feedback
+    > Miscellaneous problems
+
+    <a:Minecraft_diamond:1528237013852225609> **Please provide clear details after opening a ticket to help us assist you faster.**
+
+  color: "#5865F2"
+  thumbnail_url: ""
+  image_url: ""
+  footer_text: "ZeroX Host Support"
+  footer_icon_url: ""
+  dropdown_placeholder: "Select the correct ticket category"
+
+categories:
+  buy_orders:
+    name: "Buy / Orders"
+    emoji: "<:Store:1514165709616451696>"
+
+  general_support:
+    name: "General Support"
+    emoji: "<a:support:1514165749097173074>"
+
+  complaints_reports:
+    name: "Complaints / Reports"
+    emoji: "<a:hammer_gif:1514165780999180309>"
+
+  other_issues:
+    name: "Other Issues"
+    emoji: "<a:purchase:1528210165642432594>"
+
+transcripts:
+  enabled: true
+  mandatory: true
+  format: "html"
+  send_to_opener_dm: true
+
+panel_state:
+  message_id: ""
+  channel_id: ""
