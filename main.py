@@ -775,23 +775,44 @@ class ConfirmPurgeView(discord.ui.View):
         if self.category_key:
             where += " AND category_key=?"
             args.append(self.category_key)
-        tickets = self.bot.store.rows(f"SELECT * FROM tickets WHERE {where} ORDER BY ticket_id", tuple(args))
-        deleted = 0
-        failed = 0
-        missing = 0
+        protected = self.bot.store.row(f"SELECT COUNT(*) AS total FROM tickets WHERE {where} AND no_close=1", tuple(args))["total"]
+        tickets = self.bot.store.rows(f"SELECT * FROM tickets WHERE {where} AND no_close=0 ORDER BY ticket_id", tuple(args))
+        delete_jobs: list[tuple[sqlite3.Row, discord.TextChannel]] = []
+        missing_tickets: list[sqlite3.Row] = []
         for ticket in tickets:
             channel = interaction.guild.get_channel(ticket["channel_id"]) if interaction.guild else None
             if isinstance(channel, discord.TextChannel):
-                if await self.bot.delete_ticket(channel, interaction.user):
-                    deleted += 1
-                else:
-                    failed += 1
+                delete_jobs.append((ticket, channel))
             else:
-                self.bot.store.exec("UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=?, close_reason=? WHERE ticket_id=?", (interaction.user.id, iso(), "Ticket purged while channel was missing.", ticket["ticket_id"]))
-                missing += 1
+                missing_tickets.append(ticket)
+
+        semaphore = asyncio.Semaphore(5)
+
+        async def delete_channel(ticket: sqlite3.Row, channel: discord.TextChannel):
+            async with semaphore:
+                try:
+                    await channel.delete(reason=f"Ticket purge by {interaction.user}")
+                    return ticket, True, None
+                except Exception as e:
+                    log.warning("purge delete failed for ticket %s channel %s: %s", ticket["ticket_id"], channel.id, e)
+                    return ticket, False, e
+
+        results = await asyncio.gather(*(delete_channel(ticket, channel) for ticket, channel in delete_jobs)) if delete_jobs else []
+        deleted = 0
+        failed = 0
+        deleted_at = iso()
+        for ticket, ok, _error in results:
+            if ok:
+                self.bot.store.exec("UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=?, close_reason=? WHERE ticket_id=?", (interaction.user.id, deleted_at, "Ticket purged by owner.", ticket["ticket_id"]))
+                deleted += 1
+            else:
+                failed += 1
+        for ticket in missing_tickets:
+            self.bot.store.exec("UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=?, close_reason=? WHERE ticket_id=?", (interaction.user.id, deleted_at, "Ticket purged while channel was missing.", ticket["ticket_id"]))
+        missing = len(missing_tickets)
         scope = self.bot.cfg["categories"].get(self.category_key, {}).get("name", "all categories") if self.category_key else "all categories"
-        await self.bot.log_event("Ticket purge completed", f"By {interaction.user.mention}\nScope: {scope}\nDeleted channels: {deleted}\nMissing channels marked deleted: {missing}\nFailed: {failed}")
-        await self.bot.safe_send(interaction, f"Purge finished for **{scope}**. Deleted: `{deleted}`, missing marked deleted: `{missing}`, failed: `{failed}`.", ephemeral=True)
+        await self.bot.log_event("Ticket purge completed", f"By {interaction.user.mention}\nScope: {scope}\nDeleted channels: {deleted}\nMissing channels marked deleted: {missing}\nProtected no-close skipped: {protected}\nFailed: {failed}")
+        await self.bot.safe_send(interaction, f"Purge finished for **{scope}**. Deleted: `{deleted}`, missing marked deleted: `{missing}`, protected skipped: `{protected}`, failed: `{failed}`.", ephemeral=True)
 
     @discord.ui.button(label="No, cancel", style=discord.ButtonStyle.secondary)
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1110,9 +1131,10 @@ async def purge_cmd(interaction: discord.Interaction, category: Optional[str] = 
     if category_key:
         where += " AND category_key=?"
         args.append(category_key)
-    count = bot.store.row(f"SELECT COUNT(*) AS total FROM tickets WHERE {where}", tuple(args))["total"]
+    count = bot.store.row(f"SELECT COUNT(*) AS total FROM tickets WHERE {where} AND no_close=0", tuple(args))["total"]
+    protected = bot.store.row(f"SELECT COUNT(*) AS total FROM tickets WHERE {where} AND no_close=1", tuple(args))["total"]
     scope = bot.cfg["categories"].get(category_key, {}).get("name", "all categories") if category_key else "all categories"
-    await bot.safe_send(interaction, f"Are you sure you want to purge `{count}` ticket(s) from **{scope}**? This will delete ticket channels. Choose yes or no.", view=ConfirmPurgeView(bot, category_key), ephemeral=True)
+    await bot.safe_send(interaction, f"Are you sure you want to purge `{count}` ticket(s) from **{scope}**? Protected no-close tickets skipped: `{protected}`. This will delete ticket channels quickly without transcripts. Choose yes or no.", view=ConfirmPurgeView(bot, category_key), ephemeral=True)
 
 @bot.tree.command(name="noclose", guild=discord.Object(id=ALLOWED_GUILD_ID), description="Protect a ticket from inactivity auto-close/delete.")
 async def noclose_cmd(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
