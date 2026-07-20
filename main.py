@@ -762,8 +762,8 @@ class ConfirmPurgeView(discord.ui.View):
         self.category_key = category_key
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not isinstance(interaction.user, discord.Member) or not is_admin_or_staff(self.bot, interaction.user):
-            await self.bot.safe_send(interaction, "You do not have permission.", ephemeral=True)
+        if not isinstance(interaction.user, discord.Member) or not self.bot.is_owner(interaction.user):
+            await self.bot.safe_send(interaction, "Only the configured ZeroX Host owner role can purge tickets.", ephemeral=True)
             return False
         return True
 
@@ -1102,8 +1102,8 @@ bot.tree.add_command(ticket_group)
     app_commands.Choice(name="Other Issues", value="other_issues"),
 ])
 async def purge_cmd(interaction: discord.Interaction, category: Optional[str] = None):
-    if not isinstance(interaction.user, discord.Member) or not is_admin_or_staff(bot, interaction.user):
-        return await bot.safe_send(interaction, "You do not have permission.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not bot.is_owner(interaction.user):
+        return await bot.safe_send(interaction, "Only the configured ZeroX Host owner role can purge tickets.", ephemeral=True)
     category_key = category
     args: list[Any] = [ALLOWED_GUILD_ID]
     where = "guild_id=? AND status!='deleted'"
