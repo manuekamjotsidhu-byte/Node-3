@@ -412,6 +412,18 @@ class TicketBot(commands.Bot):
         e.set_footer(text="ZeroX Host • Premium Support")
         return e
 
+    async def refresh_ticket_message(self, channel: discord.TextChannel) -> None:
+        ticket = self.ticket_by_channel(channel.id)
+        if not ticket:
+            return
+        try:
+            async for message in channel.history(limit=25):
+                if message.author == self.user and message.embeds and message.embeds[0].title == "🎟️ Ticket Opened":
+                    await message.edit(embed=self.ticket_embed(ticket), view=TicketControlView(self))
+                    return
+        except Exception as e:
+            log.warning("failed to refresh ticket embed for channel %s: %s", channel.id, e)
+
     async def create_ticket(self, interaction: discord.Interaction, key: str, reason: str):
         lock = self.user_locks.setdefault(interaction.user.id, asyncio.Lock())
         async with lock:
@@ -545,6 +557,7 @@ class TicketBot(commands.Bot):
                 return False
             self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
             updated = self.ticket_by_channel(channel.id)
+            await self.refresh_ticket_message(channel)
             try: await channel.set_permissions(channel.guild.get_member(ticket["opener_id"]), send_messages=False, view_channel=True)
             except Exception: pass
             closed_embed = discord.Embed(title="🔒 Ticket Closed", description=f"**Reason:** {reason or 'No reason provided'}\n\n📄 Transcript has been saved and sent where configured.", color=0xED4245, timestamp=utcnow())
@@ -716,6 +729,7 @@ async def claim_ticket(bot, interaction):
     if t["claimed_by"] and t["claimed_by"] != interaction.user.id and not bot.is_owner(interaction.user):
         return await bot.safe_send(interaction, "This ticket is already claimed.", ephemeral=True)
     bot.store.exec("UPDATE tickets SET claimed_by=?, claim_at=? WHERE ticket_id=?", (interaction.user.id, iso(), t["ticket_id"]))
+    await bot.refresh_ticket_message(interaction.channel)
     await bot.log_event("Ticket claimed", f"Claimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket claimed.", ephemeral=True)
 async def unclaim_ticket(bot, interaction):
@@ -723,6 +737,7 @@ async def unclaim_ticket(bot, interaction):
     t = await require_staff(bot, interaction)
     if not t: return
     bot.store.exec("UPDATE tickets SET claimed_by=NULL, claim_at=NULL WHERE ticket_id=?", (t["ticket_id"],))
+    await bot.refresh_ticket_message(interaction.channel)
     await bot.log_event("Ticket unclaimed", f"Unclaimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket unclaimed.", ephemeral=True)
 async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
@@ -737,6 +752,7 @@ async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
     bot.store.exec("UPDATE tickets SET pinned=?, custom_channel_name=? WHERE ticket_id=?", (1 if new else 0, base, t["ticket_id"]))
     try: await interaction.channel.edit(name=name[:100], position=0 if new else None)
     except Exception as e: log.warning("pin reorder/rename failed: %s", e)
+    await bot.refresh_ticket_message(interaction.channel)
     await bot.log_event("Ticket pinned" if new else "Ticket unpinned", f"By {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Pinned." if new else "Unpinned.", ephemeral=True)
 
