@@ -45,6 +45,21 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def format_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    total_hours = days * 24 + hours
+    if total_hours and minutes:
+        return f"{total_hours}h {minutes}m"
+    if total_hours:
+        return f"{total_hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{secs}s"
+
+
 def deep_defaults() -> dict[str, Any]:
     return {
         "bot": {"token": ""},
@@ -472,7 +487,7 @@ class TicketBot(commands.Bot):
         try:
             created = parse_dt(ticket["created_at"]) or utcnow()
             finished = parse_dt(ticket["deleted_at"] or ticket["closed_at"]) or utcnow()
-            taken = max(0, int((finished - created).total_seconds()))
+            taken = format_duration(max(0, int((finished - created).total_seconds())))
             closed_by = f"<@{ticket['closed_by']}>" if ticket["closed_by"] else "—"
             deleted_by = f"<@{ticket['deleted_by']}>" if ticket["deleted_by"] else "—"
             embed = discord.Embed(
@@ -487,7 +502,7 @@ class TicketBot(commands.Bot):
                     f"**Deleted at :**\n{ticket['deleted_at'] or '—'}\n\n"
                     f"**Action by :**\n{actor.mention if actor else 'System'} - {getattr(actor, 'name', 'System')}\n\n"
                     f"**Reason :**\n{reason or ticket['close_reason'] or 'No reason provided'}\n\n"
-                    f"**Time taken :**\n{taken}s"
+                    f"**Time taken :**\n{taken}"
                 ),
                 color=0x7C3AED,
                 timestamp=utcnow(),
@@ -510,7 +525,6 @@ class TicketBot(commands.Bot):
             if not logged:
                 self.store.exec("UPDATE tickets SET transcript_status='failed' WHERE ticket_id=?", (ticket["ticket_id"],))
                 return False
-            await self.send_transcript_dm(channel, ticket, await self.transcript_file(channel, ticket), "closed", None, ticket["close_reason"] or "No reason provided")
             self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
             return True
         except Exception as e:
@@ -529,10 +543,8 @@ class TicketBot(commands.Bot):
             if self.cfg["transcripts"].get("mandatory") and not log_ok:
                 self.store.exec("UPDATE tickets SET status='open', closed_at=NULL, scheduled_delete_at=NULL, closed_by=NULL, close_reason=?, transcript_status='failed' WHERE ticket_id=?", (reason, ticket["ticket_id"]))
                 return False
-            dm_file = await self.transcript_file(channel, updated)
             self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
             updated = self.ticket_by_channel(channel.id)
-            await self.send_transcript_dm(channel, updated, dm_file, "closed", actor, reason or "No reason provided")
             try: await channel.set_permissions(channel.guild.get_member(ticket["opener_id"]), send_messages=False, view_channel=True)
             except Exception: pass
             closed_embed = discord.Embed(title="🔒 Ticket Closed", description=f"**Reason:** {reason or 'No reason provided'}\n\n📄 Transcript has been saved and sent where configured.", color=0xED4245, timestamp=utcnow())
