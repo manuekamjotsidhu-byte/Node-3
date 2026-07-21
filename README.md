@@ -30,7 +30,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
-Commands are synced globally for DM visibility and also to the configured guild for immediate admin command visibility after restarts. If an admin command such as `/unlink` does not appear, restart the bot once so the guild command sync runs immediately instead of waiting for global command propagation.
+Commands are synced globally for guild and DM visibility, and the bot clears configured-guild command copies to prevent duplicate slash commands such as duplicate `/unlink` entries. If a new command does not appear immediately after an update, restart the bot once and wait for Discord global command propagation.
 
 
 ```bash
