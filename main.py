@@ -190,11 +190,13 @@ class Store:
             closed_at TEXT, scheduled_delete_at TEXT, claimed_by INTEGER, claim_at TEXT, pinned INTEGER NOT NULL DEFAULT 0,
             added_users TEXT NOT NULL DEFAULT '', custom_channel_name TEXT, transcript_status TEXT NOT NULL DEFAULT 'missing',
             transcript_reference TEXT, closed_by INTEGER, deleted_by INTEGER, deleted_at TEXT, close_reason TEXT,
-            no_close INTEGER NOT NULL DEFAULT 0
+            no_close INTEGER NOT NULL DEFAULT 0, pinned_position INTEGER
         )""")
         existing_columns = {row[1] for row in self.db.execute("PRAGMA table_info(tickets)").fetchall()}
         if "no_close" not in existing_columns:
             self.db.execute("ALTER TABLE tickets ADD COLUMN no_close INTEGER NOT NULL DEFAULT 0")
+        if "pinned_position" not in existing_columns:
+            self.db.execute("ALTER TABLE tickets ADD COLUMN pinned_position INTEGER")
         self.db.commit()
 
     def row(self, q: str, args=()):
@@ -871,8 +873,10 @@ async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
         return await bot.safe_send(interaction, "Ticket is already pinned." if new else "Ticket is already unpinned.", ephemeral=True)
     base = t["custom_channel_name"] or strip_ticket_prefixes(interaction.channel.name)
     name = ticket_channel_name(base, pinned=new, no_close=bool(t["no_close"]))
-    bot.store.exec("UPDATE tickets SET pinned=?, custom_channel_name=? WHERE ticket_id=?", (1 if new else 0, base, t["ticket_id"]))
-    try: await interaction.channel.edit(name=name[:100], position=0 if new else None)
+    saved_position = interaction.channel.position if new else None
+    restore_position = t["pinned_position"] if not new and t["pinned_position"] is not None else None
+    bot.store.exec("UPDATE tickets SET pinned=?, custom_channel_name=?, pinned_position=? WHERE ticket_id=?", (1 if new else 0, base, saved_position, t["ticket_id"]))
+    try: await interaction.channel.edit(name=name, position=0 if new else restore_position)
     except Exception as e: log.warning("pin reorder/rename failed: %s", e)
     await bot.refresh_ticket_message(interaction.channel)
     await bot.log_event("Ticket pinned" if new else "Ticket unpinned", f"By {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
