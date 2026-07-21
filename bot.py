@@ -280,6 +280,19 @@ def fetch_links_by_panel_user() -> dict[int, sqlite3.Row]:
     return {int(row["panel_user_id"]): row for row in rows if int(row["panel_user_id"] or 0) > 0}
 
 
+def fetch_link_by_panel_user(panel_user_id: int) -> sqlite3.Row | None:
+    with db() as connection:
+        return connection.execute("SELECT * FROM links WHERE panel_user_id = ?", (int(panel_user_id),)).fetchone()
+
+
+def unlink_discord_user(discord_user_id: int) -> sqlite3.Row | None:
+    existing = fetch_link(discord_user_id)
+    if existing:
+        with db() as connection:
+            connection.execute("DELETE FROM links WHERE discord_user_id = ?", (str(discord_user_id),))
+    return existing
+
+
 def notification_sent(server_id: str, notification_type: str) -> bool:
     with db() as connection:
         return connection.execute("SELECT 1 FROM server_notifications WHERE server_id=? AND notification_type=?", (server_id, notification_type)).fetchone() is not None
@@ -1305,16 +1318,38 @@ async def create_paid(interaction: discord.Interaction, user: discord.User, name
 @admin_only()
 async def link(interaction: discord.Interaction, user: discord.User, panel_email: str) -> None:
     await interaction.response.defer(ephemeral=True)
-    panel_user = await ptero.get_required_panel_user(panel_email)
+    existing_user_link = fetch_link(user.id)
+    if existing_user_link:
+        await interaction.followup.send(embed=branded_embed("Already Linked", f"{user.mention} is already linked to `{existing_user_link['email']}`. Use `/unlink` before linking a different account.", 0xffcc00), ephemeral=True)
+        return
+
+    normalized_email = panel_email.strip().lower()
+    panel_user = await ptero.get_required_panel_user(normalized_email)
+    existing_panel_link = fetch_link_by_panel_user(int(panel_user["id"]))
+    if existing_panel_link:
+        await interaction.followup.send(embed=branded_embed("Panel Account Already Linked", f"Panel account `{existing_panel_link['email']}` is already linked to <@{existing_panel_link['discord_user_id']}> (`{existing_panel_link['discord_user_id']}`). Use `/unlink` first if this should be changed.", 0xffcc00), ephemeral=True)
+        return
+
     with db() as connection:
         connection.execute(
             """
             INSERT INTO links(discord_user_id, panel_user_id, email) VALUES (?,?,?)
-            ON CONFLICT(discord_user_id) DO UPDATE SET panel_user_id=excluded.panel_user_id, email=excluded.email
+            ON CONFLICT(discord_user_id) DO NOTHING
             """,
-            (str(user.id), panel_user["id"], panel_email),
+            (str(user.id), panel_user["id"], normalized_email),
         )
-    await interaction.followup.send(embed=branded_embed("User Linked", f"{user.mention} linked to `{panel_email}` / panel user `{panel_user['id']}`."), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("User Linked", f"{user.mention} linked to `{normalized_email}` / panel user `{panel_user['id']}`."), ephemeral=True)
+
+
+@tree.command(name="unlink", description="Admin: unlink a Discord user from their panel account")
+@admin_only()
+async def unlink(interaction: discord.Interaction, user: discord.User) -> None:
+    await interaction.response.defer(ephemeral=True)
+    existing = unlink_discord_user(user.id)
+    if not existing:
+        await interaction.followup.send(embed=branded_embed("No Link Found", f"{user.mention} does not have a linked panel account.", 0xffcc00), ephemeral=True)
+        return
+    await interaction.followup.send(embed=branded_embed("User Unlinked", f"Removed {user.mention}'s link to `{existing['email']}` / panel user `{existing['panel_user_id']}`."), ephemeral=True)
 
 
 admin_group = app_commands.Group(name="admin", description="ZeroX Host admin tools")
@@ -2244,7 +2279,7 @@ def configure_command_visibility() -> None:
     admin_contexts = app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)
     installs = app_commands.AppInstallationType(guild=True, user=True)
     admin_command_names = {
-        "admin", "create-free", "create-paid", "link", "resize", "suspend", "unsuspend", "stopall",
+        "admin", "create-free", "create-paid", "link", "unlink", "resize", "suspend", "unsuspend", "stopall",
         "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew", "delete", "deletesuspended",
     }
 
