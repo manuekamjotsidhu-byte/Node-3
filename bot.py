@@ -2326,9 +2326,9 @@ async def on_ready() -> None:
     guild_id = config.get("guild_id")
     if guild_id:
         guild = discord.Object(id=int(guild_id))
-        tree.clear_commands(guild=guild)
-        cleared_guild_commands = await tree.sync(guild=guild)
-        print(f"Synced {len(global_commands)} global/DM commands and cleared {len(cleared_guild_commands)} guild-only duplicates.")
+        tree.copy_global_to(guild=guild)
+        guild_commands = await tree.sync(guild=guild)
+        print(f"Synced {len(global_commands)} global/DM commands and {len(guild_commands)} guild commands for immediate admin visibility.")
     else:
         print(f"Synced {len(global_commands)} global/DM commands.")
     if not suspend_expired_servers.is_running():

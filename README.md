@@ -30,7 +30,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
-Commands are synced globally once for both guild and DM visibility, and the bot clears old guild-only copies to prevent duplicate slash commands. If old duplicates remain, restart the bot once and wait for Discord global command propagation.
+Commands are synced globally for DM visibility and also to the configured guild for immediate admin command visibility after restarts. If an admin command such as `/unlink` does not appear, restart the bot once so the guild command sync runs immediately instead of waiting for global command propagation.
 
 
 ```bash
@@ -64,7 +64,8 @@ python bot.py
 - `/suspend` and `/unsuspend` - admin-only suspension controls. `/suspend` can suspend a direct server, show a selectable menu by Discord user/email, or bulk suspend all except paid/whitelisted servers.
 - `/stopall` - admin-only stop for all tracked servers except whitelisted servers.
 - `/autobackup-enable` - owner/admin-only automatic backup scheduler using durations like `2d`, `4h`, or `12h`.
-- `/link` - admin-only link of an existing panel email to a Discord user.
+- `/link` - admin-only link of an existing panel email to a Discord user. It refuses to overwrite an existing link and shows the currently linked email; use `/unlink` first to change accounts.
+- `/unlink` - admin-only removal of a Discord user’s linked panel account so the user can be linked again.
 - `/nodes` - admin-only list of Pterodactyl deployment node names and IDs.
 - `/whitelist` - admin-only `add`, `remove`, or `list` command. Its `add` autocomplete only shows unprotected servers, `remove` only shows manually whitelisted servers, and `list` fetches the live `https://gp.zeroxhost.space` panel, labels paid servers as **Paid** and manually protected servers as **Whitelisted**, and automatically removes deleted servers from the whitelist. Purge protection checks server ID, UUID, and identifier.
 - `/purge confirm:True skip_keyword:smp` - admin-only purge for live panel servers; the confirmation scans panel-created and tracked servers, paid tracked servers, whitelist matches by server ID/UUID/identifier, and names starting with the optional prefix such as `smp` or `[smp]` are not deleted.
