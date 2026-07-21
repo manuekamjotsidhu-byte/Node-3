@@ -1133,8 +1133,8 @@ class ManageView(discord.ui.View):
 
 
 class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
-    ram = discord.ui.TextInput(label="RAM MB", placeholder="2048", required=True)
-    disk = discord.ui.TextInput(label="Disk MB", placeholder="10240", required=True)
+    ram = discord.ui.TextInput(label="RAM GB", placeholder="2", required=True)
+    disk = discord.ui.TextInput(label="Disk GB", placeholder="10", required=True)
     cpu = discord.ui.TextInput(label="CPU %", placeholder="100", required=True)
     extras = discord.ui.TextInput(label="DB, Allocations, Backups", placeholder="1,1,1", required=False, default="1,1,1")
 
@@ -1151,18 +1151,20 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
             if len(extras) != 3:
                 raise ValueError
             databases, allocations, backups = extras
-            ram = int(str(self.ram.value).strip())
-            disk = int(str(self.disk.value).strip())
+            ram_gb = int(str(self.ram.value).strip())
+            disk_gb = int(str(self.disk.value).strip())
             cpu = int(str(self.cpu.value).strip())
         except ValueError as error:
-            raise RuntimeError("Use whole numbers for RAM, disk, CPU, and extras in `databases,allocations,backups` format, for example `1,1,1`.") from error
-        if min(ram, disk, cpu) <= 0 or min(databases, allocations, backups) < 0:
-            raise RuntimeError("RAM, disk, and CPU must be positive. Databases, allocations, and backups cannot be negative.")
-        await (await ready_application_client_for(row)).resize_server(self.server_id, ram, disk, cpu, databases, allocations, backups)
+            raise RuntimeError("Use whole numbers for RAM GB, disk GB, CPU, and extras in `databases,allocations,backups` format, for example `1,1,1`.") from error
+        if min(ram_gb, disk_gb, cpu) <= 0 or min(databases, allocations, backups) < 0:
+            raise RuntimeError("RAM GB, disk GB, and CPU must be positive. Databases, allocations, and backups cannot be negative.")
+        ram_mb = ram_gb * 1024
+        disk_mb = disk_gb * 1024
+        await (await ready_application_client_for(row)).resize_server(self.server_id, ram_mb, disk_mb, cpu, databases, allocations, backups)
         if fetch_server(self.server_id):
             with db() as connection:
-                connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram, disk, cpu, databases, allocations, backups, self.server_id))
-        await interaction.followup.send(embed=branded_embed("Server Resized", f"**{record_value(row, 'name', self.server_id)}** is now {ram:,} MB RAM / {disk:,} MB disk / {cpu}% CPU."), ephemeral=True)
+                connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram_mb, disk_mb, cpu, databases, allocations, backups, self.server_id))
+        await interaction.followup.send(embed=branded_embed("Server Resized", f"**{record_value(row, 'name', self.server_id)}** is now {ram_gb:,} GB RAM ({ram_mb:,} MB) / {disk_gb:,} GB disk ({disk_mb:,} MB) / {cpu}% CPU."), ephemeral=True)
 
 
 class SuspendSelect(discord.ui.View):
