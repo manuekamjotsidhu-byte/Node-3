@@ -890,27 +890,17 @@ async def require_client_identifier(row: sqlite3.Row | dict[str, Any]) -> str:
 async def admin_tracked_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     if interaction.guild is None or not is_admin(interaction.user):
         return []
-    rows: list[sqlite3.Row | dict[str, Any]] = list(fetch_all_servers())
-    seen = {str(row["server_id"]) for row in rows}
-    panel_sources = [("panel", ptero)]
-    for plan, panel in panel_sources:
-        try:
-            if not panel.session:
-                await panel.start()
-            panel_servers = panel.server_cache or await asyncio.wait_for(panel.list_servers(), timeout=2.5)
-            for server in panel_servers:
-                server_id = str(server.get("id"))
-                if server_id not in seen:
-                    rows.append(panel_server_record(server, plan))
-                    seen.add(server_id)
-        except Exception as error:
-            print(f"Failed to include {panel_label_for_plan(plan)} panel servers in admin autocomplete quickly: {error}")
+    try:
+        rows = list((await asyncio.wait_for(fetch_live_panel_records(), timeout=3.0)).values())
+    except Exception as error:
+        print(f"Failed to include live panel servers in admin autocomplete quickly: {error}")
+        rows = list(fetch_all_servers())
     return row_server_choices(current, rows)
 
 
 
 
-async def fetch_live_panel_records() -> dict[str, sqlite3.Row | dict[str, Any]]:
+async def fetch_live_panel_records(*, enrich_owner: bool = False) -> dict[str, sqlite3.Row | dict[str, Any]]:
     if not ptero.session:
         await ptero.start()
     panel_servers = await ptero.list_servers()
@@ -920,9 +910,22 @@ async def fetch_live_panel_records() -> dict[str, sqlite3.Row | dict[str, Any]]:
         server_id = str(row["server_id"])
         if server_id in live_ids:
             records[server_id] = row
+    links = fetch_links_by_panel_user()
     for panel_server in panel_servers:
         server_id = str(panel_server.get("id"))
-        records.setdefault(server_id, panel_server_record(panel_server, "panel"))
+        if server_id in records:
+            continue
+        record = panel_server_record(panel_server, "panel")
+        panel_user_id = int(record_value(record, "panel_user_id", 0) or 0)
+        link = links.get(panel_user_id)
+        if enrich_owner:
+            panel_user = await ptero.get_user(panel_user_id) if panel_user_id else None
+            if panel_user and panel_user.get("email"):
+                record["panel_email"] = str(panel_user["email"]).strip().lower()
+            if link:
+                record["discord_user_id"] = str(link["discord_user_id"])
+                record["panel_email"] = str(link["email"]).strip().lower()
+        records[server_id] = record
     return records
 
 
@@ -1014,22 +1017,40 @@ async def refresh_tracked_server(row: sqlite3.Row) -> sqlite3.Row | None:
     return fetch_server(server_id)
 
 
-async def refresh_user_servers(discord_user_id: int) -> list[sqlite3.Row]:
-    refreshed: list[sqlite3.Row] = []
+async def refresh_user_servers(discord_user_id: int) -> list[sqlite3.Row | dict[str, Any]]:
+    refreshed: list[sqlite3.Row | dict[str, Any]] = []
+    seen: set[str] = set()
     for row in fetch_user_servers(discord_user_id):
         live_row = await refresh_tracked_server(row)
         if live_row and str(live_row["discord_user_id"]) == str(discord_user_id):
             refreshed.append(live_row)
+            seen.add(str(live_row["server_id"]))
+    link = fetch_link(discord_user_id)
+    if link:
+        for server_id, record in (await fetch_live_panel_records(enrich_owner=True)).items():
+            if server_id in seen:
+                continue
+            if int(record_value(record, "panel_user_id", 0) or 0) == int(link["panel_user_id"]):
+                refreshed.append(record)
+                seen.add(server_id)
     return refreshed
 
 
-async def refresh_email_servers(email: str) -> list[sqlite3.Row]:
+async def refresh_email_servers(email: str) -> list[sqlite3.Row | dict[str, Any]]:
     normalized_email = email.strip().lower()
-    refreshed: list[sqlite3.Row] = []
+    refreshed: list[sqlite3.Row | dict[str, Any]] = []
+    seen: set[str] = set()
     for row in fetch_servers_by_email(normalized_email):
         live_row = await refresh_tracked_server(row)
         if live_row and str(live_row["panel_email"]).strip().lower() == normalized_email:
             refreshed.append(live_row)
+            seen.add(str(live_row["server_id"]))
+    for server_id, record in (await fetch_live_panel_records(enrich_owner=True)).items():
+        if server_id in seen:
+            continue
+        if str(record_value(record, "panel_email", "")).strip().lower() == normalized_email:
+            refreshed.append(record)
+            seen.add(server_id)
     return refreshed
 
 
@@ -1562,10 +1583,15 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
     for page_number, page in enumerate(pages, start=1):
         embed = branded_embed(title, description)
         for row in page:
-            expires = int(datetime.fromisoformat(row["expires_at"]).timestamp())
+            expires_raw = record_value(row, "expires_at")
+            expires_text = "Panel-created / not tracked"
+            if expires_raw:
+                expires_text = f"<t:{int(datetime.fromisoformat(str(expires_raw)).timestamp())}:R>"
+            owner_id = str(record_value(row, "discord_user_id", "")).strip()
+            owner_text = f"<@{owner_id}>" if owner_id else "Not linked"
             embed.add_field(
-                name=f"#{row['server_id']} • {row['name']}",
-                value=f"**Plan:** {row['plan']}\n**UUID:** `{row['uuid'] or 'unknown'}`\n**Owner:** <@{row['discord_user_id']}>\n**Email:** `{row['panel_email']}`\n**Specs:** {row['ram']:,} MB RAM / {row['disk']:,} MB Disk / {row['cpu']}% CPU\n**Expires:** <t:{expires}:R>",
+                name=f"#{record_value(row, 'server_id')} • {record_value(row, 'name')}",
+                value=f"**Plan:** {record_value(row, 'plan')}\n**UUID:** `{record_value(row, 'uuid') or 'unknown'}`\n**Owner:** {owner_text}\n**Email:** `{record_value(row, 'panel_email')}`\n**Specs:** {int(record_value(row, 'ram', 0)):,} MB RAM / {int(record_value(row, 'disk', 0)):,} MB Disk / {int(record_value(row, 'cpu', 0))}% CPU\n**Expires:** {expires_text}",
                 inline=False,
             )
         embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(rows)} server(s) • Developer: {DEVELOPER}")
