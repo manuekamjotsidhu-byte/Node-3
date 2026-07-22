@@ -908,34 +908,63 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
     return row_server_choices(current, rows)
 
 
+
+
+async def fetch_live_panel_records() -> dict[str, sqlite3.Row | dict[str, Any]]:
+    if not ptero.session:
+        await ptero.start()
+    panel_servers = await ptero.list_servers()
+    live_ids = {str(server.get("id")) for server in panel_servers}
+    records: dict[str, sqlite3.Row | dict[str, Any]] = {}
+    for row in fetch_all_servers():
+        server_id = str(row["server_id"])
+        if server_id in live_ids:
+            records[server_id] = row
+    for panel_server in panel_servers:
+        server_id = str(panel_server.get("id"))
+        records.setdefault(server_id, panel_server_record(panel_server, "panel"))
+    return records
+
+
+def whitelist_choice_name(record: sqlite3.Row | dict[str, Any], protected_ids: set[str]) -> str:
+    identifiers = server_identifiers(record)
+    plan = str(record_value(record, "plan", "panel")).lower()
+    status = "Paid" if plan == "paid" else "Whitelisted" if identifiers & protected_ids else "Not whitelisted"
+    name = clean(str(record_value(record, "name", "unknown")), 70)
+    server_id = record_value(record, "server_id", "unknown")
+    return clean(f"[{status}] {name} • {server_id}", 100)
+
+
 async def whitelist_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     if interaction.guild is None or not is_admin(interaction.user):
         return []
     action = getattr(interaction.namespace, "action", "")
-    action_value = getattr(action, "value", action)
-    action_value = str(action_value or "").lower()
-    rows: list[sqlite3.Row | dict[str, Any]] = list(fetch_all_servers())
-    seen = {str(row["server_id"]) for row in rows}
+    action_value = str(getattr(action, "value", action) or "").lower()
+    if action_value not in {"add", "remove"}:
+        return []
     try:
-        panel_servers = ptero.server_cache or await asyncio.wait_for(ptero.list_servers(), timeout=2.5)
-        for server in panel_servers:
-            server_id = str(server.get("id"))
-            if server_id not in seen:
-                rows.append(panel_server_record(server, "panel"))
-                seen.add(server_id)
+        records = await asyncio.wait_for(fetch_live_panel_records(), timeout=3.0)
     except Exception as error:
-        print(f"Failed to include panel servers in whitelist autocomplete quickly: {error}")
+        print(f"Failed to include live panel servers in whitelist autocomplete quickly: {error}")
+        records = {str(row["server_id"]): row for row in fetch_all_servers()}
     protected = whitelist_values()
-    filtered: list[sqlite3.Row | dict[str, Any]] = []
-    for row in rows:
-        identifiers = server_identifiers(row)
+    lowered = current.lower()
+    choices: list[app_commands.Choice[str]] = []
+    for record in sorted(records.values(), key=lambda row: str(record_value(row, "name", "")).lower()):
+        identifiers = server_identifiers(record)
         is_manual = bool(identifiers & protected)
-        is_paid = str(record_value(row, "plan", "")).lower() == "paid"
-        if action_value == "remove" and is_manual:
-            filtered.append(row)
-        elif action_value == "add" and not is_manual and not is_paid:
-            filtered.append(row)
-    return row_server_choices(current, filtered)
+        is_paid = str(record_value(record, "plan", "")).lower() == "paid"
+        if action_value == "add" and (is_manual or is_paid):
+            continue
+        if action_value == "remove" and not is_manual:
+            continue
+        searchable = f"{record_value(record, 'server_id', '')} {record_value(record, 'name', '')} {record_value(record, 'uuid', '') or ''} {record_value(record, 'identifier', '') or ''}".lower()
+        if lowered not in searchable:
+            continue
+        choices.append(app_commands.Choice(name=whitelist_choice_name(record, protected), value=str(record_value(record, "server_id"))))
+        if len(choices) >= 25:
+            break
+    return choices
 
 
 def parse_duration(value: str) -> int:
@@ -1802,21 +1831,7 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
     await interaction.response.defer(ephemeral=True)
     if action.value == "list":
         protected_ids = whitelist_values()
-        if not ptero.session:
-            await ptero.start()
-        panel_servers = await ptero.list_servers()
-        live_panel_ids = {str(panel_server["id"]) for panel_server in panel_servers}
-        records: dict[str, sqlite3.Row | dict[str, Any]] = {}
-        for row in fetch_all_servers():
-            server_id = str(row["server_id"])
-            if server_id in live_panel_ids:
-                records[server_id] = row
-        for server_id, record in database.get("servers", {}).items():
-            if not record.get("deleted", False) and str(server_id) in live_panel_ids:
-                records.setdefault(str(server_id), record)
-        for panel_server in panel_servers:
-            server_id = str(panel_server["id"])
-            records.setdefault(server_id, panel_server_record(panel_server, "panel"))
+        records = await fetch_live_panel_records()
         active_identifiers = {
             str(record_value(record, field, ""))
             for record in records.values()
@@ -1864,27 +1879,25 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
         return
     if not server:
         raise RuntimeError("Select a server when using the add or remove whitelist action.")
-    tracked_row = fetch_server(server)
-    legacy_record = database.get("servers", {}).get(server)
-    panel_record: dict[str, Any] | None = None
-    if not tracked_row and not legacy_record:
-        try:
-            panel_record = panel_server_record(await ptero.get_server(server), "panel")
-        except RuntimeError:
-            panel_record = None
-    record = tracked_row or legacy_record or panel_record
+    live_records = await fetch_live_panel_records()
+    record = live_records.get(str(server))
+    if not record:
+        raise RuntimeError("That server was not found on the live panel, so it cannot be whitelisted.")
     identifiers = server_identifiers(record, server)
+    protected_ids = whitelist_values()
     whitelist_set = set(str(item) for item in database.setdefault("whitelist", []))
     if action.value == "add":
-        if record and is_server_protected(record):
-            raise RuntimeError("That server is already protected, so it is hidden from whitelist add choices.")
-        whitelist_set.add(server)
+        if str(record_value(record, "plan", "")).lower() == "paid":
+            raise RuntimeError("Paid servers are already protected automatically and do not need manual whitelist entries.")
+        if identifiers & protected_ids:
+            raise RuntimeError("That server is already manually whitelisted, so it is hidden from whitelist add choices.")
+        whitelist_set.add(str(record_value(record, "server_id", server)))
         database["whitelist"] = sorted(whitelist_set, key=str)
         save_database()
         with db() as connection:
-            connection.execute("INSERT OR IGNORE INTO whitelist(server_id) VALUES (?)", (server,))
+            connection.execute("INSERT OR IGNORE INTO whitelist(server_id) VALUES (?)", (str(record_value(record, "server_id", server)),))
     else:
-        if not identifiers & whitelist_values():
+        if not identifiers & protected_ids:
             raise RuntimeError("That server is not manually whitelisted, so it is hidden from whitelist remove choices.")
         remove_whitelist_entries(identifiers)
         save_database()
