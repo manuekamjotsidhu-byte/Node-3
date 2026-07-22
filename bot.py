@@ -2277,7 +2277,10 @@ def configure_command_visibility() -> None:
     """Sync user commands to DMs while keeping admin commands guild-only."""
     user_contexts = app_commands.AppCommandContext(guild=True, dm_channel=True, private_channel=True)
     admin_contexts = app_commands.AppCommandContext(guild=True, dm_channel=False, private_channel=False)
-    installs = app_commands.AppInstallationType(guild=True, user=True)
+    # Keep commands guild-install only. Allowing both guild and user installs can
+    # make Discord show duplicate slash commands when the app is installed both
+    # ways for the same user/server.
+    installs = app_commands.AppInstallationType(guild=True, user=False)
     admin_command_names = {
         "admin", "create-free", "create-paid", "link", "unlink", "resize", "suspend", "unsuspend", "stopall",
         "autobackup-enable", "nodes", "whitelist", "purge", "autosuspend", "server-expirations", "renew", "delete", "deletesuspended",

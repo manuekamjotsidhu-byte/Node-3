@@ -30,7 +30,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
-Commands are synced globally for guild and DM visibility, and the bot clears configured-guild command copies to prevent duplicate slash commands such as duplicate `/unlink` entries. If a new command does not appear immediately after an update, restart the bot once and wait for Discord global command propagation.
+Commands are synced globally for the guild-installed app, user-install command copies are disabled to prevent Discord from showing duplicate slash commands, and the bot clears configured-guild command copies such as duplicate `/unlink` entries. If a new command does not appear immediately after an update, restart the bot once and wait for Discord global command propagation.
 
 
 ```bash
