@@ -1697,7 +1697,9 @@ async def schedule_restart(interaction: discord.Interaction, time: str, server: 
         rows = [row for row in rows if record_value(row, "identifier") and not bool(record_value(row, "suspended", False))]
         with db() as connection:
             for row in rows:
-                connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,1,1)", (str(record_value(row, "server_id")), str(interaction.user.id), seconds, next_run))
+                server_id = str(record_value(row, "server_id"))
+                connection.execute("DELETE FROM scheduled_restarts WHERE server_id=?", (server_id,))
+                connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,1,1)", (server_id, str(interaction.user.id), seconds, next_run))
         node_note = f" on node **{node.split(':', 1)[1] if node and ':' in node else node_id}**" if node_id else ""
         await interaction.followup.send(embed=branded_embed("One-Time Restarts Scheduled", f"Scheduled **{len(rows)}** server(s){node_note} to restart once in **{time}**."), ephemeral=True)
         return
@@ -1708,6 +1710,7 @@ async def schedule_restart(interaction: discord.Interaction, time: str, server: 
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
     with db() as connection:
+        connection.execute("DELETE FROM scheduled_restarts WHERE server_id=?", (server,))
         connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,0,1)", (server, str(interaction.user.id), seconds, next_run))
     await interaction.followup.send(embed=branded_embed("One-Time Restart Scheduled", f"**{record_value(row, 'name', server)}** (`{identifier}`) will restart once in **{time}**."), ephemeral=True)
 
@@ -2344,22 +2347,29 @@ async def run_scheduled_restarts() -> None:
     now = utc_now()
     with db() as connection:
         restarts = connection.execute("SELECT * FROM scheduled_restarts WHERE enabled=1 AND next_run_at <= ?", (now.isoformat(),)).fetchall()
+    processed: set[str] = set()
     for restart in restarts:
+        server_id = str(restart["server_id"])
+        if server_id in processed:
+            with db() as connection:
+                connection.execute("DELETE FROM scheduled_restarts WHERE id=?", (restart["id"],))
+            continue
+        processed.add(server_id)
         try:
-            row: sqlite3.Row | dict[str, Any] | None = fetch_server(restart["server_id"])
+            row: sqlite3.Row | dict[str, Any] | None = fetch_server(server_id)
             if not row:
                 try:
-                    row = panel_server_record(await ptero.get_server(str(restart["server_id"])), "panel")
+                    row = panel_server_record(await ptero.get_server(server_id), "panel")
                 except RuntimeError:
                     row = None
             if not row or not record_value(row, "identifier") or bool(record_value(row, "deleted", False)) or bool(record_value(row, "suspended", False)):
                 continue
             await (await ready_client_api_for(row)).power(str(record_value(row, "identifier")), "restart")
         except Exception as error:
-            print(f"Failed one-time scheduled restart for {restart['server_id']}: {error}")
+            print(f"Failed one-time scheduled restart for {server_id}: {error}")
         finally:
             with db() as connection:
-                connection.execute("DELETE FROM scheduled_restarts WHERE id=?", (restart["id"],))
+                connection.execute("DELETE FROM scheduled_restarts WHERE server_id=?", (server_id,))
 
 
 @tasks.loop(minutes=1)
