@@ -851,6 +851,10 @@ def panel_server_record(server: dict[str, Any], plan: str = "panel") -> dict[str
         "ram": int(limits.get("memory") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
+        "node_id": int(server.get("node") or server.get("node_id") or 0),
+        "node_name": f"Node {server.get('node') or server.get('node_id') or 'unknown'}",
+        "nest_id": int(server.get("nest") or server.get("nest_id") or 0),
+        "egg_id": int(server.get("egg") or server.get("egg_id") or 0),
         "expires_at": None,
         "deleted": 0,
     }
@@ -1676,29 +1680,36 @@ async def rename(interaction: discord.Interaction, server: str, new_name: str) -
     await interaction.followup.send(embed=branded_embed("Server Renamed", f"`{record_value(row, 'name', server)}` is now **{new_name}**."), ephemeral=True)
 
 
-@tree.command(name="schedule-restart", description="Schedule restarts")
-@app_commands.autocomplete(server=accessible_server_autocomplete)
-async def schedule_restart(interaction: discord.Interaction, time: str, server: str | None = None, all_servers: bool = False) -> None:
+@tree.command(name="schedule-restart", description="Schedule one-time delayed restart")
+@app_commands.autocomplete(server=accessible_server_autocomplete, node=node_autocomplete)
+@app_commands.describe(time="Delay before the one-time restart, like 5m, 12h, or 1d", node="Admin-only with all_servers: restart only servers on this node")
+async def schedule_restart(interaction: discord.Interaction, time: str, server: str | None = None, all_servers: bool = False, node: str | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
     seconds = parse_duration(time)
     next_run = (utc_now() + timedelta(seconds=seconds)).isoformat()
     if all_servers:
         if interaction.guild is None or not is_admin(interaction.user):
             raise RuntimeError("Scheduling restarts for all servers is admin-only and cannot be used in DMs.")
-        rows = fetch_all_servers()
+        node_id = parse_id(node) if node else None
+        rows = list((await fetch_live_panel_records()).values())
+        if node_id:
+            rows = [row for row in rows if int(record_value(row, "node_id", 0) or 0) == node_id]
+        rows = [row for row in rows if record_value(row, "identifier") and not bool(record_value(row, "suspended", False))]
         with db() as connection:
             for row in rows:
-                connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,1,1)", (row["server_id"], str(interaction.user.id), seconds, next_run))
-        await interaction.followup.send(embed=branded_embed("All Server Restarts Scheduled", f"Scheduled **{len(rows)}** tracked server(s) to restart every **{time}**."), ephemeral=True)
+                connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,1,1)", (str(record_value(row, "server_id")), str(interaction.user.id), seconds, next_run))
+        node_note = f" on node **{node.split(':', 1)[1] if node and ':' in node else node_id}**" if node_id else ""
+        await interaction.followup.send(embed=branded_embed("One-Time Restarts Scheduled", f"Scheduled **{len(rows)}** server(s){node_note} to restart once in **{time}**."), ephemeral=True)
         return
+    if node:
+        raise RuntimeError("The node option is only used with all_servers:True.")
     if not server:
         raise RuntimeError("Select one server, or admins can set all_servers:True inside the Discord server.")
     row = await admin_or_owner_server(interaction, server)
-    if not fetch_server(server):
-        raise RuntimeError("Scheduled restarts require a locally tracked server. Use `/create-free`, `/create-paid`, or renew/link tracking first.")
+    identifier = await require_client_identifier(row)
     with db() as connection:
         connection.execute("INSERT INTO scheduled_restarts(server_id, discord_user_id, interval_seconds, next_run_at, all_servers, enabled) VALUES (?,?,?,?,0,1)", (server, str(interaction.user.id), seconds, next_run))
-    await interaction.followup.send(embed=branded_embed("Restart Scheduled", f"**{record_value(row, 'name', server)}** will restart every **{time}**."), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("One-Time Restart Scheduled", f"**{record_value(row, 'name', server)}** (`{identifier}`) will restart once in **{time}**."), ephemeral=True)
 
 
 @tree.command(name="renew", description="Admin renew server")
@@ -2334,15 +2345,21 @@ async def run_scheduled_restarts() -> None:
     with db() as connection:
         restarts = connection.execute("SELECT * FROM scheduled_restarts WHERE enabled=1 AND next_run_at <= ?", (now.isoformat(),)).fetchall()
     for restart in restarts:
-        row = fetch_server(restart["server_id"])
-        if not row or not row["identifier"] or row["deleted"] or row["suspended"]:
-            continue
         try:
-            await (await ready_client_api_for(row)).power(row["identifier"], "restart")
+            row: sqlite3.Row | dict[str, Any] | None = fetch_server(restart["server_id"])
+            if not row:
+                try:
+                    row = panel_server_record(await ptero.get_server(str(restart["server_id"])), "panel")
+                except RuntimeError:
+                    row = None
+            if not row or not record_value(row, "identifier") or bool(record_value(row, "deleted", False)) or bool(record_value(row, "suspended", False)):
+                continue
+            await (await ready_client_api_for(row)).power(str(record_value(row, "identifier")), "restart")
         except Exception as error:
-            print(f"Failed to scheduled-restart {restart['server_id']}: {error}")
-        with db() as connection:
-            connection.execute("UPDATE scheduled_restarts SET next_run_at=? WHERE id=?", ((now + timedelta(seconds=restart["interval_seconds"])).isoformat(), restart["id"]))
+            print(f"Failed one-time scheduled restart for {restart['server_id']}: {error}")
+        finally:
+            with db() as connection:
+                connection.execute("DELETE FROM scheduled_restarts WHERE id=?", (restart["id"],))
 
 
 @tasks.loop(minutes=1)
