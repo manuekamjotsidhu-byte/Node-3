@@ -941,6 +941,41 @@ def whitelist_choice_name(record: sqlite3.Row | dict[str, Any], protected_ids: s
     return clean(f"[{status}] {name} • {server_id}", 100)
 
 
+
+
+def whitelist_candidate_records(records: dict[str, sqlite3.Row | dict[str, Any]], action_value: str) -> list[sqlite3.Row | dict[str, Any]]:
+    protected = whitelist_values()
+    candidates: list[sqlite3.Row | dict[str, Any]] = []
+    for record in records.values():
+        identifiers = server_identifiers(record)
+        is_manual = bool(identifiers & protected)
+        is_paid = str(record_value(record, "plan", "")).lower() == "paid"
+        if action_value == "add" and not is_manual and not is_paid:
+            candidates.append(record)
+        elif action_value == "remove" and is_manual:
+            candidates.append(record)
+    return sorted(candidates, key=lambda row: str(record_value(row, "name", "")).lower())
+
+
+def whitelist_candidate_embeds(action_value: str, candidates: list[sqlite3.Row | dict[str, Any]]) -> list[discord.Embed]:
+    title = "Whitelist Add Candidates" if action_value == "add" else "Whitelist Remove Candidates"
+    description = "Unwhitelisted, non-paid live panel servers eligible for `/whitelist add`." if action_value == "add" else "Manually whitelisted live panel servers eligible for `/whitelist remove`."
+    embeds: list[discord.Embed] = []
+    pages = chunked(candidates, 10)
+    for page_number, page in enumerate(pages, start=1):
+        embed = branded_embed(title, description)
+        for record in page:
+            server_id = str(record_value(record, "server_id", "unknown"))
+            name = clean(str(record_value(record, "name", server_id)), 80)
+            uuid = record_value(record, "uuid") or "unknown"
+            identifier = record_value(record, "identifier") or "unknown"
+            panel_label = panel_label_for_plan(str(record_value(record, "plan", "panel")))
+            embed.add_field(name=f"{name} (`{server_id}`)", value=f"Panel: **{panel_label}**\nUUID: `{uuid}`\nIdentifier: `{identifier}`", inline=False)
+        embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(candidates)} candidate server(s) • Developer: {DEVELOPER}")
+        embeds.append(embed)
+    return embeds
+
+
 async def whitelist_server_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     if interaction.guild is None or not is_admin(interaction.user):
         return []
@@ -959,14 +994,7 @@ async def whitelist_server_autocomplete(interaction: discord.Interaction, curren
     protected = whitelist_values()
     lowered = current.lower()
     choices: list[app_commands.Choice[str]] = []
-    for record in sorted(records.values(), key=lambda row: str(record_value(row, "name", "")).lower()):
-        identifiers = server_identifiers(record)
-        is_manual = bool(identifiers & protected)
-        is_paid = str(record_value(record, "plan", "")).lower() == "paid"
-        if action_value == "add" and (is_manual or is_paid):
-            continue
-        if action_value == "remove" and not is_manual:
-            continue
+    for record in whitelist_candidate_records(records, action_value):
         searchable = f"{record_value(record, 'server_id', '')} {record_value(record, 'name', '')} {record_value(record, 'uuid', '') or ''} {record_value(record, 'identifier', '') or ''}".lower()
         if lowered not in searchable:
             continue
@@ -1911,9 +1939,19 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
         else:
             await interaction.followup.send(embed=embeds[0], ephemeral=True)
         return
-    if not server:
-        raise RuntimeError("Select a server when using the add or remove whitelist action.")
     live_records = await fetch_live_panel_records()
+    if not server:
+        candidates = whitelist_candidate_records(live_records, action.value)
+        if not candidates:
+            message = "No unwhitelisted, non-paid live panel servers found." if action.value == "add" else "No manually whitelisted live panel servers found."
+            await interaction.followup.send(embed=branded_embed("No Whitelist Candidates", message, 0xffcc00), ephemeral=True)
+            return
+        embeds = whitelist_candidate_embeds(action.value, candidates)
+        if len(embeds) > 1:
+            await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embeds[0], ephemeral=True)
+        return
     record = live_records.get(str(server))
     if not record:
         raise RuntimeError("That server was not found on the live panel, so it cannot be whitelisted.")
