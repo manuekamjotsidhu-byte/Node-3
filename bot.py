@@ -900,10 +900,10 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
 
 
 
-async def fetch_live_panel_records(*, enrich_owner: bool = False) -> dict[str, sqlite3.Row | dict[str, Any]]:
+async def fetch_live_panel_records(*, enrich_owner: bool = False, use_cache: bool = False) -> dict[str, sqlite3.Row | dict[str, Any]]:
     if not ptero.session:
         await ptero.start()
-    panel_servers = await ptero.list_servers()
+    panel_servers = ptero.server_cache if use_cache and ptero.server_cache else await ptero.list_servers()
     live_ids = {str(server.get("id")) for server in panel_servers}
     records: dict[str, sqlite3.Row | dict[str, Any]] = {}
     for row in fetch_all_servers():
@@ -942,11 +942,11 @@ async def whitelist_server_autocomplete(interaction: discord.Interaction, curren
     if interaction.guild is None or not is_admin(interaction.user):
         return []
     action = getattr(interaction.namespace, "action", "")
-    action_value = str(getattr(action, "value", action) or "").lower()
+    action_value = str(getattr(action, "value", action) or "add").lower()
     if action_value not in {"add", "remove"}:
-        return []
+        action_value = "add"
     try:
-        records = await asyncio.wait_for(fetch_live_panel_records(), timeout=3.0)
+        records = await asyncio.wait_for(fetch_live_panel_records(use_cache=True), timeout=3.0)
     except Exception as error:
         print(f"Failed to include live panel servers in whitelist autocomplete quickly: {error}")
         records = {str(row["server_id"]): row for row in fetch_all_servers()}
@@ -1877,23 +1877,20 @@ async def whitelist(interaction: discord.Interaction, action: app_commands.Choic
                 if record_value(record, field, "")
             }
             plan = str(record_value(record, "plan", "")).lower()
-            is_paid = plan == "paid"
             is_manual = bool(record_identifiers & protected_ids)
-            if not is_paid and not is_manual:
+            if not is_manual:
                 continue
             server_id = str(record_value(record, "server_id", key.split(":", 1)[-1]))
             name = clean(str(record_value(record, "name", server_id)), 80)
             panel_label = panel_label_for_plan(plan)
-            category = "Paid" if is_paid else "Whitelisted"
-            protection = "automatic paid protection" if is_paid else "manual whitelist"
-            entries.append((category, f"**{name}** (`{server_id}`)\nPanel: **{panel_label}** • Source: **{protection}**"))
+            entries.append(("Whitelisted", f"**{name}** (`{server_id}`)\nPanel: **{panel_label}** • Source: **manual whitelist**"))
         if not entries:
-            await interaction.followup.send(embed=branded_embed("Whitelisted Servers", "No paid or manually whitelisted servers found."), ephemeral=True)
+            await interaction.followup.send(embed=branded_embed("Whitelisted Servers", "No manually whitelisted servers found."), ephemeral=True)
             return
         embeds: list[discord.Embed] = []
         pages = chunked(entries, 10)
         for page_number, page in enumerate(pages, start=1):
-            embed = branded_embed("Whitelisted Servers", "Paid servers are included automatically and are protected alongside manually whitelisted servers.")
+            embed = branded_embed("Whitelisted Servers", "Only manually whitelisted servers are shown here. Paid servers remain protected automatically but are not listed here.")
             for category, label in page:
                 embed.add_field(name=category, value=label, inline=False)
             embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(entries)} protected servers • Developer: {DEVELOPER}")
