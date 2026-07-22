@@ -893,8 +893,11 @@ async def admin_tracked_server_autocomplete(interaction: discord.Interaction, cu
     try:
         rows = list((await asyncio.wait_for(fetch_live_panel_records(), timeout=3.0)).values())
     except Exception as error:
-        print(f"Failed to include live panel servers in admin autocomplete quickly: {error}")
-        rows = list(fetch_all_servers())
+        print(f"Failed to include fresh live panel servers in admin autocomplete quickly: {error}")
+        try:
+            rows = list((await fetch_live_panel_records(use_cache=True)).values())
+        except Exception:
+            rows = list(fetch_all_servers())
     return row_server_choices(current, rows)
 
 
@@ -946,10 +949,13 @@ async def whitelist_server_autocomplete(interaction: discord.Interaction, curren
     if action_value not in {"add", "remove"}:
         action_value = "add"
     try:
-        records = await asyncio.wait_for(fetch_live_panel_records(use_cache=True), timeout=3.0)
+        records = await asyncio.wait_for(fetch_live_panel_records(), timeout=3.0)
     except Exception as error:
-        print(f"Failed to include live panel servers in whitelist autocomplete quickly: {error}")
-        records = {str(row["server_id"]): row for row in fetch_all_servers()}
+        print(f"Failed to include fresh live panel servers in whitelist autocomplete quickly: {error}")
+        try:
+            records = await fetch_live_panel_records(use_cache=True)
+        except Exception:
+            records = {str(row["server_id"]): row for row in fetch_all_servers()}
     protected = whitelist_values()
     lowered = current.lower()
     choices: list[app_commands.Choice[str]] = []
@@ -1571,9 +1577,14 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
         title = "Servers For Email"
         description = f"Tracked servers linked to panel email `{clean(normalized_email, 120)}`."
     else:
-        rows = await refresh_user_servers(interaction.user.id)
-        title = "Your Servers"
-        description = "Only your own linked/tracked servers are shown here."
+        if command_allows_admin_access(interaction):
+            rows = list((await fetch_live_panel_records(enrich_owner=True)).values())
+            title = "All Servers"
+            description = "All live panel servers are shown here, including panel-created servers that are not tracked locally."
+        else:
+            rows = await refresh_user_servers(interaction.user.id)
+            title = "Your Servers"
+            description = "Only your own linked/tracked servers are shown here."
 
     if not rows:
         await interaction.followup.send(embed=branded_embed(title, "No servers found."), ephemeral=admin_filter_requested)
@@ -2108,12 +2119,18 @@ async def deletesuspended(interaction: discord.Interaction, plan: app_commands.C
 async def server_expirations(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     rows = []
-    for record in fetch_all_servers():
-        expires = int(datetime.fromisoformat(record["expires_at"]).timestamp())
-        flag = "⭐ whitelisted" if is_whitelisted(record["server_id"]) else record["plan"]
-        auto = "autosuspend:on" if record["autosuspend_enabled"] else "autosuspend:off"
-        rows.append(f"`{record['server_id']}` • **{record['name']}** • {flag} • {auto} • <t:{expires}:R>")
-    await interaction.followup.send(embed=branded_embed("Tracked Expirations", "\n".join(rows[:25]) or "No tracked servers."), ephemeral=True)
+    for record in (await fetch_live_panel_records(enrich_owner=True)).values():
+        server_id = str(record_value(record, "server_id", ""))
+        stored_expiry = record_value(record, "expires_at")
+        expiry_text = "panel-created / not tracked"
+        if stored_expiry:
+            expires = int(datetime.fromisoformat(str(stored_expiry)).timestamp())
+            expiry_text = f"<t:{expires}:R>"
+        flag = "⭐ whitelisted" if server_identifiers(record) & whitelist_values() else record_value(record, "plan", "panel")
+        auto_value = record_value(record, "autosuspend_enabled")
+        auto = "autosuspend:unknown" if auto_value is None else "autosuspend:on" if bool(auto_value) else "autosuspend:off"
+        rows.append(f"`{server_id}` • **{record_value(record, 'name', server_id)}** • {flag} • {auto} • {expiry_text}")
+    await interaction.followup.send(embed=branded_embed("Server Expirations", "\n".join(rows[:25]) or "No live panel servers."), ephemeral=True)
 
 
 def expiration_warning_lead(notification_type: str | None) -> str:
