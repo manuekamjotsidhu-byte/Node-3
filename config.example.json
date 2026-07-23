@@ -2,7 +2,7 @@
   "discord_token": "YOUR_DISCORD_BOT_TOKEN",
   "guild_id": "YOUR_DISCORD_GUILD_ID",
   "owner_ids": [
-    "YOUR_DISCORD_USER_ID_FOR_DM_ADMIN_ACCESS"
+    "YOUR_DISCORD_OWNER_USER_ID"
   ],
   "admin_role_ids": [
     "1504092228778459226"

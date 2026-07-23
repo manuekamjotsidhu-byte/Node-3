@@ -38,7 +38,7 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.json config.json
-# Fill owner_ids with real Discord user IDs for DM admin access.
+# Fill owner_ids with real Discord owner/admin user IDs.
 python bot.py
 ```
 
