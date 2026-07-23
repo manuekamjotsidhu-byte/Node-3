@@ -20,6 +20,7 @@ PAID_LOG_CHANNEL_ID = 1504092779700289536
 ADMIN_ROLE_ID = 1504092228778459226
 OWNER_ROLE_ID = 1504092176492265553
 PANEL_URL = "https://gp.zeroxhost.space"
+DEFAULT_NODE_STATUS_WEBHOOK_URL = "https://discord.com/api/webhooks/1529670294250328164/IphtUOnIeUURVI1tJSVlHek12qCegKHJZ5k8Gy96J7GLTOFIb_IDggK2WWnfRP6MBGOT"
 
 
 def utc_now() -> datetime:
@@ -149,6 +150,12 @@ def init_db() -> None:
             notification_type TEXT NOT NULL,
             sent_at TEXT NOT NULL,
             PRIMARY KEY (server_id, notification_type)
+        );
+        CREATE TABLE IF NOT EXISTS node_status (
+            node_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
@@ -291,6 +298,31 @@ def unlink_discord_user(discord_user_id: int) -> sqlite3.Row | None:
         with db() as connection:
             connection.execute("DELETE FROM links WHERE discord_user_id = ?", (str(discord_user_id),))
     return existing
+
+
+
+
+def fetch_node_status(node_id: str) -> sqlite3.Row | None:
+    with db() as connection:
+        return connection.execute("SELECT * FROM node_status WHERE node_id=?", (str(node_id),)).fetchone()
+
+
+def upsert_node_status(node_id: str, state: str, summary: str) -> None:
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT INTO node_status(node_id, state, summary, updated_at) VALUES (?,?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET state=excluded.state, summary=excluded.summary, updated_at=excluded.updated_at
+            """,
+            (str(node_id), state, summary, utc_now().isoformat()),
+        )
+
+
+def node_status_webhook_url() -> str | None:
+    value = str(config.get("node_status_webhook_url") or DEFAULT_NODE_STATUS_WEBHOOK_URL or "").strip()
+    if value.lower() in {"", "none", "null", "false", "0"}:
+        return None
+    return value
 
 
 def notification_sent(server_id: str, notification_type: str) -> bool:
@@ -1952,6 +1984,58 @@ def node_dashboard_field(node: dict[str, Any], records: list[sqlite3.Row | dict[
     return f"{state.split(' ', 1)[0]} {node.get('name', f'Node {node_id}')} (`{node_id}`)", value
 
 
+
+
+def node_health_summary(node: dict[str, Any], records: list[sqlite3.Row | dict[str, Any]]) -> tuple[str, str, int, float, float]:
+    node_id = int(node.get("id") or 0)
+    node_records = [record for record in records if int(record_value(record, "node_id", 0) or 0) == node_id]
+    memory_total = node_capacity_value(node, "memory", "memory_limit")
+    disk_total = node_capacity_value(node, "disk", "disk_limit")
+    memory_used = sum(int(record_value(record, "ram", 0) or 0) for record in node_records)
+    disk_used = sum(int(record_value(record, "disk", 0) or 0) for record in node_records)
+    memory_pct = (memory_used / memory_total * 100) if memory_total else 0
+    disk_pct = (disk_used / disk_total * 100) if disk_total else 0
+    statuses = [server_status_label(record) for record in node_records]
+    crashing = sum(1 for status in statuses if any(word in status for word in ("crash", "error", "failed", "offline")))
+    maintenance = bool(node.get("maintenance_mode") or node.get("maintenance"))
+    overloaded = memory_pct >= 90 or disk_pct >= 90
+    state = "maintenance" if maintenance else "warning" if overloaded or crashing else "online"
+    summary = f"servers={len(node_records)} memory={memory_pct:.1f}% disk={disk_pct:.1f}% crashing={crashing}"
+    return state, summary, len(node_records), memory_pct, disk_pct
+
+
+async def send_node_status_webhook(node: dict[str, Any], previous_state: str | None, state: str, summary: str, server_count: int, memory_pct: float, disk_pct: float) -> None:
+    webhook_url = node_status_webhook_url()
+    if not webhook_url:
+        return
+    node_id = str(node.get("id", "unknown"))
+    node_name = str(node.get("name", f"Node {node_id}"))
+    color = 0x2ecc71 if state == "online" else 0xf1c40f if state == "maintenance" else 0xe74c3c
+    emoji = "🟢" if state == "online" else "🟡" if state == "maintenance" else "🔴"
+    transition = f"{previous_state or 'new'} → {state}"
+    payload = {
+        "username": f"{BRAND} Node Watch",
+        "embeds": [{
+            "title": f"{emoji} Node Status Changed",
+            "description": f"**{node_name}** (`{node_id}`) is now **{state.upper()}**",
+            "color": color,
+            "fields": [
+                {"name": "Transition", "value": transition, "inline": True},
+                {"name": "Live servers", "value": str(server_count), "inline": True},
+                {"name": "Load", "value": f"Memory **{memory_pct:.1f}%** • Disk **{disk_pct:.1f}%**", "inline": False},
+                {"name": "Summary", "value": summary, "inline": False},
+            ],
+            "footer": {"text": f"{BRAND} • Developer: {DEVELOPER}"},
+            "timestamp": utc_now().isoformat(),
+        }],
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(webhook_url, json=payload) as response:
+            if response.status >= 400:
+                text = await response.text()
+                print(f"Node status webhook failed for node {node_id}: HTTP {response.status} {text[:300]}")
+
+
 @tree.command(name="nodes", description="Show live node status")
 @admin_only()
 async def nodes(interaction: discord.Interaction) -> None:
@@ -2417,6 +2501,31 @@ async def suspend_expired_servers() -> None:
             print(f"Failed lifecycle processing for server {server_id}: {error}")
 
 
+
+
+@tasks.loop(minutes=1)
+async def monitor_node_status() -> None:
+    try:
+        panel_nodes = await ptero.list_nodes()
+        records = list((await fetch_live_panel_records()).values())
+    except Exception as error:
+        print(f"Failed to monitor node status: {error}")
+        return
+    for node in panel_nodes:
+        node_id = str(node.get("id"))
+        state, summary, server_count, memory_pct, disk_pct = node_health_summary(node, records)
+        previous = fetch_node_status(node_id)
+        previous_state = str(previous["state"]) if previous else None
+        previous_summary = str(previous["summary"]) if previous else None
+        changed = previous is not None and (previous_state != state or (state == "warning" and previous_summary != summary))
+        if changed:
+            try:
+                await send_node_status_webhook(node, previous_state, state, summary, server_count, memory_pct, disk_pct)
+            except Exception as error:
+                print(f"Failed to send node status webhook for node {node_id}: {error}")
+        upsert_node_status(node_id, state, summary)
+
+
 @tasks.loop(minutes=1)
 async def run_scheduled_restarts() -> None:
     now = utc_now()
@@ -2535,6 +2644,8 @@ async def on_ready() -> None:
         run_scheduled_restarts.start()
     if not sync_panel_activity.is_running():
         sync_panel_activity.start()
+    if not monitor_node_status.is_running():
+        monitor_node_status.start()
     print(f"{BRAND} bot online as {client.user} | Developer: {DEVELOPER}")
 
 

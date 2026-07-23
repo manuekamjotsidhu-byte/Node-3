@@ -1,13 +1,18 @@
 {
   "discord_token": "YOUR_DISCORD_BOT_TOKEN",
   "guild_id": "YOUR_DISCORD_GUILD_ID",
-  "owner_ids": ["YOUR_DISCORD_USER_ID_FOR_DM_ADMIN_ACCESS"],
-  "admin_role_ids": ["1504092228778459226"],
+  "owner_ids": [
+    "YOUR_DISCORD_USER_ID_FOR_DM_ADMIN_ACCESS"
+  ],
+  "admin_role_ids": [
+    "1504092228778459226"
+  ],
   "panel_url": "https://gp.zeroxhost.space",
   "panel_api_key": "ptla_YOUR_PTERODACTYL_APPLICATION_API_KEY",
   "client_api_key": "ptlc_YOUR_PTERODACTYL_CLIENT_API_KEY_WITH_SERVER_ACCESS",
   "paid_log_channel_id": "1504092779700289536",
   "saga_auto_suspend_enabled": true,
   "saga_auto_suspend_field": "suspended_at",
-  "brand_icon_url": null
+  "brand_icon_url": null,
+  "node_status_webhook_url": "https://discord.com/api/webhooks/1529670294250328164/IphtUOnIeUURVI1tJSVlHek12qCegKHJZ5k8Gy96J7GLTOFIb_IDggK2WWnfRP6MBGOT"
 }
