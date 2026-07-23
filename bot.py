@@ -790,6 +790,14 @@ async def send_plan_log(plan: str, embed: discord.Embed) -> bool:
         return False
 
 
+async def send_server_event_log(record: sqlite3.Row | dict[str, Any], title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> bool:
+    """Send server lifecycle/admin logs to the channel that matches the server plan."""
+    actor_line = f"\nAdmin: {actor.mention} (`{actor.id}`)" if actor else ""
+    plan = str(record_value(record, "plan", "free")).strip().lower()
+    embed = branded_embed(f"Admin Log: {title}", f"{description}{actor_line}", color)
+    return await send_plan_log(plan, embed)
+
+
 async def send_admin_audit(title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> None:
     channel_id_value = config.get("admin_log_channel_id") or config.get("paid_log_channel_id", ADMIN_LOG_CHANNEL_ID)
     if not channel_id_value:
@@ -1433,7 +1441,7 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
             with db() as connection:
                 connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram_mb, disk_mb, cpu, databases, allocations, backups, self.server_id))
         await interaction.followup.send(embed=branded_embed("Server Resized", f"**{record_value(row, 'name', self.server_id)}** is now {ram_gb:,} GB RAM ({ram_mb:,} MB) / {disk_gb:,} GB disk ({disk_mb:,} MB) / {cpu}% CPU."), ephemeral=True)
-        await send_admin_audit("Server Resized", f"**{record_value(row, 'name', self.server_id)}** (`{self.server_id}`) resized to {ram_gb:,} GB RAM / {disk_gb:,} GB disk / {cpu}% CPU.", actor=interaction.user, color=0x3498db)
+        await send_server_event_log(row, "Server Resized", f"**{record_value(row, 'name', self.server_id)}** (`{self.server_id}`) resized to {ram_gb:,} GB RAM / {disk_gb:,} GB disk / {cpu}% CPU.", actor=interaction.user, color=0x3498db)
 
 
 class SuspendSelect(discord.ui.View):
@@ -1543,8 +1551,6 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     created.add_field(name="Expiration", value=f"<t:{int(expires_at.timestamp())}:F>\n<t:{int(expires_at.timestamp())}:R>", inline=True)
     created.add_field(name="Saga Auto Suspension", value="Synced to panel" if saga_synced else "Bot DB only / panel sync unavailable", inline=True)
     await interaction.followup.send(embed=created, ephemeral=True)
-    await send_admin_audit("Server Created", f"Plan: **{plan}**\nServer: **{name}** (`{server_id}`)\nOwner: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nNode: **{node_name}**\nExpires: <t:{int(expires_at.timestamp())}:F>", actor=interaction.user, color=0x2ecc71)
-
     plan_title = "Paid" if plan == "paid" else "Free"
     log_embed = branded_embed(
         f"{plan_title} Server Created",
@@ -1999,7 +2005,7 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
                 warning_note = "Sent " + ", ".join(expiration_warning_lead(notification_type) for notification_type in sent_warnings) + " renewal warning(s)"
     tracking_note = "Local DB updated" if tracked_row else "Panel/Saga updated only (server is not locally tracked)"
     await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
-    await send_admin_audit("Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
+    await send_server_event_log(row, "Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
 
 
 @tree.command(name="delete", description="Admin delete one server")
@@ -2016,7 +2022,7 @@ async def delete(interaction: discord.Interaction, server: str, confirm: bool = 
     await (await ready_application_client_for(row)).delete_server(server)
     mark_server_deleted(server)
     await interaction.followup.send(embed=branded_embed("Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", 0xe74c3c), ephemeral=True)
-    await send_admin_audit("Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe74c3c)
+    await send_server_event_log(row, "Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe74c3c)
 
 
 @tree.command(name="power", description="Power server")
@@ -2096,7 +2102,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
         with db() as connection:
             connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
         await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended **{record_value(row, 'name', server)}**."), ephemeral=True)
-        await send_admin_audit("Server Suspended", f"Suspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe67e22)
+        await send_server_event_log(row, "Server Suspended", f"Suspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe67e22)
         return
 
     rows = fetch_user_servers(user.id) if user else fetch_servers_by_email(email) if email else []
@@ -2116,7 +2122,7 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     with db() as connection:
         connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
     await interaction.followup.send(embed=branded_embed("Server Unsuspended", f"Unsuspended server `{server}`."), ephemeral=True)
-    await send_admin_audit("Server Unsuspended", f"Unsuspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0x2ecc71)
+    await send_server_event_log(row, "Server Unsuspended", f"Unsuspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0x2ecc71)
 
 
 @tree.command(name="stopall", description="Stop all except whitelist")
