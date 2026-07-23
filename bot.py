@@ -160,6 +160,17 @@ def init_db() -> None:
             updated_at TEXT NOT NULL,
             down_since TEXT
         );
+        CREATE TABLE IF NOT EXISTS premium_bills (
+            bill_id TEXT PRIMARY KEY,
+            discord_user_id TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            next_invoice_at TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            total REAL NOT NULL,
+            warn_7d_sent INTEGER NOT NULL DEFAULT 0,
+            warn_1d_sent INTEGER NOT NULL DEFAULT 0
+        );
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
@@ -345,6 +356,47 @@ def clear_server_notifications(server_id: str) -> None:
     with db() as connection:
         connection.execute("DELETE FROM server_notifications WHERE server_id=?", (server_id,))
 
+
+def save_premium_bill_record(record: dict[str, Any]) -> None:
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO premium_bills (bill_id, discord_user_id, plan, created_at, next_invoice_at, currency, total, warn_7d_sent, warn_1d_sent)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                record["bill_id"],
+                record["discord_user_id"],
+                record["plan"],
+                record["created_at"],
+                record["next_invoice_at"],
+                record["currency"],
+                record["total"],
+                int(record.get("warn_7d_sent", False)),
+                int(record.get("warn_1d_sent", False)),
+            ),
+        )
+
+
+def fetch_due_vps_bill_warnings(now: datetime) -> list[sqlite3.Row]:
+    with db() as connection:
+        return connection.execute(
+            """
+            SELECT * FROM premium_bills
+            WHERE LOWER(plan) = 'vps'
+              AND ((warn_7d_sent = 0 AND next_invoice_at <= ?)
+                OR (warn_1d_sent = 0 AND next_invoice_at <= ?))
+            ORDER BY next_invoice_at ASC
+            """,
+            ((now + timedelta(days=7)).isoformat(), (now + timedelta(days=1)).isoformat()),
+        ).fetchall()
+
+
+def mark_premium_bill_warning_sent(bill_id: str, column: str) -> None:
+    if column not in {"warn_7d_sent", "warn_1d_sent"}:
+        raise ValueError("Invalid bill warning column.")
+    with db() as connection:
+        connection.execute(f"UPDATE premium_bills SET {column}=1 WHERE bill_id=?", (bill_id,))
 
 
 
@@ -869,6 +921,11 @@ def premium_bill_embed(
     currency: str,
     notes: str | None,
     bill_id: str,
+    created_at: datetime,
+    next_invoice_at: datetime,
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
 ) -> discord.Embed:
     discount_amount = price * (discount_percentage / 100)
     taxable_subtotal = max(price - discount_amount + other_charges, 0)
@@ -882,6 +939,8 @@ def premium_bill_embed(
     embed.add_field(name="🧾 Bill ID", value=f"`{bill_id}`", inline=True)
     embed.add_field(name="👤 Customer", value=f"{user.mention}\n`{user.id}`", inline=True)
     embed.add_field(name="📦 Plan", value=plan.title(), inline=True)
+    embed.add_field(name="📅 Creation Date", value=f"<t:{int(created_at.timestamp())}:F>", inline=True)
+    embed.add_field(name="🗓️ Next Invoice Date", value=f"<t:{int(next_invoice_at.timestamp())}:F>\n<t:{int(next_invoice_at.timestamp())}:R>", inline=True)
     embed.add_field(name="⚙️ Specifications", value=clean(specifications, 1000) or "Not specified", inline=False)
     embed.add_field(
         name="💰 Price Summary",
@@ -896,6 +955,23 @@ def premium_bill_embed(
     )
     if notes and notes.strip():
         embed.add_field(name="📝 Notes / Payment Details", value=clean(notes, 1000), inline=False)
+    if plan.strip().lower() == "vps":
+        embed.add_field(
+            name="🧩 VPS Hardware Types",
+            value=(
+                f"CPU: **{clean(cpu_type or 'Not specified', 120)}**\n"
+                f"RAM: **{clean(ram_type or 'Not specified', 40)}**\n"
+                f"Disk: **{clean(disk_type or 'Not specified', 80)}**"
+            ),
+            inline=False,
+        )
+        warn_7d = next_invoice_at - timedelta(days=7)
+        warn_1d = next_invoice_at - timedelta(days=1)
+        embed.add_field(
+            name="⚠️ VPS Renewal Warnings",
+            value=f"7-day warning: <t:{int(warn_7d.timestamp())}:F>\n1-day warning: <t:{int(warn_1d.timestamp())}:F>",
+            inline=False,
+        )
     embed.add_field(name="✅ Status", value="Premium bill created. Pay only through official ZeroX Host payment methods.", inline=False)
     return embed
 
@@ -912,6 +988,10 @@ async def send_premium_bill(
     other_charges: float,
     currency: str,
     notes: str | None,
+    billing_seconds: int,
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
 ) -> None:
     if price < 0 or other_charges < 0:
         raise RuntimeError("Price and other charges cannot be negative.")
@@ -919,7 +999,9 @@ async def send_premium_bill(
         raise RuntimeError("Tax and discount percentages cannot be negative.")
     if discount_percentage > 100:
         raise RuntimeError("Discount percentage cannot be more than 100%.")
-    bill_id = f"ZX-{utc_now().strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
+    created_at = utc_now()
+    next_invoice_at = created_at + timedelta(seconds=billing_seconds)
+    bill_id = f"ZX-{created_at.strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
     embed = premium_bill_embed(
         user=user,
         plan=plan,
@@ -931,7 +1013,25 @@ async def send_premium_bill(
         currency=currency,
         notes=notes,
         bill_id=bill_id,
+        created_at=created_at,
+        next_invoice_at=next_invoice_at,
+        cpu_type=cpu_type,
+        ram_type=ram_type,
+        disk_type=disk_type,
     )
+    discount_amount = price * (discount_percentage / 100)
+    taxable_subtotal = max(price - discount_amount + other_charges, 0)
+    tax_amount = taxable_subtotal * (tax_percentage / 100)
+    total = taxable_subtotal + tax_amount
+    save_premium_bill_record({
+        "bill_id": bill_id,
+        "discord_user_id": str(user.id),
+        "plan": plan,
+        "created_at": created_at.isoformat(),
+        "next_invoice_at": next_invoice_at.isoformat(),
+        "currency": currency.upper(),
+        "total": total,
+    })
     dm_status = "sent"
     try:
         await user.send(embed=embed)
@@ -939,7 +1039,21 @@ async def send_premium_bill(
         dm_status = "blocked by the user"
     await interaction.followup.send(embed=embed, ephemeral=True)
     await interaction.followup.send(f"Bill `{bill_id}` created for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
-    await send_admin_audit("Premium Bill Created", f"Bill `{bill_id}` for {user.mention} (`{user.id}`) • Plan: **{plan.title()}** • Total shown in bill embed.", actor=interaction.user, color=0xf1c40f)
+    warning_line = ""
+    if plan.strip().lower() == "vps":
+        hardware_line = f"\nVPS hardware: CPU **{clean(cpu_type or 'Not specified', 120)}** • RAM **{clean(ram_type or 'Not specified', 40)}** • Disk **{clean(disk_type or 'Not specified', 80)}**"
+        warning_line = f"{hardware_line}\nVPS warnings: 7-day <t:{int((next_invoice_at - timedelta(days=7)).timestamp())}:F> • 1-day <t:{int((next_invoice_at - timedelta(days=1)).timestamp())}:F>"
+    await send_admin_audit(
+        "Premium Bill Created",
+        f"Bill `{bill_id}` for {user.mention} (`{user.id}`)\n"
+        f"Plan: **{plan.title()}**\n"
+        f"Creation date: <t:{int(created_at.timestamp())}:F>\n"
+        f"Next invoice date: <t:{int(next_invoice_at.timestamp())}:F> (<t:{int(next_invoice_at.timestamp())}:R>)"
+        f"{warning_line}\n"
+        "Total shown in bill embed.",
+        actor=interaction.user,
+        color=0xf1c40f,
+    )
 
 
 def parse_bill_other_details(value: str) -> tuple[float, str | None]:
@@ -1510,11 +1624,15 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
     discount_percentage = discord.ui.TextInput(label="Discount percentage", placeholder="0", required=False, default="0")
     other_details = discord.ui.TextInput(label="Other charges and notes", placeholder="Other charges: 0 | Notes: Pay via official ticket/invoice", required=False, style=discord.TextStyle.paragraph)
 
-    def __init__(self, user: discord.User, plan: str, currency: str) -> None:
+    def __init__(self, user: discord.User, plan: str, currency: str, billing_seconds: int, cpu_type: str | None, ram_type: str | None, disk_type: str | None) -> None:
         super().__init__()
         self.user = user
         self.plan = plan
         self.currency = currency
+        self.billing_seconds = billing_seconds
+        self.cpu_type = cpu_type
+        self.ram_type = ram_type
+        self.disk_type = disk_type
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -1536,6 +1654,10 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
             other_charges=other_charges,
             currency=self.currency,
             notes=notes,
+            billing_seconds=self.billing_seconds,
+            cpu_type=self.cpu_type,
+            ram_type=self.ram_type,
+            disk_type=self.disk_type,
         )
 
 
@@ -1669,15 +1791,40 @@ async def about(interaction: discord.Interaction) -> None:
     user="Customer who should receive the bill",
     plan="Premium plan type for this bill",
     currency="Currency code, for example USD, INR, EUR",
+    time="Billing period until the next invoice, for example 30d, 12h, or 1d6h",
+    cpu_type="VPS CPU type, for example Ryzen 9 or Xeon",
+    ram_type="VPS RAM type",
+    disk_type="VPS disk type, for example NVMe SSD or SATA SSD",
 )
-@app_commands.choices(plan=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="minecraft")])
+@app_commands.choices(
+    plan=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="minecraft")],
+    ram_type=[app_commands.Choice(name="DDR4", value="DDR4"), app_commands.Choice(name="DDR5", value="DDR5")],
+)
 async def bill(
     interaction: discord.Interaction,
     user: discord.User,
     plan: app_commands.Choice[str],
     currency: str = "USD",
+    time: str = "30d",
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
 ) -> None:
-    await interaction.response.send_modal(BillModal(user, plan.value, currency))
+    try:
+        billing_seconds = parse_duration(time)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    await interaction.response.send_modal(
+        BillModal(
+            user,
+            plan.value,
+            currency,
+            billing_seconds,
+            cpu_type,
+            ram_type,
+            disk_type,
+        )
+    )
 
 
 @tree.command(name="create-free", description="Create free server")
@@ -2798,6 +2945,45 @@ async def sync_panel_activity() -> None:
             print(f"Failed to refresh tracked server {server_id}: {error}")
     print(f"Panel sync refreshed {len(nodes)} nodes, {len(nests)} nests, {sum(len(eggs) for eggs in ptero.egg_cache.values())} eggs, {len(panel_servers)} servers, and {len(live_user_ids)} users.")
 
+async def send_vps_bill_warning(row: sqlite3.Row, lead: str) -> bool:
+    next_invoice_at = datetime.fromisoformat(row["next_invoice_at"])
+    try:
+        user = await client.fetch_user(int(row["discord_user_id"]))
+    except Exception as error:
+        print(f"Failed to fetch VPS bill user for bill {row['bill_id']}: {error}")
+        return False
+    embed = branded_embed(
+        "VPS Invoice Reminder",
+        f"Your VPS invoice `{row['bill_id']}` is due in **{lead}** at <t:{int(next_invoice_at.timestamp())}:F>. Please pay before the next invoice date to keep your VPS active. Amount due: **{format_bill_money(float(row['total']), row['currency'])}**.",
+        0xe67e22,
+    )
+    try:
+        await user.send(embed=embed)
+        await send_admin_audit("VPS Invoice Reminder Sent", f"Bill `{row['bill_id']}` for {user.mention} (`{user.id}`) • Lead: **{lead}** • Next invoice: <t:{int(next_invoice_at.timestamp())}:F>", color=0xe67e22)
+        return True
+    except discord.Forbidden:
+        print(f"VPS bill reminder DM forbidden for user {row['discord_user_id']} on bill {row['bill_id']}.")
+    except Exception as error:
+        print(f"Failed to send VPS bill reminder for bill {row['bill_id']}: {error}")
+    return False
+
+
+@tasks.loop(minutes=1)
+async def send_vps_bill_reminders() -> None:
+    now = utc_now()
+    for row in fetch_due_vps_bill_warnings(now):
+        try:
+            next_invoice_at = datetime.fromisoformat(row["next_invoice_at"])
+            if not row["warn_7d_sent"] and now >= next_invoice_at - timedelta(days=7):
+                if await send_vps_bill_warning(row, "7 days"):
+                    mark_premium_bill_warning_sent(row["bill_id"], "warn_7d_sent")
+            if not row["warn_1d_sent"] and now >= next_invoice_at - timedelta(days=1):
+                if await send_vps_bill_warning(row, "24 hours"):
+                    mark_premium_bill_warning_sent(row["bill_id"], "warn_1d_sent")
+        except Exception as error:
+            print(f"Failed VPS bill reminder processing for bill {row['bill_id']}: {error}")
+
+
 @tasks.loop(minutes=1)
 async def suspend_expired_servers() -> None:
     now = utc_now()
@@ -2969,6 +3155,8 @@ async def on_ready() -> None:
         print(f"Synced {len(global_commands)} global/DM commands and {len(guild_commands)} instant guild commands: {command_names}")
     else:
         print(f"Synced {len(global_commands)} global/DM commands.")
+    if not send_vps_bill_reminders.is_running():
+        send_vps_bill_reminders.start()
     if not suspend_expired_servers.is_running():
         suspend_expired_servers.start()
     if not run_autobackups.is_running():

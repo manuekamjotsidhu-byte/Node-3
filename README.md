@@ -16,7 +16,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - Admins create either `/create-free` or `/create-paid` servers on the same panel with custom `time`, nest, egg, node, RAM/Disk entered in GB, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link` or `/admin createuser`.
 - Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`; general admin audit logs use `admin_log_channel_id` and fall back to the paid log channel.
 - `/purge` deletes tracked free servers only; paid and whitelisted servers are skipped.
-- Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
+- Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link. Premium bills include a creation date, next invoice date, price summary, VPS CPU/RAM/disk type details, and VPS 7-day/1-day renewal warning schedule.
 - Tracked server details are refreshed from the live Pterodactyl panel before user lists and management actions, and a 60-second background sync refetches panel nodes, nests, eggs, servers, users, and updates tracked server names/specs/suspension/deletion status from panel activity.
 - Saga Auto Suspension can be synced during create, renew, and `/autosuspend` changes by configuring `saga_auto_suspend_enabled` and the panel field name in `saga_auto_suspend_field` (fallbacks try `suspended_at`, `expiration_date`, and `expires_at`).
 - Expired tracked servers are automatically suspended by the background task. Paid users receive renewal reminders 7 days and 24 hours before suspension; free users receive the 24-hour reminder. Everyone receives a deletion warning 24 hours before cleanup, and suspended servers are deleted after 7 days.
@@ -45,6 +45,7 @@ python bot.py
 ## Slash commands
 
 - `/about` - polished feature overview for the ZeroX Host Pterodactyl Manager, including user management, server management, logging, receipts/DMs, node monitoring, expirations, and permissions.
+- `/bill` - admin-only premium VPS or Minecraft invoice command. Admins provide the customer, plan, currency, and billing period; the modal captures price/specs/tax/discount/notes. Bills DM the customer and log an admin audit with creation date, next invoice date, VPS CPU/RAM/disk type details (including DDR4/DDR5 RAM choice), and VPS 7-day/1-day renewal warning details.
 - `/create-free` - admin-only free-plan server creation on the single configured panel. Its node, nest, and egg autocomplete values are loaded from `https://gp.zeroxhost.space`, and it requires the user to have a linked panel account.
 - `/create-paid` - admin-only paid server creation with `time` duration, RAM/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging.
 - `/admin list` - admin-only paginated embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
