@@ -954,6 +954,26 @@ async def admin_or_owner_server(interaction: discord.Interaction, server: str) -
     return await ensure_server_access(interaction, server, allow_admin=command_allows_admin_access(interaction))
 
 
+
+
+def server_is_suspended(row: sqlite3.Row | dict[str, Any]) -> bool:
+    if bool(record_value(row, "suspended", False)):
+        return True
+    status = str(record_value(row, "status", "") or "").strip().lower()
+    return "suspend" in status
+
+
+def suspended_action_message(row: sqlite3.Row | dict[str, Any], action: str = "that action") -> str:
+    return (
+        f"**{record_value(row, 'name', record_value(row, 'server_id', 'this server'))}** is currently suspended, "
+        f"so {action} is unavailable until an admin unsuspends it."
+    )
+
+
+def ensure_not_suspended(row: sqlite3.Row | dict[str, Any], action: str = "that action") -> None:
+    if server_is_suspended(row):
+        raise RuntimeError(suspended_action_message(row, action))
+
 async def require_client_identifier(row: sqlite3.Row | dict[str, Any]) -> str:
     identifier = record_value(row, "identifier")
     if not identifier:
@@ -1193,6 +1213,8 @@ def format_mb(value: float) -> str:
 def manage_embed(row: sqlite3.Row | dict[str, Any], resources: dict[str, Any]) -> discord.Embed:
     raw = resources.get("resources", {}) if resources else {}
     state = resources.get("current_state", "unknown") if resources else "unknown"
+    if server_is_suspended(row):
+        state = "suspended"
     memory_mb = float(raw.get("memory_bytes") or 0) / 1024 / 1024
     disk_mb = float(raw.get("disk_bytes") or 0) / 1024 / 1024
     cpu_usage = float(raw.get("cpu_absolute") or 0)
@@ -1265,6 +1287,11 @@ class ManageView(discord.ui.View):
 
     async def refresh_message(self, interaction: discord.Interaction, note: str) -> None:
         row = await self.row(interaction)
+        if server_is_suspended(row):
+            embed = manage_embed(row, {})
+            embed.description = f"{embed.description}\n\n⚠️ {suspended_action_message(row, 'live controls')}"
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
         resources = await (await ready_client_api_for(row)).resources(row["identifier"]) if row["identifier"] else {}
         embed = manage_embed(row, resources)
         embed.description = f"{embed.description}\n\n{note}"
@@ -1275,6 +1302,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "start")
         await self.refresh_message(interaction, "✅ Start signal sent.")
 
@@ -1283,6 +1311,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "stop")
         await self.refresh_message(interaction, "✅ Stop signal sent.")
 
@@ -1291,6 +1320,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "restart")
         await self.refresh_message(interaction, "✅ Restart signal sent.")
 
@@ -1299,6 +1329,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "kill")
         await self.refresh_message(interaction, "✅ Kill signal sent.")
 
@@ -1634,8 +1665,13 @@ async def admin_list(interaction: discord.Interaction) -> None:
 async def admin_manage(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await ensure_server_access(interaction, server, allow_admin=True)
-    resources = await (await ready_client_api_for(row)).resources(row["identifier"]) if row["identifier"] else {}
-    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=True), ephemeral=True)
+    resources = {}
+    if row["identifier"] and not server_is_suspended(row):
+        resources = await (await ready_client_api_for(row)).resources(row["identifier"])
+    embed = manage_embed(row, resources)
+    if server_is_suspended(row):
+        embed.description = f"{embed.description}\n\n⚠️ {suspended_action_message(row, 'live controls')}"
+    await interaction.followup.send(embed=embed, view=ManageView(server, allow_admin=True), ephemeral=True)
 
 
 @admin_group.command(name="console", description="Send console command to any tracked server")
@@ -1647,6 +1683,7 @@ async def admin_console(interaction: discord.Interaction, server: str, command: 
         raise RuntimeError("Console command cannot be empty.")
     row = await ensure_server_access(interaction, server, allow_admin=True)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "console commands")
     await (await ready_client_api_for(row)).command(identifier, command.strip())
     await interaction.followup.send(embed=branded_embed("Admin Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
@@ -1659,6 +1696,7 @@ async def admin_rename(interaction: discord.Interaction, server: str, new_name: 
     row = await ensure_server_access(interaction, server, allow_admin=True)
     if not row["identifier"]:
         raise RuntimeError("This tracked server is missing its client identifier.")
+    ensure_not_suspended(row, "renaming")
     await (await ready_client_api_for(row)).rename(row["identifier"], new_name)
     with db() as connection:
         connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
@@ -1691,7 +1729,7 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
         if command_allows_admin_access(interaction):
             rows = list((await fetch_live_panel_records(enrich_owner=True)).values())
             title = "All Servers"
-            description = "All live panel servers are shown here, including panel-created servers that are not tracked locally."
+            description = "Public overview with important status only. Use admin filters for sensitive UUID/email details."
         else:
             rows = await refresh_user_servers(interaction.user.id)
             title = "Your Servers"
@@ -1711,9 +1749,12 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
                 expires_text = f"<t:{int(datetime.fromisoformat(str(expires_raw)).timestamp())}:R>"
             owner_id = str(record_value(row, "discord_user_id", "")).strip()
             owner_text = f"<@{owner_id}>" if owner_id else "Not linked"
+            state_text = "Suspended" if server_is_suspended(row) else "Active"
+            important_value = f"**Plan:** {record_value(row, 'plan')}\n**State:** {state_text}\n**Owner:** {owner_text}\n**Specs:** {int(record_value(row, 'ram', 0)):,} MB RAM / {int(record_value(row, 'disk', 0)):,} MB Disk / {int(record_value(row, 'cpu', 0))}% CPU\n**Expires:** {expires_text}"
+            sensitive_value = f"{important_value}\n**UUID:** `{record_value(row, 'uuid') or 'unknown'}`\n**Email:** `{record_value(row, 'panel_email')}`"
             embed.add_field(
                 name=f"#{record_value(row, 'server_id')} • {record_value(row, 'name')}",
-                value=f"**Plan:** {record_value(row, 'plan')}\n**UUID:** `{record_value(row, 'uuid') or 'unknown'}`\n**Owner:** {owner_text}\n**Email:** `{record_value(row, 'panel_email')}`\n**Specs:** {int(record_value(row, 'ram', 0)):,} MB RAM / {int(record_value(row, 'disk', 0)):,} MB Disk / {int(record_value(row, 'cpu', 0))}% CPU\n**Expires:** {expires_text}",
+                value=sensitive_value if admin_filter_requested else important_value,
                 inline=False,
             )
         embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(rows)} server(s) • Developer: {DEVELOPER}")
@@ -1730,8 +1771,13 @@ async def manage(interaction: discord.Interaction, server: str) -> None:
     allow_admin = command_allows_admin_access(interaction)
     row = await ensure_server_access(interaction, server, allow_admin=allow_admin)
     identifier = record_value(row, "identifier")
-    resources = await (await ready_client_api_for(row)).resources(str(identifier)) if identifier else {}
-    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=allow_admin), ephemeral=True)
+    resources = {}
+    if identifier and not server_is_suspended(row):
+        resources = await (await ready_client_api_for(row)).resources(str(identifier))
+    embed = manage_embed(row, resources)
+    if server_is_suspended(row):
+        embed.description = f"{embed.description}\n\n⚠️ {suspended_action_message(row, 'live controls')}"
+    await interaction.followup.send(embed=embed, view=ManageView(server, allow_admin=allow_admin), ephemeral=True)
 
 
 @tree.command(name="console", description="Send console command")
@@ -1742,6 +1788,7 @@ async def console(interaction: discord.Interaction, server: str, command: str) -
         raise RuntimeError("Console command cannot be empty.")
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "console commands")
     await (await ready_client_api_for(row)).command(identifier, command.strip())
     await interaction.followup.send(embed=branded_embed("Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
@@ -1752,6 +1799,7 @@ async def rename(interaction: discord.Interaction, server: str, new_name: str) -
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "renaming")
     await (await ready_client_api_for(row)).rename(identifier, new_name)
     if fetch_server(server):
         with db() as connection:
@@ -1862,6 +1910,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "power controls")
     await (await ready_client_api_for(row)).power(identifier, action.value)
     await interaction.followup.send(embed=branded_embed("Power Signal Sent", f"Sent **{action.value}** to **{record_value(row, 'name', server)}**."), ephemeral=True)
 
@@ -1871,6 +1920,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
 async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
+    ensure_not_suspended(row, "reinstall")
     await (await ready_application_client_for(row)).reinstall_server(server)
     await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{record_value(row, 'name', server)}**."), ephemeral=True)
 
@@ -1886,6 +1936,7 @@ async def change_egg(interaction: discord.Interaction, server: str, nest: str, e
         raise RuntimeError("Select a real nest and egg from autocomplete before changing the server egg.")
     nest_name = nest.split(":", 1)[1] if ":" in nest else f"Nest {nest_id}"
     egg_name = egg.split(":", 1)[1] if ":" in egg else f"Egg {egg_id}"
+    ensure_not_suspended(row, "egg changes")
     panel = await ready_application_client_for(row)
     await panel.change_server_egg(server, nest_id, egg_id)
     reinstall_requested = reinstall or wipe_files
@@ -1957,12 +2008,23 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
 async def stopall(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     stopped = 0
+    skipped_suspended = 0
+    skipped_whitelisted = 0
+    skipped_missing_identifier = 0
     for row in fetch_all_servers():
-        if is_whitelisted(row["server_id"]) or not row["identifier"]:
+        if is_whitelisted(row["server_id"]):
+            skipped_whitelisted += 1
             continue
-        await (await ready_client_api_for(row)).power(row["identifier"], "stop")
+        if not row["identifier"]:
+            skipped_missing_identifier += 1
+            continue
+        live_row = await refresh_tracked_server(row) or row
+        if server_is_suspended(live_row):
+            skipped_suspended += 1
+            continue
+        await (await ready_client_api_for(live_row)).power(live_row["identifier"], "stop")
         stopped += 1
-    await interaction.followup.send(embed=branded_embed("Stop All Complete", f"Stopped **{stopped}** server(s). Whitelisted servers were skipped."), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("Stop All Complete", f"Stopped **{stopped}** server(s).\nSkipped: **{skipped_whitelisted}** whitelisted • **{skipped_suspended}** suspended • **{skipped_missing_identifier}** missing client identifier."), ephemeral=True)
 
 
 @tree.command(name="autobackup-enable", description="Enable autobackups")
