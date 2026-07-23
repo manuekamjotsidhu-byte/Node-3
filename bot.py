@@ -851,6 +851,7 @@ def panel_server_record(server: dict[str, Any], plan: str = "panel") -> dict[str
         "ram": int(limits.get("memory") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
+        "status": server.get("status") or server.get("state") or (server.get("container") or {}).get("status"),
         "node_id": int(server.get("node") or server.get("node_id") or 0),
         "node_name": f"Node {server.get('node') or server.get('node_id') or 'unknown'}",
         "nest_id": int(server.get("nest") or server.get("nest_id") or 0),
@@ -1894,12 +1895,86 @@ async def autobackup_enable(interaction: discord.Interaction, server: str, every
     await interaction.followup.send(embed=branded_embed("Autobackup Enabled", f"Server `{server}` will back up every **{every}**."), ephemeral=True)
 
 
-@tree.command(name="nodes", description="Show nodes")
+
+
+def pct_bar(percent: float) -> str:
+    filled = max(0, min(10, round(percent / 10)))
+    return "█" * filled + "░" * (10 - filled)
+
+
+def node_capacity_value(node: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = node.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def server_status_label(record: sqlite3.Row | dict[str, Any]) -> str:
+    status = str(record_value(record, "status", "") or "").strip().lower()
+    if not status and panel_server_is_suspended(dict(record) if isinstance(record, dict) else {key: record[key] for key in record.keys()}):
+        status = "suspended"
+    return status
+
+
+def node_dashboard_field(node: dict[str, Any], records: list[sqlite3.Row | dict[str, Any]]) -> tuple[str, str]:
+    node_id = int(node.get("id") or 0)
+    node_records = [record for record in records if int(record_value(record, "node_id", 0) or 0) == node_id]
+    memory_total = node_capacity_value(node, "memory", "memory_limit")
+    disk_total = node_capacity_value(node, "disk", "disk_limit")
+    memory_used = sum(int(record_value(record, "ram", 0) or 0) for record in node_records)
+    disk_used = sum(int(record_value(record, "disk", 0) or 0) for record in node_records)
+    memory_pct = (memory_used / memory_total * 100) if memory_total else 0
+    disk_pct = (disk_used / disk_total * 100) if disk_total else 0
+    statuses = [server_status_label(record) for record in node_records]
+    suspended = sum(1 for status in statuses if "suspend" in status)
+    crashing = sum(1 for status in statuses if any(word in status for word in ("crash", "error", "failed", "offline")))
+    maintenance = bool(node.get("maintenance_mode") or node.get("maintenance"))
+    overloaded = memory_pct >= 90 or disk_pct >= 90
+    state = "🟡 Maintenance" if maintenance else "🔴 Warning" if overloaded or crashing else "🟢 Online"
+    warnings: list[str] = []
+    if overloaded:
+        warnings.append("⚠️ overloaded")
+    if crashing:
+        warnings.append(f"💥 {crashing} crashing/error")
+    if maintenance:
+        warnings.append("🛠️ maintenance")
+    warning_line = " • ".join(warnings) if warnings else "✅ healthy"
+    value = (
+        f"Status: **{state}** • {warning_line}\n"
+        f"Servers: **{len(node_records)}** live • Suspended: **{suspended}**\n"
+        f"Memory: `{memory_used:,}/{memory_total:,} MB` **{memory_pct:.1f}%**\n`{pct_bar(memory_pct)}`\n"
+        f"Disk: `{disk_used:,}/{disk_total:,} MB` **{disk_pct:.1f}%**\n`{pct_bar(disk_pct)}`"
+    )
+    return f"{state.split(' ', 1)[0]} {node.get('name', f'Node {node_id}')} (`{node_id}`)", value
+
+
+@tree.command(name="nodes", description="Show live node status")
 @admin_only()
 async def nodes(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    rows = [f"`{node['id']}` • **{node['name']}**" for node in await ptero.list_nodes()]
-    await interaction.followup.send(embed=branded_embed("Deployment Nodes", "\n".join(rows) or "No nodes found."), ephemeral=True)
+    panel_nodes = await ptero.list_nodes()
+    records = list((await fetch_live_panel_records()).values())
+    if not panel_nodes:
+        await interaction.followup.send(embed=branded_embed("Live Node Status", "No nodes found."), ephemeral=True)
+        return
+    embeds: list[discord.Embed] = []
+    pages = chunked(panel_nodes, 5)
+    total_servers = len(records)
+    for page_number, page in enumerate(pages, start=1):
+        embed = branded_embed("🚀 Live Node Status", f"Real-time panel allocation view across **{len(panel_nodes)}** node(s) and **{total_servers}** live server(s).")
+        for node in page:
+            name, value = node_dashboard_field(node, records)
+            embed.add_field(name=name, value=value, inline=False)
+        embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • 🟢 healthy / 🔴 warning / 🟡 maintenance • Developer: {DEVELOPER}")
+        embeds.append(embed)
+    if len(embeds) > 1:
+        await interaction.followup.send(embed=embeds[0], view=PaginatedEmbeds(embeds), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embeds[0], ephemeral=True)
 
 
 @tree.command(name="whitelist", description="Admin: manage or list whitelisted servers")
