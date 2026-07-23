@@ -17,6 +17,7 @@ SQLITE_PATH = Path("data/zerox_host.db")
 DEVELOPER = "ekamsidhu07 ekam"
 BRAND = "ZeroX Host"
 PAID_LOG_CHANNEL_ID = 1504092779700289536
+FREE_LOG_CHANNEL_ID = 1529782327348170873
 ADMIN_LOG_CHANNEL_ID = 1504092779700289536
 ADMIN_ROLE_ID = 1504092228778459226
 OWNER_ROLE_ID = 1504092176492265553
@@ -772,6 +773,31 @@ def branded_embed(title: str, description: str, color: int = 0x00d4ff) -> discor
 
 
 
+def plan_log_channel_id(plan: str) -> int:
+    if str(plan).strip().lower() == "paid":
+        return int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))
+    return int(config.get("free_log_channel_id", FREE_LOG_CHANNEL_ID))
+
+
+async def send_plan_log(plan: str, embed: discord.Embed) -> bool:
+    try:
+        channel_id = plan_log_channel_id(plan)
+        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+        await channel.send(embed=embed)
+        return True
+    except Exception as error:
+        print(f"Failed to send {plan} server log: {error}")
+        return False
+
+
+async def send_server_event_log(record: sqlite3.Row | dict[str, Any], title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> bool:
+    """Send server lifecycle/admin logs to the channel that matches the server plan."""
+    actor_line = f"\nAdmin: {actor.mention} (`{actor.id}`)" if actor else ""
+    plan = str(record_value(record, "plan", "free")).strip().lower()
+    embed = branded_embed(f"Admin Log: {title}", f"{description}{actor_line}", color)
+    return await send_plan_log(plan, embed)
+
+
 async def send_admin_audit(title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> None:
     channel_id_value = config.get("admin_log_channel_id") or config.get("paid_log_channel_id", ADMIN_LOG_CHANNEL_ID)
     if not channel_id_value:
@@ -823,6 +849,113 @@ def trustpilot_embed() -> discord.Embed:
     )
     embed.add_field(name="⭐ Review Link", value="https://www.trustpilot.com/review/status.zeroxhost.space", inline=False)
     return embed
+
+
+
+def format_bill_money(amount: float, currency: str) -> str:
+    safe_currency = clean(currency.upper(), 8) or "USD"
+    return f"{safe_currency} {amount:,.2f}"
+
+
+def premium_bill_embed(
+    *,
+    user: discord.User,
+    plan: str,
+    price: float,
+    specifications: str,
+    tax_percentage: float,
+    discount_percentage: float,
+    other_charges: float,
+    currency: str,
+    notes: str | None,
+    bill_id: str,
+) -> discord.Embed:
+    discount_amount = price * (discount_percentage / 100)
+    taxable_subtotal = max(price - discount_amount + other_charges, 0)
+    tax_amount = taxable_subtotal * (tax_percentage / 100)
+    total = taxable_subtotal + tax_amount
+    embed = branded_embed(
+        "Premium Bill",
+        f"Premium {BRAND} invoice for {user.mention}. Please review the plan, specifications, and total before payment.",
+        0x0b132b,
+    )
+    embed.add_field(name="🧾 Bill ID", value=f"`{bill_id}`", inline=True)
+    embed.add_field(name="👤 Customer", value=f"{user.mention}\n`{user.id}`", inline=True)
+    embed.add_field(name="📦 Plan", value=plan.title(), inline=True)
+    embed.add_field(name="⚙️ Specifications", value=clean(specifications, 1000) or "Not specified", inline=False)
+    embed.add_field(
+        name="💰 Price Summary",
+        value=(
+            f"Base price: **{format_bill_money(price, currency)}**\n"
+            f"Discount ({discount_percentage:.2f}%): **-{format_bill_money(discount_amount, currency)}**\n"
+            f"Other charges: **{format_bill_money(other_charges, currency)}**\n"
+            f"Tax ({tax_percentage:.2f}%): **{format_bill_money(tax_amount, currency)}**\n"
+            f"Total due: **{format_bill_money(total, currency)}**"
+        ),
+        inline=False,
+    )
+    if notes and notes.strip():
+        embed.add_field(name="📝 Notes / Payment Details", value=clean(notes, 1000), inline=False)
+    embed.add_field(name="✅ Status", value="Premium bill created. Pay only through official ZeroX Host payment methods.", inline=False)
+    return embed
+
+
+async def send_premium_bill(
+    interaction: discord.Interaction,
+    *,
+    user: discord.User,
+    plan: str,
+    price: float,
+    specifications: str,
+    tax_percentage: float,
+    discount_percentage: float,
+    other_charges: float,
+    currency: str,
+    notes: str | None,
+) -> None:
+    if price < 0 or other_charges < 0:
+        raise RuntimeError("Price and other charges cannot be negative.")
+    if tax_percentage < 0 or discount_percentage < 0:
+        raise RuntimeError("Tax and discount percentages cannot be negative.")
+    if discount_percentage > 100:
+        raise RuntimeError("Discount percentage cannot be more than 100%.")
+    bill_id = f"ZX-{utc_now().strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
+    embed = premium_bill_embed(
+        user=user,
+        plan=plan,
+        price=price,
+        specifications=specifications,
+        tax_percentage=tax_percentage,
+        discount_percentage=discount_percentage,
+        other_charges=other_charges,
+        currency=currency,
+        notes=notes,
+        bill_id=bill_id,
+    )
+    dm_status = "sent"
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        dm_status = "blocked by the user"
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(f"Bill `{bill_id}` created for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
+    await send_admin_audit("Premium Bill Created", f"Bill `{bill_id}` for {user.mention} (`{user.id}`) • Plan: **{plan.title()}** • Total shown in bill embed.", actor=interaction.user, color=0xf1c40f)
+
+
+def parse_bill_other_details(value: str) -> tuple[float, str | None]:
+    text = value.strip()
+    if not text:
+        return 0.0, None
+    other_charges = 0.0
+    notes = text
+    charge_match = re.search(r"(?:other\s*charges?|charges?|fee|fees)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+    if charge_match:
+        other_charges = float(charge_match.group(1))
+        notes = (text[:charge_match.start()] + text[charge_match.end():]).strip(" |,;\n") or None
+    elif re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        other_charges = float(text)
+        notes = None
+    return other_charges, notes
 
 
 def panel_server_embed(server: dict[str, Any], email: str, discord_label: str) -> discord.Embed:
@@ -953,6 +1086,26 @@ def command_allows_admin_access(interaction: discord.Interaction) -> bool:
 async def admin_or_owner_server(interaction: discord.Interaction, server: str) -> sqlite3.Row | dict[str, Any]:
     return await ensure_server_access(interaction, server, allow_admin=command_allows_admin_access(interaction))
 
+
+
+
+def server_is_suspended(row: sqlite3.Row | dict[str, Any]) -> bool:
+    if bool(record_value(row, "suspended", False)):
+        return True
+    status = str(record_value(row, "status", "") or "").strip().lower()
+    return "suspend" in status
+
+
+def suspended_action_message(row: sqlite3.Row | dict[str, Any], action: str = "that action") -> str:
+    return (
+        f"**{record_value(row, 'name', record_value(row, 'server_id', 'this server'))}** is currently suspended, "
+        f"so {action} is unavailable until an admin unsuspends it."
+    )
+
+
+def ensure_not_suspended(row: sqlite3.Row | dict[str, Any], action: str = "that action") -> None:
+    if server_is_suspended(row):
+        raise RuntimeError(suspended_action_message(row, action))
 
 async def require_client_identifier(row: sqlite3.Row | dict[str, Any]) -> str:
     identifier = record_value(row, "identifier")
@@ -1193,6 +1346,8 @@ def format_mb(value: float) -> str:
 def manage_embed(row: sqlite3.Row | dict[str, Any], resources: dict[str, Any]) -> discord.Embed:
     raw = resources.get("resources", {}) if resources else {}
     state = resources.get("current_state", "unknown") if resources else "unknown"
+    if server_is_suspended(row):
+        state = "suspended"
     memory_mb = float(raw.get("memory_bytes") or 0) / 1024 / 1024
     disk_mb = float(raw.get("disk_bytes") or 0) / 1024 / 1024
     cpu_usage = float(raw.get("cpu_absolute") or 0)
@@ -1265,6 +1420,11 @@ class ManageView(discord.ui.View):
 
     async def refresh_message(self, interaction: discord.Interaction, note: str) -> None:
         row = await self.row(interaction)
+        if server_is_suspended(row):
+            embed = manage_embed(row, {})
+            embed.description = f"{embed.description}\n\n⚠️ {suspended_action_message(row, 'live controls')}"
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
         resources = await (await ready_client_api_for(row)).resources(row["identifier"]) if row["identifier"] else {}
         embed = manage_embed(row, resources)
         embed.description = f"{embed.description}\n\n{note}"
@@ -1275,6 +1435,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "start")
         await self.refresh_message(interaction, "✅ Start signal sent.")
 
@@ -1283,6 +1444,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "stop")
         await self.refresh_message(interaction, "✅ Stop signal sent.")
 
@@ -1291,6 +1453,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "restart")
         await self.refresh_message(interaction, "✅ Restart signal sent.")
 
@@ -1299,6 +1462,7 @@ class ManageView(discord.ui.View):
         row = await self.row(interaction)
         if not row["identifier"]:
             raise RuntimeError("This tracked server is missing its client identifier.")
+        ensure_not_suspended(row, "power controls")
         await (await ready_client_api_for(row)).power(row["identifier"], "kill")
         await self.refresh_message(interaction, "✅ Kill signal sent.")
 
@@ -1336,7 +1500,43 @@ class ResizeModal(discord.ui.Modal, title="Resize ZeroX Host Server"):
             with db() as connection:
                 connection.execute("UPDATE servers SET ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=? WHERE server_id=?", (ram_mb, disk_mb, cpu, databases, allocations, backups, self.server_id))
         await interaction.followup.send(embed=branded_embed("Server Resized", f"**{record_value(row, 'name', self.server_id)}** is now {ram_gb:,} GB RAM ({ram_mb:,} MB) / {disk_gb:,} GB disk ({disk_mb:,} MB) / {cpu}% CPU."), ephemeral=True)
-        await send_admin_audit("Server Resized", f"**{record_value(row, 'name', self.server_id)}** (`{self.server_id}`) resized to {ram_gb:,} GB RAM / {disk_gb:,} GB disk / {cpu}% CPU.", actor=interaction.user, color=0x3498db)
+        await send_server_event_log(row, "Server Resized", f"**{record_value(row, 'name', self.server_id)}** (`{self.server_id}`) resized to {ram_gb:,} GB RAM / {disk_gb:,} GB disk / {cpu}% CPU.", actor=interaction.user, color=0x3498db)
+
+
+class BillModal(discord.ui.Modal, title="Create Premium Bill"):
+    price = discord.ui.TextInput(label="Base price", placeholder="10.00", required=True)
+    specifications = discord.ui.TextInput(label="Specifications", placeholder="2 vCPU, 4 GB RAM, 50 GB NVMe, 1 month", required=True, style=discord.TextStyle.paragraph)
+    tax_percentage = discord.ui.TextInput(label="Tax percentage", placeholder="0", required=False, default="0")
+    discount_percentage = discord.ui.TextInput(label="Discount percentage", placeholder="0", required=False, default="0")
+    other_details = discord.ui.TextInput(label="Other charges and notes", placeholder="Other charges: 0 | Notes: Pay via official ticket/invoice", required=False, style=discord.TextStyle.paragraph)
+
+    def __init__(self, user: discord.User, plan: str, currency: str) -> None:
+        super().__init__()
+        self.user = user
+        self.plan = plan
+        self.currency = currency
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        try:
+            price = float(str(self.price.value).strip())
+            tax_percentage = float(str(self.tax_percentage.value or "0").strip() or 0)
+            discount_percentage = float(str(self.discount_percentage.value or "0").strip() or 0)
+        except ValueError as error:
+            raise RuntimeError("Use valid numbers for price, tax percentage, and discount percentage.") from error
+        other_charges, notes = parse_bill_other_details(str(self.other_details.value or ""))
+        await send_premium_bill(
+            interaction,
+            user=self.user,
+            plan=self.plan,
+            price=price,
+            specifications=str(self.specifications.value),
+            tax_percentage=tax_percentage,
+            discount_percentage=discount_percentage,
+            other_charges=other_charges,
+            currency=self.currency,
+            notes=notes,
+        )
 
 
 class SuspendSelect(discord.ui.View):
@@ -1446,16 +1646,13 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     created.add_field(name="Expiration", value=f"<t:{int(expires_at.timestamp())}:F>\n<t:{int(expires_at.timestamp())}:R>", inline=True)
     created.add_field(name="Saga Auto Suspension", value="Synced to panel" if saga_synced else "Bot DB only / panel sync unavailable", inline=True)
     await interaction.followup.send(embed=created, ephemeral=True)
-    await send_admin_audit("Server Created", f"Plan: **{plan}**\nServer: **{name}** (`{server_id}`)\nOwner: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nNode: **{node_name}**\nExpires: <t:{int(expires_at.timestamp())}:F>", actor=interaction.user, color=0x2ecc71)
-
-    if plan == "paid":
-        channel = client.get_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))) or await client.fetch_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID)))
-        log_embed = branded_embed(
-            "Paid Server Created",
-            server_admin_details(record, user=user, event_when=expires_at, reason=f"Paid server created; Saga auto suspension {'synced' if saga_synced else 'not synced'}"),
-            0xf1c40f,
-        )
-        await channel.send(embed=log_embed)
+    plan_title = "Paid" if plan == "paid" else "Free"
+    log_embed = branded_embed(
+        f"{plan_title} Server Created",
+        server_admin_details(record, user=user, event_when=expires_at, reason=f"{plan_title} server created; Saga auto suspension {'synced' if saga_synced else 'not synced'}"),
+        0xf1c40f if plan == "paid" else 0x00d4ff,
+    )
+    await send_plan_log(plan, log_embed)
 
 
 
@@ -1463,6 +1660,24 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
 @tree.command(name="about", description="Show the ZeroX Host Pterodactyl Manager overview")
 async def about(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=about_embed(), ephemeral=True)
+
+
+
+@tree.command(name="bill", description="Admin: create a premium bill for VPS or Minecraft hosting")
+@admin_only()
+@app_commands.describe(
+    user="Customer who should receive the bill",
+    plan="Premium plan type for this bill",
+    currency="Currency code, for example USD, INR, EUR",
+)
+@app_commands.choices(plan=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="minecraft")])
+async def bill(
+    interaction: discord.Interaction,
+    user: discord.User,
+    plan: app_commands.Choice[str],
+    currency: str = "USD",
+) -> None:
+    await interaction.response.send_modal(BillModal(user, plan.value, currency))
 
 
 @tree.command(name="create-free", description="Create free server")
@@ -1634,8 +1849,13 @@ async def admin_list(interaction: discord.Interaction) -> None:
 async def admin_manage(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await ensure_server_access(interaction, server, allow_admin=True)
-    resources = await (await ready_client_api_for(row)).resources(row["identifier"]) if row["identifier"] else {}
-    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=True), ephemeral=True)
+    resources = {}
+    if row["identifier"] and not server_is_suspended(row):
+        resources = await (await ready_client_api_for(row)).resources(row["identifier"])
+    embed = manage_embed(row, resources)
+    if server_is_suspended(row):
+        embed.description = f"{embed.description}\n\n⚠️ {suspended_action_message(row, 'live controls')}"
+    await interaction.followup.send(embed=embed, view=ManageView(server, allow_admin=True), ephemeral=True)
 
 
 @admin_group.command(name="console", description="Send console command to any tracked server")
@@ -1647,6 +1867,7 @@ async def admin_console(interaction: discord.Interaction, server: str, command: 
         raise RuntimeError("Console command cannot be empty.")
     row = await ensure_server_access(interaction, server, allow_admin=True)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "console commands")
     await (await ready_client_api_for(row)).command(identifier, command.strip())
     await interaction.followup.send(embed=branded_embed("Admin Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
@@ -1659,6 +1880,7 @@ async def admin_rename(interaction: discord.Interaction, server: str, new_name: 
     row = await ensure_server_access(interaction, server, allow_admin=True)
     if not row["identifier"]:
         raise RuntimeError("This tracked server is missing its client identifier.")
+    ensure_not_suspended(row, "renaming")
     await (await ready_client_api_for(row)).rename(row["identifier"], new_name)
     with db() as connection:
         connection.execute("UPDATE servers SET name=? WHERE server_id=?", (new_name, server))
@@ -1688,14 +1910,9 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
         title = "Servers For Email"
         description = f"Tracked servers linked to panel email `{clean(normalized_email, 120)}`."
     else:
-        if command_allows_admin_access(interaction):
-            rows = list((await fetch_live_panel_records(enrich_owner=True)).values())
-            title = "All Servers"
-            description = "All live panel servers are shown here, including panel-created servers that are not tracked locally."
-        else:
-            rows = await refresh_user_servers(interaction.user.id)
-            title = "Your Servers"
-            description = "Only your own linked/tracked servers are shown here."
+        rows = await refresh_user_servers(interaction.user.id)
+        title = "Your Servers"
+        description = "Only your own linked/tracked servers are shown here. Admins can use `/admin list` for all servers."
 
     if not rows:
         await interaction.followup.send(embed=branded_embed(title, "No servers found."), ephemeral=admin_filter_requested)
@@ -1711,9 +1928,12 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
                 expires_text = f"<t:{int(datetime.fromisoformat(str(expires_raw)).timestamp())}:R>"
             owner_id = str(record_value(row, "discord_user_id", "")).strip()
             owner_text = f"<@{owner_id}>" if owner_id else "Not linked"
+            state_text = "Suspended" if server_is_suspended(row) else "Active"
+            important_value = f"**Plan:** {record_value(row, 'plan')}\n**State:** {state_text}\n**Owner:** {owner_text}\n**Specs:** {int(record_value(row, 'ram', 0)):,} MB RAM / {int(record_value(row, 'disk', 0)):,} MB Disk / {int(record_value(row, 'cpu', 0))}% CPU\n**Expires:** {expires_text}"
+            sensitive_value = f"{important_value}\n**UUID:** `{record_value(row, 'uuid') or 'unknown'}`\n**Email:** `{record_value(row, 'panel_email')}`"
             embed.add_field(
                 name=f"#{record_value(row, 'server_id')} • {record_value(row, 'name')}",
-                value=f"**Plan:** {record_value(row, 'plan')}\n**UUID:** `{record_value(row, 'uuid') or 'unknown'}`\n**Owner:** {owner_text}\n**Email:** `{record_value(row, 'panel_email')}`\n**Specs:** {int(record_value(row, 'ram', 0)):,} MB RAM / {int(record_value(row, 'disk', 0)):,} MB Disk / {int(record_value(row, 'cpu', 0))}% CPU\n**Expires:** {expires_text}",
+                value=sensitive_value if admin_filter_requested else important_value,
                 inline=False,
             )
         embed.set_footer(text=f"{BRAND} • Page {page_number}/{len(pages)} • {len(rows)} server(s) • Developer: {DEVELOPER}")
@@ -1730,8 +1950,13 @@ async def manage(interaction: discord.Interaction, server: str) -> None:
     allow_admin = command_allows_admin_access(interaction)
     row = await ensure_server_access(interaction, server, allow_admin=allow_admin)
     identifier = record_value(row, "identifier")
-    resources = await (await ready_client_api_for(row)).resources(str(identifier)) if identifier else {}
-    await interaction.followup.send(embed=manage_embed(row, resources), view=ManageView(server, allow_admin=allow_admin), ephemeral=True)
+    resources = {}
+    if identifier and not server_is_suspended(row):
+        resources = await (await ready_client_api_for(row)).resources(str(identifier))
+    embed = manage_embed(row, resources)
+    if server_is_suspended(row):
+        embed.description = f"{embed.description}\n\n⚠️ {suspended_action_message(row, 'live controls')}"
+    await interaction.followup.send(embed=embed, view=ManageView(server, allow_admin=allow_admin), ephemeral=True)
 
 
 @tree.command(name="console", description="Send console command")
@@ -1742,6 +1967,7 @@ async def console(interaction: discord.Interaction, server: str, command: str) -
         raise RuntimeError("Console command cannot be empty.")
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "console commands")
     await (await ready_client_api_for(row)).command(identifier, command.strip())
     await interaction.followup.send(embed=branded_embed("Console Command Sent", f"Sent command to **{record_value(row, 'name', server)}**.\n```{clean(command, 1000)}```"), ephemeral=True)
 
@@ -1752,6 +1978,7 @@ async def rename(interaction: discord.Interaction, server: str, new_name: str) -
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "renaming")
     await (await ready_client_api_for(row)).rename(identifier, new_name)
     if fetch_server(server):
         with db() as connection:
@@ -1835,7 +2062,7 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
                 warning_note = "Sent " + ", ".join(expiration_warning_lead(notification_type) for notification_type in sent_warnings) + " renewal warning(s)"
     tracking_note = "Local DB updated" if tracked_row else "Panel/Saga updated only (server is not locally tracked)"
     await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
-    await send_admin_audit("Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
+    await send_server_event_log(row, "Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
 
 
 @tree.command(name="delete", description="Admin delete one server")
@@ -1852,7 +2079,7 @@ async def delete(interaction: discord.Interaction, server: str, confirm: bool = 
     await (await ready_application_client_for(row)).delete_server(server)
     mark_server_deleted(server)
     await interaction.followup.send(embed=branded_embed("Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", 0xe74c3c), ephemeral=True)
-    await send_admin_audit("Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe74c3c)
+    await send_server_event_log(row, "Server Deleted", f"Deleted **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe74c3c)
 
 
 @tree.command(name="power", description="Power server")
@@ -1862,6 +2089,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
     identifier = await require_client_identifier(row)
+    ensure_not_suspended(row, "power controls")
     await (await ready_client_api_for(row)).power(identifier, action.value)
     await interaction.followup.send(embed=branded_embed("Power Signal Sent", f"Sent **{action.value}** to **{record_value(row, 'name', server)}**."), ephemeral=True)
 
@@ -1871,6 +2099,7 @@ async def power(interaction: discord.Interaction, server: str, action: app_comma
 async def reinstall(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await admin_or_owner_server(interaction, server)
+    ensure_not_suspended(row, "reinstall")
     await (await ready_application_client_for(row)).reinstall_server(server)
     await interaction.followup.send(embed=branded_embed("Reinstall Started", f"Reinstall started for **{record_value(row, 'name', server)}**."), ephemeral=True)
 
@@ -1886,6 +2115,7 @@ async def change_egg(interaction: discord.Interaction, server: str, nest: str, e
         raise RuntimeError("Select a real nest and egg from autocomplete before changing the server egg.")
     nest_name = nest.split(":", 1)[1] if ":" in nest else f"Nest {nest_id}"
     egg_name = egg.split(":", 1)[1] if ":" in egg else f"Egg {egg_id}"
+    ensure_not_suspended(row, "egg changes")
     panel = await ready_application_client_for(row)
     await panel.change_server_egg(server, nest_id, egg_id)
     reinstall_requested = reinstall or wipe_files
@@ -1929,7 +2159,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
         with db() as connection:
             connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
         await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended **{record_value(row, 'name', server)}**."), ephemeral=True)
-        await send_admin_audit("Server Suspended", f"Suspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe67e22)
+        await send_server_event_log(row, "Server Suspended", f"Suspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe67e22)
         return
 
     rows = fetch_user_servers(user.id) if user else fetch_servers_by_email(email) if email else []
@@ -1949,7 +2179,7 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     with db() as connection:
         connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
     await interaction.followup.send(embed=branded_embed("Server Unsuspended", f"Unsuspended server `{server}`."), ephemeral=True)
-    await send_admin_audit("Server Unsuspended", f"Unsuspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0x2ecc71)
+    await send_server_event_log(row, "Server Unsuspended", f"Unsuspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0x2ecc71)
 
 
 @tree.command(name="stopall", description="Stop all except whitelist")
@@ -1957,12 +2187,23 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
 async def stopall(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     stopped = 0
+    skipped_suspended = 0
+    skipped_whitelisted = 0
+    skipped_missing_identifier = 0
     for row in fetch_all_servers():
-        if is_whitelisted(row["server_id"]) or not row["identifier"]:
+        if is_whitelisted(row["server_id"]):
+            skipped_whitelisted += 1
             continue
-        await (await ready_client_api_for(row)).power(row["identifier"], "stop")
+        if not row["identifier"]:
+            skipped_missing_identifier += 1
+            continue
+        live_row = await refresh_tracked_server(row) or row
+        if server_is_suspended(live_row):
+            skipped_suspended += 1
+            continue
+        await (await ready_client_api_for(live_row)).power(live_row["identifier"], "stop")
         stopped += 1
-    await interaction.followup.send(embed=branded_embed("Stop All Complete", f"Stopped **{stopped}** server(s). Whitelisted servers were skipped."), ephemeral=True)
+    await interaction.followup.send(embed=branded_embed("Stop All Complete", f"Stopped **{stopped}** server(s).\nSkipped: **{skipped_whitelisted}** whitelisted • **{skipped_suspended}** suspended • **{skipped_missing_identifier}** missing client identifier."), ephemeral=True)
 
 
 @tree.command(name="autobackup-enable", description="Enable autobackups")
@@ -2512,19 +2753,15 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
             print(f"Lifecycle DM forbidden for user {record['discord_user_id']} on server {record['server_id']}.")
         except Exception as error:
             print(f"Failed to send lifecycle DM for server {record['server_id']}: {error}")
-    if plan == "paid":
-        try:
-            channel_id = int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))
-            channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-            admin_embed = branded_embed(
-                f"Admin Log: {title}",
-                server_admin_details(record, user=user, event_when=when, reason=message),
-                0xe67e22 if event != "deleted" else 0xe74c3c,
-            )
-            await channel.send(embed=admin_embed)
-            delivered = True
-        except Exception as error:
-            print(f"Failed to send paid lifecycle reminder for server {record['server_id']} to log channel: {error}")
+    try:
+        admin_embed = branded_embed(
+            f"Admin Log: {title}",
+            server_admin_details(record, user=user, event_when=when, reason=message),
+            0xe67e22 if event != "deleted" else 0xe74c3c,
+        )
+        delivered = await send_plan_log(plan, admin_embed) or delivered
+    except Exception as error:
+        print(f"Failed to send {plan} lifecycle reminder for server {record['server_id']} to log channel: {error}")
     return delivered
 
 
@@ -2726,9 +2963,10 @@ async def on_ready() -> None:
     guild_id = config.get("guild_id")
     if guild_id:
         guild = discord.Object(id=int(guild_id))
-        tree.clear_commands(guild=guild)
-        cleared_guild_commands = await tree.sync(guild=guild)
-        print(f"Synced {len(global_commands)} global/DM commands and cleared {len(cleared_guild_commands)} guild duplicate commands.")
+        tree.copy_global_to(guild=guild)
+        guild_commands = await tree.sync(guild=guild)
+        command_names = ", ".join(sorted(command.name for command in guild_commands))
+        print(f"Synced {len(global_commands)} global/DM commands and {len(guild_commands)} instant guild commands: {command_names}")
     else:
         print(f"Synced {len(global_commands)} global/DM commands.")
     if not suspend_expired_servers.is_running():
