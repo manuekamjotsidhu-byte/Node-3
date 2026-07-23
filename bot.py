@@ -17,6 +17,7 @@ SQLITE_PATH = Path("data/zerox_host.db")
 DEVELOPER = "ekamsidhu07 ekam"
 BRAND = "ZeroX Host"
 PAID_LOG_CHANNEL_ID = 1504092779700289536
+FREE_LOG_CHANNEL_ID = 1529782327348170873
 ADMIN_LOG_CHANNEL_ID = 1504092779700289536
 ADMIN_ROLE_ID = 1504092228778459226
 OWNER_ROLE_ID = 1504092176492265553
@@ -772,6 +773,23 @@ def branded_embed(title: str, description: str, color: int = 0x00d4ff) -> discor
 
 
 
+def plan_log_channel_id(plan: str) -> int:
+    if str(plan).strip().lower() == "paid":
+        return int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))
+    return int(config.get("free_log_channel_id", FREE_LOG_CHANNEL_ID))
+
+
+async def send_plan_log(plan: str, embed: discord.Embed) -> bool:
+    try:
+        channel_id = plan_log_channel_id(plan)
+        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+        await channel.send(embed=embed)
+        return True
+    except Exception as error:
+        print(f"Failed to send {plan} server log: {error}")
+        return False
+
+
 async def send_admin_audit(title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> None:
     channel_id_value = config.get("admin_log_channel_id") or config.get("paid_log_channel_id", ADMIN_LOG_CHANNEL_ID)
     if not channel_id_value:
@@ -1479,14 +1497,13 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     await interaction.followup.send(embed=created, ephemeral=True)
     await send_admin_audit("Server Created", f"Plan: **{plan}**\nServer: **{name}** (`{server_id}`)\nOwner: {user.mention} (`{user.id}`)\nEmail: `{panel_email}`\nNode: **{node_name}**\nExpires: <t:{int(expires_at.timestamp())}:F>", actor=interaction.user, color=0x2ecc71)
 
-    if plan == "paid":
-        channel = client.get_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))) or await client.fetch_channel(int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID)))
-        log_embed = branded_embed(
-            "Paid Server Created",
-            server_admin_details(record, user=user, event_when=expires_at, reason=f"Paid server created; Saga auto suspension {'synced' if saga_synced else 'not synced'}"),
-            0xf1c40f,
-        )
-        await channel.send(embed=log_embed)
+    plan_title = "Paid" if plan == "paid" else "Free"
+    log_embed = branded_embed(
+        f"{plan_title} Server Created",
+        server_admin_details(record, user=user, event_when=expires_at, reason=f"{plan_title} server created; Saga auto suspension {'synced' if saga_synced else 'not synced'}"),
+        0xf1c40f if plan == "paid" else 0x00d4ff,
+    )
+    await send_plan_log(plan, log_embed)
 
 
 
@@ -1726,14 +1743,9 @@ async def list_mine(interaction: discord.Interaction, user: discord.User | None 
         title = "Servers For Email"
         description = f"Tracked servers linked to panel email `{clean(normalized_email, 120)}`."
     else:
-        if command_allows_admin_access(interaction):
-            rows = list((await fetch_live_panel_records(enrich_owner=True)).values())
-            title = "All Servers"
-            description = "Public overview with important status only. Use admin filters for sensitive UUID/email details."
-        else:
-            rows = await refresh_user_servers(interaction.user.id)
-            title = "Your Servers"
-            description = "Only your own linked/tracked servers are shown here."
+        rows = await refresh_user_servers(interaction.user.id)
+        title = "Your Servers"
+        description = "Only your own linked/tracked servers are shown here. Admins can use `/admin list` for all servers."
 
     if not rows:
         await interaction.followup.send(embed=branded_embed(title, "No servers found."), ephemeral=admin_filter_requested)
@@ -2574,19 +2586,15 @@ async def send_lifecycle_dm(record: sqlite3.Row, event: str, when: datetime, not
             print(f"Lifecycle DM forbidden for user {record['discord_user_id']} on server {record['server_id']}.")
         except Exception as error:
             print(f"Failed to send lifecycle DM for server {record['server_id']}: {error}")
-    if plan == "paid":
-        try:
-            channel_id = int(config.get("paid_log_channel_id", PAID_LOG_CHANNEL_ID))
-            channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
-            admin_embed = branded_embed(
-                f"Admin Log: {title}",
-                server_admin_details(record, user=user, event_when=when, reason=message),
-                0xe67e22 if event != "deleted" else 0xe74c3c,
-            )
-            await channel.send(embed=admin_embed)
-            delivered = True
-        except Exception as error:
-            print(f"Failed to send paid lifecycle reminder for server {record['server_id']} to log channel: {error}")
+    try:
+        admin_embed = branded_embed(
+            f"Admin Log: {title}",
+            server_admin_details(record, user=user, event_when=when, reason=message),
+            0xe67e22 if event != "deleted" else 0xe74c3c,
+        )
+        delivered = await send_plan_log(plan, admin_embed) or delivered
+    except Exception as error:
+        print(f"Failed to send {plan} lifecycle reminder for server {record['server_id']} to log channel: {error}")
     return delivered
 
 
