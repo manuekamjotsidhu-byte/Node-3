@@ -843,6 +843,54 @@ def trustpilot_embed() -> discord.Embed:
     return embed
 
 
+
+def format_bill_money(amount: float, currency: str) -> str:
+    safe_currency = clean(currency.upper(), 8) or "USD"
+    return f"{safe_currency} {amount:,.2f}"
+
+
+def premium_bill_embed(
+    *,
+    user: discord.User,
+    plan: str,
+    price: float,
+    specifications: str,
+    tax_percentage: float,
+    discount_percentage: float,
+    other_charges: float,
+    currency: str,
+    notes: str | None,
+    bill_id: str,
+) -> discord.Embed:
+    discount_amount = price * (discount_percentage / 100)
+    taxable_subtotal = max(price - discount_amount + other_charges, 0)
+    tax_amount = taxable_subtotal * (tax_percentage / 100)
+    total = taxable_subtotal + tax_amount
+    embed = branded_embed(
+        "Premium Bill",
+        f"Premium {BRAND} invoice for {user.mention}. Please review the plan, specifications, and total before payment.",
+        0x0b132b,
+    )
+    embed.add_field(name="🧾 Bill ID", value=f"`{bill_id}`", inline=True)
+    embed.add_field(name="👤 Customer", value=f"{user.mention}\n`{user.id}`", inline=True)
+    embed.add_field(name="📦 Plan", value=plan.title(), inline=True)
+    embed.add_field(name="⚙️ Specifications", value=clean(specifications, 1000) or "Not specified", inline=False)
+    embed.add_field(
+        name="💰 Price Summary",
+        value=(
+            f"Base price: **{format_bill_money(price, currency)}**\n"
+            f"Discount ({discount_percentage:.2f}%): **-{format_bill_money(discount_amount, currency)}**\n"
+            f"Other charges: **{format_bill_money(other_charges, currency)}**\n"
+            f"Tax ({tax_percentage:.2f}%): **{format_bill_money(tax_amount, currency)}**\n"
+            f"Total due: **{format_bill_money(total, currency)}**"
+        ),
+        inline=False,
+    )
+    if notes and notes.strip():
+        embed.add_field(name="📝 Notes / Payment Details", value=clean(notes, 1000), inline=False)
+    embed.add_field(name="✅ Status", value="Premium bill created. Pay only through official ZeroX Host payment methods.", inline=False)
+    return embed
+
 def panel_server_embed(server: dict[str, Any], email: str, discord_label: str) -> discord.Embed:
     embed = branded_embed("Panel Server", f"**{server['name']}**", 0x5865f2)
     embed.add_field(name="Server ID", value=f"`{server['id']}`", inline=True)
@@ -1511,6 +1559,62 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
 @tree.command(name="about", description="Show the ZeroX Host Pterodactyl Manager overview")
 async def about(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=about_embed(), ephemeral=True)
+
+
+
+@tree.command(name="bill", description="Admin: create a premium bill for VPS or Minecraft hosting")
+@admin_only()
+@app_commands.describe(
+    user="Customer who should receive the bill",
+    price="Base price before discount, tax, and other charges",
+    specifications="Server specifications, term, add-ons, or package details",
+    tax_percentage="Tax percentage to add after discount and other charges",
+    discount_percentage="Discount percentage to subtract from the base price",
+    other_charges="Additional fixed charges such as setup fees",
+    currency="Currency code, for example USD, INR, EUR",
+    notes="Optional payment instructions or extra bill notes",
+)
+@app_commands.choices(plan=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="minecraft")])
+async def bill(
+    interaction: discord.Interaction,
+    user: discord.User,
+    plan: app_commands.Choice[str],
+    price: float,
+    specifications: str,
+    tax_percentage: float = 0.0,
+    discount_percentage: float = 0.0,
+    other_charges: float = 0.0,
+    currency: str = "USD",
+    notes: str | None = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    if price < 0 or other_charges < 0:
+        raise RuntimeError("Price and other charges cannot be negative.")
+    if tax_percentage < 0 or discount_percentage < 0:
+        raise RuntimeError("Tax and discount percentages cannot be negative.")
+    if discount_percentage > 100:
+        raise RuntimeError("Discount percentage cannot be more than 100%.")
+    bill_id = f"ZX-{utc_now().strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
+    embed = premium_bill_embed(
+        user=user,
+        plan=plan.value,
+        price=price,
+        specifications=specifications,
+        tax_percentage=tax_percentage,
+        discount_percentage=discount_percentage,
+        other_charges=other_charges,
+        currency=currency,
+        notes=notes,
+        bill_id=bill_id,
+    )
+    dm_status = "sent"
+    try:
+        await user.send(embed=embed)
+    except discord.Forbidden:
+        dm_status = "blocked by the user"
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(f"Bill `{bill_id}` created for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
+    await send_admin_audit("Premium Bill Created", f"Bill `{bill_id}` for {user.mention} (`{user.id}`) • Plan: **{plan.value.title()}** • Total shown in bill embed.", actor=interaction.user, color=0xf1c40f)
 
 
 @tree.command(name="create-free", description="Create free server")
