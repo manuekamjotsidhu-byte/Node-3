@@ -3148,13 +3148,16 @@ async def on_ready() -> None:
     global_commands = await tree.sync()
     guild_id = config.get("guild_id")
     if guild_id:
+        # Do not copy globals into the guild: registering both global commands
+        # and guild command copies makes Discord show duplicate slash commands.
+        # Sync an empty guild command set so any older guild copies are removed
+        # while the global command definitions remain available in the guild.
         guild = discord.Object(id=int(guild_id))
-        tree.copy_global_to(guild=guild)
-        guild_commands = await tree.sync(guild=guild)
-        command_names = ", ".join(sorted(command.name for command in guild_commands))
-        print(f"Synced {len(global_commands)} global/DM commands and {len(guild_commands)} instant guild commands: {command_names}")
+        tree.clear_commands(guild=guild)
+        removed_guild_commands = await tree.sync(guild=guild)
+        print(f"Synced {len(global_commands)} global commands and cleared guild command copies ({len(removed_guild_commands)} remaining).")
     else:
-        print(f"Synced {len(global_commands)} global/DM commands.")
+        print(f"Synced {len(global_commands)} global commands.")
     if not send_vps_bill_reminders.is_running():
         send_vps_bill_reminders.start()
     if not suspend_expired_servers.is_running():
