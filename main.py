@@ -190,13 +190,15 @@ class Store:
             closed_at TEXT, scheduled_delete_at TEXT, claimed_by INTEGER, claim_at TEXT, pinned INTEGER NOT NULL DEFAULT 0,
             added_users TEXT NOT NULL DEFAULT '', custom_channel_name TEXT, transcript_status TEXT NOT NULL DEFAULT 'missing',
             transcript_reference TEXT, closed_by INTEGER, deleted_by INTEGER, deleted_at TEXT, close_reason TEXT,
-            no_close INTEGER NOT NULL DEFAULT 0, pinned_position INTEGER
+            no_close INTEGER NOT NULL DEFAULT 0, pinned_position INTEGER, control_message_id INTEGER
         )""")
         existing_columns = {row[1] for row in self.db.execute("PRAGMA table_info(tickets)").fetchall()}
         if "no_close" not in existing_columns:
             self.db.execute("ALTER TABLE tickets ADD COLUMN no_close INTEGER NOT NULL DEFAULT 0")
         if "pinned_position" not in existing_columns:
             self.db.execute("ALTER TABLE tickets ADD COLUMN pinned_position INTEGER")
+        if "control_message_id" not in existing_columns:
+            self.db.execute("ALTER TABLE tickets ADD COLUMN control_message_id INTEGER")
         self.db.commit()
 
     def row(self, q: str, args=()):
@@ -339,6 +341,14 @@ class TicketBot(commands.Bot):
         log.warning("log channel missing: %s %s", title, desc)
         return False
 
+    def queue_log_event(self, title: str, desc: str = "", ticket=None) -> None:
+        async def runner():
+            try:
+                await self.log_event(title, desc, ticket)
+            except Exception as e:
+                log.warning("queued log event failed for %s: %s", title, e)
+        self.loop.create_task(runner())
+
     def panel_embed(self) -> discord.Embed:
         p = self.cfg["panel"]
         e = discord.Embed(title=p["title"], description=p["description"], color=color_value(p["color"]), timestamp=utcnow())
@@ -453,8 +463,14 @@ class TicketBot(commands.Bot):
         if not ticket:
             return
         try:
+            message_id = ticket["control_message_id"]
+            if message_id:
+                message = await channel.fetch_message(message_id)
+                await message.edit(embed=self.ticket_embed(ticket), view=TicketControlView(self))
+                return
             async for message in channel.history(limit=25):
                 if message.author == self.user and message.embeds and message.embeds[0].title == "🎟️ Ticket Opened":
+                    self.store.exec("UPDATE tickets SET control_message_id=? WHERE ticket_id=?", (message.id, ticket["ticket_id"]))
                     await message.edit(embed=self.ticket_embed(ticket), view=TicketControlView(self))
                     return
         except Exception as e:
@@ -489,13 +505,14 @@ class TicketBot(commands.Bot):
                 ch = await guild.create_text_channel(base, category=cat, overwrites=overwrites, reason=f"Ticket #{tid}")
                 self.store.exec("UPDATE tickets SET channel_id=?, custom_channel_name=? WHERE ticket_id=?", (ch.id, base, tid))
                 ticket = self.ticket_by_channel(ch.id)
-                await ch.send(
+                control_msg = await ch.send(
                     content=f"{interaction.user.mention} {staff.mention if staff else ''}".strip(),
                     embed=self.ticket_embed(ticket),
                     view=TicketControlView(self),
                     allowed_mentions=discord.AllowedMentions(users=True, roles=True),
                 )
-                await self.log_event("Ticket opened", f"Channel: {ch.mention}", ticket)
+                self.store.exec("UPDATE tickets SET control_message_id=? WHERE ticket_id=?", (control_msg.id, tid))
+                self.queue_log_event("Ticket opened", f"Channel: {ch.mention}", self.ticket_by_channel(ch.id))
                 view = discord.ui.View(); view.add_item(discord.ui.Button(label="🎟️ Visit Ticket ↗", url=ch.jump_url))
                 created = discord.Embed(title="🎟️ Ticket Created", description="Your ticket has been created. Click the button below to access it!", color=0xF59E0B, timestamp=utcnow())
                 created.set_author(name="ZeroX Host Support")
@@ -617,7 +634,7 @@ class TicketBot(commands.Bot):
             embed = discord.Embed(title="🔓 Ticket Reopened", description=reason or "Ticket reopened", color=0x57F287, timestamp=utcnow())
             embed.set_footer(text="ZeroX Host • Ticket Active")
             await channel.send(embed=embed)
-            await self.log_event("Ticket reopened", f"By {actor.mention}\nReason: {reason or 'Ticket reopened'}", self.ticket_by_channel(channel.id))
+            self.queue_log_event("Ticket reopened", f"By {actor.mention}\nReason: {reason or 'Ticket reopened'}", self.ticket_by_channel(channel.id))
             return True
         except Exception as e:
             log.warning("ticket reopen failed for channel %s: %s", channel.id, e)
@@ -854,7 +871,7 @@ async def claim_ticket(bot, interaction):
         return await bot.safe_send(interaction, "This ticket is already claimed.", ephemeral=True)
     bot.store.exec("UPDATE tickets SET claimed_by=?, claim_at=? WHERE ticket_id=?", (interaction.user.id, iso(), t["ticket_id"]))
     await bot.refresh_ticket_message(interaction.channel)
-    await bot.log_event("Ticket claimed", f"Claimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
+    bot.queue_log_event("Ticket claimed", f"Claimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket claimed.", ephemeral=True)
 async def unclaim_ticket(bot, interaction):
     await defer_if_needed(interaction)
@@ -862,7 +879,7 @@ async def unclaim_ticket(bot, interaction):
     if not t: return
     bot.store.exec("UPDATE tickets SET claimed_by=NULL, claim_at=NULL WHERE ticket_id=?", (t["ticket_id"],))
     await bot.refresh_ticket_message(interaction.channel)
-    await bot.log_event("Ticket unclaimed", f"Unclaimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
+    bot.queue_log_event("Ticket unclaimed", f"Unclaimed by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket unclaimed.", ephemeral=True)
 async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
     await defer_if_needed(interaction)
@@ -879,7 +896,7 @@ async def set_pin_ticket(bot, interaction, desired: Optional[bool] = None):
     try: await interaction.channel.edit(name=name, position=0 if new else restore_position)
     except Exception as e: log.warning("pin reorder/rename failed: %s", e)
     await bot.refresh_ticket_message(interaction.channel)
-    await bot.log_event("Ticket pinned" if new else "Ticket unpinned", f"By {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
+    bot.queue_log_event("Ticket pinned" if new else "Ticket unpinned", f"By {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Pinned." if new else "Unpinned.", ephemeral=True)
 
 
@@ -914,7 +931,7 @@ async def set_no_close_ticket(bot, interaction, channel: Optional[discord.TextCh
     desc += "**Recent tickets**\n" + ("\n".join(lines) if lines else "No tickets found.")
     embed = discord.Embed(title="🛡️ Ticket No-Close Enabled", description=desc[:4000], color=0x57F287, timestamp=utcnow())
     embed.set_footer(text="No-close tickets are skipped by automated maintenance.")
-    await bot.log_event("Ticket no-close enabled", f"By {interaction.user.mention}\nChannel: {target.mention}", updated)
+    bot.queue_log_event("Ticket no-close enabled", f"By {interaction.user.mention}\nChannel: {target.mention}", updated)
     await bot.safe_send(interaction, embed=embed, ephemeral=True)
 
 async def pin_ticket(bot, interaction):
@@ -928,7 +945,7 @@ async def rename_channel(bot, interaction, name):
     old = interaction.channel.name
     await interaction.channel.edit(name=final[:100])
     bot.store.exec("UPDATE tickets SET custom_channel_name=? WHERE ticket_id=?", (clean, t["ticket_id"]))
-    await bot.log_event("Ticket renamed", f"By {interaction.user.mention}\nOld: {old}\nNew: {final}", bot.ticket_by_channel(interaction.channel.id))
+    bot.queue_log_event("Ticket renamed", f"By {interaction.user.mention}\nOld: {old}\nNew: {final}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, "Ticket renamed.", ephemeral=True)
 async def user_action(bot, interaction, member, action):
     await defer_if_needed(interaction)
@@ -945,7 +962,7 @@ async def user_action(bot, interaction, member, action):
         if str(member.id) not in added: return await bot.safe_send(interaction, "That user was never added.", ephemeral=True)
         added.remove(str(member.id)); await interaction.channel.set_permissions(member, overwrite=None); msg = "User removed"
     bot.store.exec("UPDATE tickets SET added_users=? WHERE ticket_id=?", (",".join(sorted(added)), t["ticket_id"]))
-    await bot.log_event(msg, f"{member.mention} by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
+    bot.queue_log_event(msg, f"{member.mention} by {interaction.user.mention}", bot.ticket_by_channel(interaction.channel.id))
     await bot.safe_send(interaction, msg + ".", ephemeral=True)
 
 bot = TicketBot()
