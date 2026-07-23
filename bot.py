@@ -155,7 +155,8 @@ def init_db() -> None:
             node_id TEXT PRIMARY KEY,
             state TEXT NOT NULL,
             summary TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            down_since TEXT
         );
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
@@ -163,6 +164,9 @@ def init_db() -> None:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_enabled INTEGER NOT NULL DEFAULT 1")
         if "autosuspend_seconds" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_seconds INTEGER")
+        node_status_columns = {row[1] for row in connection.execute("PRAGMA table_info(node_status)").fetchall()}
+        if "down_since" not in node_status_columns:
+            connection.execute("ALTER TABLE node_status ADD COLUMN down_since TEXT")
         # Legacy databases may contain older link columns, but new installs use one panel only.
 
 
@@ -307,14 +311,14 @@ def fetch_node_status(node_id: str) -> sqlite3.Row | None:
         return connection.execute("SELECT * FROM node_status WHERE node_id=?", (str(node_id),)).fetchone()
 
 
-def upsert_node_status(node_id: str, state: str, summary: str) -> None:
+def upsert_node_status(node_id: str, state: str, summary: str, down_since: str | None = None) -> None:
     with db() as connection:
         connection.execute(
             """
-            INSERT INTO node_status(node_id, state, summary, updated_at) VALUES (?,?,?,?)
-            ON CONFLICT(node_id) DO UPDATE SET state=excluded.state, summary=excluded.summary, updated_at=excluded.updated_at
+            INSERT INTO node_status(node_id, state, summary, updated_at, down_since) VALUES (?,?,?,?,?)
+            ON CONFLICT(node_id) DO UPDATE SET state=excluded.state, summary=excluded.summary, updated_at=excluded.updated_at, down_since=excluded.down_since
             """,
-            (str(node_id), state, summary, utc_now().isoformat()),
+            (str(node_id), state, summary, utc_now().isoformat(), down_since),
         )
 
 
@@ -1986,7 +1990,44 @@ def node_dashboard_field(node: dict[str, Any], records: list[sqlite3.Row | dict[
 
 
 
-def node_health_summary(node: dict[str, Any], records: list[sqlite3.Row | dict[str, Any]]) -> tuple[str, str, int, float, float]:
+
+
+def node_daemon_url(node: dict[str, Any]) -> str | None:
+    fqdn = str(node.get("fqdn") or node.get("address") or "").strip()
+    if not fqdn:
+        return None
+    scheme = str(node.get("scheme") or "https").strip() or "https"
+    port = int(node.get("daemon_listen") or node.get("daemon_port") or 8080)
+    return f"{scheme}://{fqdn}:{port}/api/system"
+
+
+async def node_daemon_reachable(node: dict[str, Any]) -> bool:
+    url = node_daemon_url(node)
+    if not url:
+        return False
+    timeout = aiohttp.ClientTimeout(total=5)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, ssl=False) as response:
+                # 200 means the daemon answered; 401/403 also means Wings is reachable
+                # but requires auth. Connection errors/timeouts mean offline.
+                return response.status < 500
+    except Exception:
+        return False
+
+
+def format_downtime(down_since: str | None, ended_at: datetime | None = None) -> str | None:
+    if not down_since:
+        return None
+    try:
+        started = datetime.fromisoformat(down_since)
+    except ValueError:
+        return None
+    ended = ended_at or utc_now()
+    return describe_duration(int((ended - started).total_seconds()))
+
+
+def node_health_summary(node: dict[str, Any], records: list[sqlite3.Row | dict[str, Any]], daemon_online: bool | None = None) -> tuple[str, str, int, float, float]:
     node_id = int(node.get("id") or 0)
     node_records = [record for record in records if int(record_value(record, "node_id", 0) or 0) == node_id]
     memory_total = node_capacity_value(node, "memory", "memory_limit")
@@ -1999,12 +2040,13 @@ def node_health_summary(node: dict[str, Any], records: list[sqlite3.Row | dict[s
     crashing = sum(1 for status in statuses if any(word in status for word in ("crash", "error", "failed", "offline")))
     maintenance = bool(node.get("maintenance_mode") or node.get("maintenance"))
     overloaded = memory_pct >= 90 or disk_pct >= 90
-    state = "maintenance" if maintenance else "warning" if overloaded or crashing else "online"
-    summary = f"servers={len(node_records)} memory={memory_pct:.1f}% disk={disk_pct:.1f}% crashing={crashing}"
+    state = "offline" if daemon_online is False else "maintenance" if maintenance else "warning" if overloaded or crashing else "online"
+    daemon_text = "offline" if daemon_online is False else "online" if daemon_online is True else "unknown"
+    summary = f"daemon={daemon_text} servers={len(node_records)} memory={memory_pct:.1f}% disk={disk_pct:.1f}% crashing={crashing}"
     return state, summary, len(node_records), memory_pct, disk_pct
 
 
-async def send_node_status_webhook(node: dict[str, Any], previous_state: str | None, state: str, summary: str, server_count: int, memory_pct: float, disk_pct: float) -> None:
+async def send_node_status_webhook(node: dict[str, Any], previous_state: str | None, state: str, summary: str, server_count: int, memory_pct: float, disk_pct: float, downtime: str | None = None) -> None:
     webhook_url = node_status_webhook_url()
     if not webhook_url:
         return
@@ -2013,18 +2055,21 @@ async def send_node_status_webhook(node: dict[str, Any], previous_state: str | N
     color = 0x2ecc71 if state == "online" else 0xf1c40f if state == "maintenance" else 0xe74c3c
     emoji = "🟢" if state == "online" else "🟡" if state == "maintenance" else "🔴"
     transition = f"{previous_state or 'new'} → {state}"
+    fields = [
+        {"name": "Transition", "value": transition, "inline": True},
+        {"name": "Live servers", "value": str(server_count), "inline": True},
+        {"name": "Load", "value": f"Memory **{memory_pct:.1f}%** • Disk **{disk_pct:.1f}%**", "inline": False},
+        {"name": "Summary", "value": summary, "inline": False},
+    ]
+    if downtime:
+        fields.insert(2, {"name": "Downtime", "value": downtime, "inline": True})
     payload = {
         "username": f"{BRAND} Node Watch",
         "embeds": [{
             "title": f"{emoji} Node Status Changed",
             "description": f"**{node_name}** (`{node_id}`) is now **{state.upper()}**",
             "color": color,
-            "fields": [
-                {"name": "Transition", "value": transition, "inline": True},
-                {"name": "Live servers", "value": str(server_count), "inline": True},
-                {"name": "Load", "value": f"Memory **{memory_pct:.1f}%** • Disk **{disk_pct:.1f}%**", "inline": False},
-                {"name": "Summary", "value": summary, "inline": False},
-            ],
+            "fields": fields,
             "footer": {"text": f"{BRAND} • Developer: {DEVELOPER}"},
             "timestamp": utc_now().isoformat(),
         }],
@@ -2513,17 +2558,21 @@ async def monitor_node_status() -> None:
         return
     for node in panel_nodes:
         node_id = str(node.get("id"))
-        state, summary, server_count, memory_pct, disk_pct = node_health_summary(node, records)
+        daemon_online = await node_daemon_reachable(node)
+        state, summary, server_count, memory_pct, disk_pct = node_health_summary(node, records, daemon_online)
         previous = fetch_node_status(node_id)
         previous_state = str(previous["state"]) if previous else None
         previous_summary = str(previous["summary"]) if previous else None
+        previous_down_since = str(previous["down_since"] or "") if previous and "down_since" in previous.keys() else ""
+        down_since = previous_down_since or utc_now().isoformat() if state == "offline" else None
+        downtime = format_downtime(previous_down_since) if previous_state == "offline" and state != "offline" else None
         changed = previous is not None and (previous_state != state or (state == "warning" and previous_summary != summary))
         if changed:
             try:
-                await send_node_status_webhook(node, previous_state, state, summary, server_count, memory_pct, disk_pct)
+                await send_node_status_webhook(node, previous_state, state, summary, server_count, memory_pct, disk_pct, downtime)
             except Exception as error:
                 print(f"Failed to send node status webhook for node {node_id}: {error}")
-        upsert_node_status(node_id, state, summary)
+        upsert_node_status(node_id, state, summary, down_since)
 
 
 @tasks.loop(minutes=1)
