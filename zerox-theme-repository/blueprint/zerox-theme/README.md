@@ -41,6 +41,12 @@ accessibility options, import/export, and a reset button. Settings are stored
 in the browser and applied immediately; **Download configuration** creates a
 portable JSON backup. No credentials or panel data are collected.
 
+Version 1.5 uses the supplied panel screenshots as its default visual target:
+deep violet navigation, a black/purple abstract backdrop, translucent bordered
+cards, violet action buttons, green online states, dark console surfaces, and
+a corrected single-column mobile layout. Unlike the screenshots, content is
+kept below headings and toolbars so text and addon controls do not overlap.
+
 The extension appears under **Admin > Extensions > ZeroX Theme** and also adds
 a direct **ZeroX Theme** navigation entry beside the Nodes/Servers area. It
 opens a dedicated settings page with Appearance, Background, Layout, Branding

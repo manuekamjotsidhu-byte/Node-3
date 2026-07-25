@@ -17,7 +17,7 @@ css = (ROOT / "theme.css").read_text()
 assert ":root:not(.zerox-theme-disabled)" in css
 assert "javascript:" in (ROOT / "conf.yml").read_text()
 for line in (line.strip() for line in css.splitlines()):
-    if line.endswith("{") and not line.startswith(("@", ":root:not(.zerox-theme-disabled)", "/*")):
+    if line.endswith("{") and not line.startswith(("@", ":root:not(.zerox-theme-disabled)", "/*", ")")):
         raise AssertionError(f"Found unscoped theme selector: {line[:-1].strip()}")
 if shutil.which("node"):
     for script in ("theme.js", "admin.js"):

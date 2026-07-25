@@ -1,27 +1,31 @@
+/* ZeroX Theme 1.5 — Drago-inspired purple glass interface. */
 :root:not(.zerox-theme-disabled) {
   --zerox-theme-accent: #8b5cf6;
   --zerox-theme-accent-alt: #22d3ee;
-  --zerox-theme-success: #34d399;
+  --zerox-theme-success: #22d37f;
   --zerox-theme-danger: #fb7185;
-  --zerox-theme-bg: #080b1c;
-  --zerox-theme-surface: #11162d;
-  --zerox-theme-text: #f8fafc;
-  --zerox-theme-muted: #aab2c8;
-  --zerox-theme-radius: 16px;
-  --zerox-theme-blur: 16px;
+  --zerox-theme-bg: #070817;
+  --zerox-theme-surface: #100b29;
+  --zerox-theme-text: #f7f4ff;
+  --zerox-theme-muted: #aaa5b9;
+  --zerox-theme-radius: 18px;
+  --zerox-theme-blur: 18px;
   --zerox-theme-font-scale: 1;
-  --zerox-theme-bg-opacity: .28;
+  --zerox-theme-bg-opacity: .32;
   color-scheme: dark;
   font-size: calc(100% * var(--zerox-theme-font-scale));
 }
 
 :root:not(.zerox-theme-disabled) body {
-  color: var(--zerox-theme-text);
+  min-height: 100vh;
+  color: var(--zerox-theme-text) !important;
   background-color: var(--zerox-theme-bg) !important;
   background-image:
-    radial-gradient(circle at 12% 10%, color-mix(in srgb, var(--zerox-theme-accent) 28%, transparent), transparent 34rem),
-    radial-gradient(circle at 88% 82%, color-mix(in srgb, var(--zerox-theme-accent-alt) 18%, transparent), transparent 38rem),
-    linear-gradient(rgb(8 11 28 / calc(1 - var(--zerox-theme-bg-opacity))), rgb(8 11 28 / calc(1 - var(--zerox-theme-bg-opacity)))),
+    radial-gradient(ellipse 52% 42% at 20% 18%, rgb(157 110 255 / .35), transparent 70%),
+    radial-gradient(ellipse 32% 72% at 74% 52%, rgb(77 80 255 / .32), transparent 72%),
+    radial-gradient(ellipse 48% 30% at 12% 87%, rgb(120 73 255 / .30), transparent 75%),
+    radial-gradient(circle at 90% 94%, rgb(1 2 12 / .95), transparent 42%),
+    linear-gradient(rgb(7 8 23 / calc(1 - var(--zerox-theme-bg-opacity))), rgb(7 8 23 / calc(1 - var(--zerox-theme-bg-opacity)))),
     var(--zerox-theme-bg-image) !important;
   background-attachment: fixed !important;
   background-position: center !important;
@@ -29,50 +33,126 @@
   background-size: cover !important;
 }
 
-/* Low specificity is intentional: Blueprint addons can override the theme. */
-:root:not(.zerox-theme-disabled) :where(main, aside, nav, header, section, article, form, dialog) {
+:root:not(.zerox-theme-disabled) body::before {
+  position: fixed;
+  z-index: -1;
+  inset: -15%;
+  content: "";
+  pointer-events: none;
+  background:
+    conic-gradient(from 205deg at 30% 38%, transparent 0 19%, rgb(191 139 255 / .12) 23%, transparent 30% 100%),
+    conic-gradient(from 20deg at 78% 65%, transparent 0 31%, rgb(68 78 255 / .14) 36%, transparent 44% 100%);
+  filter: blur(22px);
+  transform: rotate(-8deg) scale(1.15);
+}
+
+/* Layout foundation: no content overlap, even with Blueprint addon pages. */
+:root:not(.zerox-theme-disabled) :where(main, aside, nav, header, section, article, form, dialog, main > div) {
   min-width: 0;
 }
 
-:root:not(.zerox-theme-disabled) :where(.bg-gray-800, .bg-gray-700, [class*="ContentBox"], [class*="style__Card"], [class*="Modal__Container"]) {
-  border: 1px solid color-mix(in srgb, var(--zerox-theme-accent) 26%, transparent) !important;
-  border-radius: var(--zerox-theme-radius) !important;
-  background: color-mix(in srgb, var(--zerox-theme-surface) 88%, transparent) !important;
-  box-shadow: 0 18px 48px rgb(0 0 0 / .22);
+/* Sidebar and navigation closely match the supplied deep-purple panel. */
+:root:not(.zerox-theme-disabled) :where(aside, [class*="Sidebar"], [class*="Navigation"]),
+:root:not(.zerox-theme-disabled) :where(#sidebar, .sidebar) {
+  border-right: 1px solid rgb(139 92 246 / .25) !important;
+  background: linear-gradient(180deg, rgb(21 8 60 / .97), rgb(8 7 28 / .96)) !important;
+  box-shadow: 18px 0 60px rgb(0 0 0 / .28);
   backdrop-filter: blur(var(--zerox-theme-blur));
 }
 
-:root:not(.zerox-theme-disabled) :where(input, textarea, select, [role="combobox"]) {
-  max-width: 100%;
-  color: var(--zerox-theme-text) !important;
-  border-color: color-mix(in srgb, var(--zerox-theme-muted) 34%, transparent) !important;
-  border-radius: max(8px, calc(var(--zerox-theme-radius) - 5px)) !important;
-  background-color: color-mix(in srgb, var(--zerox-theme-bg) 72%, transparent) !important;
+:root:not(.zerox-theme-disabled) :where(nav a, aside a, #sidebar a, .sidebar a) {
+  color: var(--zerox-theme-muted) !important;
+  border-radius: 13px !important;
+  transition: color .18s ease, background .18s ease, border-color .18s ease, transform .18s ease;
 }
 
+:root:not(.zerox-theme-disabled) :where(nav a:hover, aside a:hover, #sidebar a:hover, .sidebar a:hover),
+:root:not(.zerox-theme-disabled) :where(nav a[aria-current="page"], aside a[aria-current="page"], #sidebar li.active > a, .sidebar li.active > a) {
+  color: #fff !important;
+  border: 1px solid rgb(139 92 246 / .48) !important;
+  background: linear-gradient(135deg, rgb(139 92 246 / .24), rgb(76 29 149 / .16)) !important;
+  box-shadow: inset 0 0 20px rgb(139 92 246 / .08), 0 10px 30px rgb(0 0 0 / .16);
+}
+
+/* Glass cards used throughout dashboard, console, files, schedules and addons. */
+:root:not(.zerox-theme-disabled) :where(
+  .bg-gray-900, .bg-gray-800, .bg-gray-700, .bg-neutral-900, .bg-neutral-800,
+  [class*="ContentBox"], [class*="style__Card"], [class*="Card_"],
+  [class*="Modal__Container"], [class*="Dialog"], [class*="Widget"]
+) {
+  color: var(--zerox-theme-text) !important;
+  border: 1px solid rgb(139 92 246 / .28) !important;
+  border-radius: var(--zerox-theme-radius) !important;
+  background: linear-gradient(145deg, rgb(18 12 48 / .88), rgb(7 8 23 / .82)) !important;
+  box-shadow: inset 0 1px rgb(255 255 255 / .035), 0 20px 55px rgb(0 0 0 / .24);
+  backdrop-filter: blur(var(--zerox-theme-blur));
+}
+
+/* Inputs are opaque enough to remain readable over the wallpaper. */
+:root:not(.zerox-theme-disabled) :where(input, textarea, select, [role="combobox"], [contenteditable="true"]) {
+  max-width: 100%;
+  color: var(--zerox-theme-text) !important;
+  caret-color: var(--zerox-theme-accent-alt);
+  border: 1px solid rgb(170 165 185 / .48) !important;
+  border-radius: max(10px, calc(var(--zerox-theme-radius) - 6px)) !important;
+  background: rgb(7 6 25 / .86) !important;
+  box-shadow: inset 0 1px 8px rgb(0 0 0 / .28) !important;
+}
+
+:root:not(.zerox-theme-disabled) :where(input, textarea, select)::placeholder { color: #8f899f !important; opacity: 1; }
 :root:not(.zerox-theme-disabled) :where(button, a, input, textarea, select):focus-visible {
   outline: 3px solid color-mix(in srgb, var(--zerox-theme-accent-alt) 72%, white) !important;
   outline-offset: 2px;
 }
 
-:root:not(.zerox-theme-disabled) :where(button, [role="button"], .btn) { border-radius: max(8px, calc(var(--zerox-theme-radius) - 5px)) !important; }
+/* Buttons use the bright violet edge and restrained glass fill from references. */
+:root:not(.zerox-theme-disabled) :where(button, [role="button"], .btn) {
+  border-radius: max(10px, calc(var(--zerox-theme-radius) - 6px)) !important;
+  font-weight: 700;
+}
+:root:not(.zerox-theme-disabled) :where(button:not(:disabled):hover, [role="button"]:hover) { transform: translateY(-1px); }
+:root:not(.zerox-theme-disabled) :where(.bg-blue-500, .bg-primary-500, button[type="submit"]) {
+  color: white !important;
+  border-color: rgb(167 139 250 / .72) !important;
+  background: linear-gradient(135deg, #7c3aed, #4f46e5) !important;
+  box-shadow: 0 10px 30px rgb(124 58 237 / .28);
+}
+
+/* Status colors, meters, tables and terminal surfaces. */
+:root:not(.zerox-theme-disabled) :where(.text-green-400, .text-green-500, [class*="Success"]) { color: var(--zerox-theme-success) !important; }
+:root:not(.zerox-theme-disabled) :where(.text-red-400, .text-red-500, [class*="Danger"]) { color: var(--zerox-theme-danger) !important; }
 :root:not(.zerox-theme-disabled) :where(.text-gray-100, .text-gray-200, .text-white) { color: var(--zerox-theme-text) !important; }
 :root:not(.zerox-theme-disabled) :where(.text-gray-300, .text-gray-400, .text-neutral-400) { color: var(--zerox-theme-muted) !important; }
-:root:not(.zerox-theme-disabled) :where(.text-green-400, .text-green-500) { color: var(--zerox-theme-success) !important; }
-:root:not(.zerox-theme-disabled) :where(.text-red-400, .text-red-500) { color: var(--zerox-theme-danger) !important; }
-:root:not(.zerox-theme-disabled) :where(.border-gray-700, .border-gray-600) { border-color: color-mix(in srgb, var(--zerox-theme-accent) 25%, transparent) !important; }
+:root:not(.zerox-theme-disabled) :where(.border-gray-700, .border-gray-600) { border-color: rgb(139 92 246 / .24) !important; }
+:root:not(.zerox-theme-disabled) :where([role="progressbar"], progress) { accent-color: var(--zerox-theme-accent); }
+:root:not(.zerox-theme-disabled) :where(pre, code, [class*="Console"], [class*="Terminal"]) {
+  color: #f4f0ff !important;
+  background-color: rgb(3 4 14 / .9) !important;
+}
+:root:not(.zerox-theme-disabled) :where(table) { border-collapse: separate; border-spacing: 0; }
+:root:not(.zerox-theme-disabled) :where(th) { color: #d8d3e6 !important; background: rgb(255 255 255 / .035) !important; }
+:root:not(.zerox-theme-disabled) :where(tr + tr td) { border-top-color: rgb(139 92 246 / .16) !important; }
+
+/* Footer is deliberately themeable and no longer forced to Pterodactyl copy. */
+:root:not(.zerox-theme-disabled) :where(footer, [class*="Footer"], #footer) {
+  color: var(--zerox-theme-muted) !important;
+  background: transparent !important;
+}
 
 :root:not(.zerox-theme-disabled).zerox-theme-compact :where(.p-6, .p-4) { padding: .8rem !important; }
 :root:not(.zerox-theme-disabled).zerox-theme-high-contrast { --zerox-theme-muted: #e2e8f0; }
 :root:not(.zerox-theme-disabled).zerox-theme-high-contrast :where(input, textarea, select, button, [role="button"]) { border-width: 2px !important; }
 
+/* The supplied screenshots were phone-sized; this prevents their overlaps. */
 @media (max-width: 767px) {
-  :root:not(.zerox-theme-disabled) body { overflow-x: hidden; }
-  :root:not(.zerox-theme-disabled) :where(main, main > div, form, table, [class*="Container"], [class*="ContentBox"]) { max-width: 100%; }
+  :root:not(.zerox-theme-disabled) body { overflow-x: hidden; background-attachment: scroll !important; }
+  :root:not(.zerox-theme-disabled) :where(main, main > div, form, table, [class*="Container"], [class*="ContentBox"]) { width: 100%; max-width: 100%; }
   :root:not(.zerox-theme-disabled) :where(table) { display: block; overflow-x: auto; overscroll-behavior-inline: contain; }
-  :root:not(.zerox-theme-disabled) :where(input, textarea, select) { font-size: 16px !important; }
+  :root:not(.zerox-theme-disabled) :where(input, textarea, select) { min-height: 46px; font-size: 16px !important; }
   :root:not(.zerox-theme-disabled) :where(.grid-cols-2, .grid-cols-3, .grid-cols-4) { grid-template-columns: minmax(0, 1fr) !important; }
-  :root:not(.zerox-theme-disabled) :where(h1) { font-size: clamp(1.55rem, 8vw, 2.25rem) !important; line-height: 1.12; }
+  :root:not(.zerox-theme-disabled) :where(h1) { margin-block: .25rem 1rem; font-size: clamp(1.65rem, 8vw, 2.35rem) !important; line-height: 1.12; }
+  :root:not(.zerox-theme-disabled) :where(h2) { font-size: clamp(1.25rem, 5.5vw, 1.7rem) !important; }
+  :root:not(.zerox-theme-disabled) :where(.p-6) { padding: 1rem !important; }
 }
 
 @media (prefers-reduced-motion: reduce) {
