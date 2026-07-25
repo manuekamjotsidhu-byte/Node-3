@@ -1,4 +1,4 @@
-:root.zerox-theme {
+:root:not(.zerox-theme-disabled) {
   --zerox-theme-accent: #8b5cf6;
   --zerox-theme-accent-alt: #22d3ee;
   --zerox-theme-success: #34d399;
@@ -15,7 +15,7 @@
   font-size: calc(100% * var(--zerox-theme-font-scale));
 }
 
-:root.zerox-theme body {
+:root:not(.zerox-theme-disabled) body {
   color: var(--zerox-theme-text);
   background-color: var(--zerox-theme-bg) !important;
   background-image:
@@ -30,11 +30,11 @@
 }
 
 /* Low specificity is intentional: Blueprint addons can override the theme. */
-:root.zerox-theme :where(main, aside, nav, header, section, article, form, dialog) {
+:root:not(.zerox-theme-disabled) :where(main, aside, nav, header, section, article, form, dialog) {
   min-width: 0;
 }
 
-:root.zerox-theme :where(.bg-gray-800, .bg-gray-700, [class*="ContentBox"], [class*="style__Card"], [class*="Modal__Container"]) {
+:root:not(.zerox-theme-disabled) :where(.bg-gray-800, .bg-gray-700, [class*="ContentBox"], [class*="style__Card"], [class*="Modal__Container"]) {
   border: 1px solid color-mix(in srgb, var(--zerox-theme-accent) 26%, transparent) !important;
   border-radius: var(--zerox-theme-radius) !important;
   background: color-mix(in srgb, var(--zerox-theme-surface) 88%, transparent) !important;
@@ -42,7 +42,7 @@
   backdrop-filter: blur(var(--zerox-theme-blur));
 }
 
-:root.zerox-theme :where(input, textarea, select, [role="combobox"]) {
+:root:not(.zerox-theme-disabled) :where(input, textarea, select, [role="combobox"]) {
   max-width: 100%;
   color: var(--zerox-theme-text) !important;
   border-color: color-mix(in srgb, var(--zerox-theme-muted) 34%, transparent) !important;
@@ -50,32 +50,32 @@
   background-color: color-mix(in srgb, var(--zerox-theme-bg) 72%, transparent) !important;
 }
 
-:root.zerox-theme :where(button, a, input, textarea, select):focus-visible {
+:root:not(.zerox-theme-disabled) :where(button, a, input, textarea, select):focus-visible {
   outline: 3px solid color-mix(in srgb, var(--zerox-theme-accent-alt) 72%, white) !important;
   outline-offset: 2px;
 }
 
-:root.zerox-theme :where(button, [role="button"], .btn) { border-radius: max(8px, calc(var(--zerox-theme-radius) - 5px)) !important; }
-:root.zerox-theme :where(.text-gray-100, .text-gray-200, .text-white) { color: var(--zerox-theme-text) !important; }
-:root.zerox-theme :where(.text-gray-300, .text-gray-400, .text-neutral-400) { color: var(--zerox-theme-muted) !important; }
-:root.zerox-theme :where(.text-green-400, .text-green-500) { color: var(--zerox-theme-success) !important; }
-:root.zerox-theme :where(.text-red-400, .text-red-500) { color: var(--zerox-theme-danger) !important; }
-:root.zerox-theme :where(.border-gray-700, .border-gray-600) { border-color: color-mix(in srgb, var(--zerox-theme-accent) 25%, transparent) !important; }
+:root:not(.zerox-theme-disabled) :where(button, [role="button"], .btn) { border-radius: max(8px, calc(var(--zerox-theme-radius) - 5px)) !important; }
+:root:not(.zerox-theme-disabled) :where(.text-gray-100, .text-gray-200, .text-white) { color: var(--zerox-theme-text) !important; }
+:root:not(.zerox-theme-disabled) :where(.text-gray-300, .text-gray-400, .text-neutral-400) { color: var(--zerox-theme-muted) !important; }
+:root:not(.zerox-theme-disabled) :where(.text-green-400, .text-green-500) { color: var(--zerox-theme-success) !important; }
+:root:not(.zerox-theme-disabled) :where(.text-red-400, .text-red-500) { color: var(--zerox-theme-danger) !important; }
+:root:not(.zerox-theme-disabled) :where(.border-gray-700, .border-gray-600) { border-color: color-mix(in srgb, var(--zerox-theme-accent) 25%, transparent) !important; }
 
-:root.zerox-theme.zerox-theme-compact :where(.p-6, .p-4) { padding: .8rem !important; }
-:root.zerox-theme.zerox-theme-high-contrast { --zerox-theme-muted: #e2e8f0; }
-:root.zerox-theme.zerox-theme-high-contrast :where(input, textarea, select, button, [role="button"]) { border-width: 2px !important; }
+:root:not(.zerox-theme-disabled).zerox-theme-compact :where(.p-6, .p-4) { padding: .8rem !important; }
+:root:not(.zerox-theme-disabled).zerox-theme-high-contrast { --zerox-theme-muted: #e2e8f0; }
+:root:not(.zerox-theme-disabled).zerox-theme-high-contrast :where(input, textarea, select, button, [role="button"]) { border-width: 2px !important; }
 
 @media (max-width: 767px) {
-  :root.zerox-theme body { overflow-x: hidden; }
-  :root.zerox-theme :where(main, main > div, form, table, [class*="Container"], [class*="ContentBox"]) { max-width: 100%; }
-  :root.zerox-theme :where(table) { display: block; overflow-x: auto; overscroll-behavior-inline: contain; }
-  :root.zerox-theme :where(input, textarea, select) { font-size: 16px !important; }
-  :root.zerox-theme :where(.grid-cols-2, .grid-cols-3, .grid-cols-4) { grid-template-columns: minmax(0, 1fr) !important; }
-  :root.zerox-theme :where(h1) { font-size: clamp(1.55rem, 8vw, 2.25rem) !important; line-height: 1.12; }
+  :root:not(.zerox-theme-disabled) body { overflow-x: hidden; }
+  :root:not(.zerox-theme-disabled) :where(main, main > div, form, table, [class*="Container"], [class*="ContentBox"]) { max-width: 100%; }
+  :root:not(.zerox-theme-disabled) :where(table) { display: block; overflow-x: auto; overscroll-behavior-inline: contain; }
+  :root:not(.zerox-theme-disabled) :where(input, textarea, select) { font-size: 16px !important; }
+  :root:not(.zerox-theme-disabled) :where(.grid-cols-2, .grid-cols-3, .grid-cols-4) { grid-template-columns: minmax(0, 1fr) !important; }
+  :root:not(.zerox-theme-disabled) :where(h1) { font-size: clamp(1.55rem, 8vw, 2.25rem) !important; line-height: 1.12; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  :root.zerox-theme *, :root.zerox-theme *::before, :root.zerox-theme *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+  :root:not(.zerox-theme-disabled) *, :root:not(.zerox-theme-disabled) *::before, :root:not(.zerox-theme-disabled) *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
-:root.zerox-theme.zerox-theme-reduce-motion *, :root.zerox-theme.zerox-theme-reduce-motion *::before, :root.zerox-theme.zerox-theme-reduce-motion *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+:root:not(.zerox-theme-disabled).zerox-theme-reduce-motion *, :root:not(.zerox-theme-disabled).zerox-theme-reduce-motion *::before, :root:not(.zerox-theme-disabled).zerox-theme-reduce-motion *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }

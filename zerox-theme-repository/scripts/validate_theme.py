@@ -14,10 +14,10 @@ assert not missing, f"Missing theme files: {', '.join(missing)}"
 defaults = json.loads((ROOT / "public/defaults.json").read_text())
 assert defaults["enabled"] is True and re.fullmatch(r"#[0-9a-fA-F]{6}", defaults["accent"])
 css = (ROOT / "theme.css").read_text()
-assert ":root.zerox-theme" in css
+assert ":root:not(.zerox-theme-disabled)" in css
 assert "javascript:" in (ROOT / "conf.yml").read_text()
 for line in (line.strip() for line in css.splitlines()):
-    if line.endswith("{") and not line.startswith(("@", ":root.zerox-theme", "/*")):
+    if line.endswith("{") and not line.startswith(("@", ":root:not(.zerox-theme-disabled)", "/*")):
         raise AssertionError(f"Found unscoped theme selector: {line[:-1].strip()}")
 if shutil.which("node"):
     for script in ("theme.js", "admin.js"):
@@ -37,7 +37,7 @@ with zipfile.ZipFile(release) as archive:
         assert b"Save Theme Settings" in packaged_admin, "Admin save button is missing"
         wrapper = package.read("admin.wrapper.blade.php")
         assert b"/admin/nodes" in wrapper and b"/admin/extensions/zeroxtheme" in wrapper, "Admin navigation tab is missing"
-        for tab in (b"appearance", b"background", b"layout", b"advanced"):
+        for tab in (b"appearance", b"background", b"layout", b"branding", b"advanced"):
             assert b'data-zerox-tab="' + tab + b'"' in packaged_admin, f"Missing admin tab: {tab!r}"
         packaged_text = b"\n".join(package.read(name) for name in package.namelist())
         assert b"nebula" not in packaged_text.lower(), "Legacy theme branding remains in the package"

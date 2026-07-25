@@ -16,5 +16,10 @@
   "density": "comfortable",
   "fontScale": 1,
   "reduceMotion": false,
-  "highContrast": false
+  "highContrast": false,
+  "brandName": "ZeroX Host",
+  "footerText": "ZeroX Host © 2025 - 2026",
+  "footerUrl": "",
+  "hideFooter": false,
+  "customCss": ""
 }

@@ -43,8 +43,9 @@ portable JSON backup. No credentials or panel data are collected.
 
 The extension appears under **Admin > Extensions > ZeroX Theme** and also adds
 a direct **ZeroX Theme** navigation entry beside the Nodes/Servers area. It
-opens a dedicated settings page with Appearance, Background, Layout, and
-Advanced tabs. The sticky **Save Theme Settings** button remains available on
+opens a dedicated settings page with Appearance, Background, Layout, Branding
+& Footer, and Advanced tabs. Footer text/link/visibility, panel branding, and
+advanced custom CSS can all be changed. The sticky **Save Theme Settings** button remains available on
 every tab.
 
 Saved settings are written to both browser storage and a panel-wide path cookie

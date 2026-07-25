@@ -10,6 +10,7 @@
         <button type="button" class="is-active" data-zerox-tab="appearance" aria-selected="true">Appearance</button>
         <button type="button" data-zerox-tab="background" aria-selected="false">Background</button>
         <button type="button" data-zerox-tab="layout" aria-selected="false">Layout</button>
+        <button type="button" data-zerox-tab="branding" aria-selected="false">Branding & Footer</button>
         <button type="button" data-zerox-tab="advanced" aria-selected="false">Advanced</button>
       </nav>
       <section class="zerox-theme-tab is-active" data-zerox-panel="appearance">
@@ -31,8 +32,18 @@
           <label>Font scale <input name="fontScale" type="range" min="0.85" max="1.2" step="0.05"></label><label>Density <select name="density"><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label>
         </div>
       </section>
+      <section class="zerox-theme-tab" data-zerox-panel="branding" hidden>
+        <h2>Branding & footer</h2>
+        <div class="zerox-theme-fields">
+          <label>Panel brand name <input name="brandName" type="text" maxlength="80" placeholder="ZeroX Host"></label>
+          <label>Footer text <input name="footerText" type="text" maxlength="160" placeholder="ZeroX Host © 2025 - 2026"></label>
+          <label>Footer link <input name="footerUrl" type="url" placeholder="https://example.com"></label>
+        </div>
+        <div class="zerox-theme-checks"><label><input name="hideFooter" type="checkbox"> Hide panel footer completely</label></div>
+      </section>
       <section class="zerox-theme-tab" data-zerox-panel="advanced" hidden>
         <h2>Accessibility & portability</h2><div class="zerox-theme-checks"><label><input name="reduceMotion" type="checkbox"> Reduce motion</label><label><input name="highContrast" type="checkbox"> Higher contrast</label></div>
+        <label class="zerox-theme-wide">Custom CSS <textarea name="customCss" rows="10" maxlength="20000" placeholder="/* Advanced panel-wide overrides */"></textarea></label>
         <div class="zerox-theme-actions"><button type="button" id="zerox-theme-reset">Reset defaults</button><button type="button" id="zerox-theme-export">Download configuration</button><label class="zerox-theme-import">Import JSON<input id="zerox-theme-import" type="file" accept="application/json"></label></div>
       </section>
       <footer class="zerox-theme-savebar"><span id="zerox-theme-dirty">All changes saved</span><button type="submit" id="zerox-theme-save" class="zerox-theme-primary">Save Theme Settings</button></footer>

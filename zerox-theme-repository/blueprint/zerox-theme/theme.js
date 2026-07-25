@@ -10,6 +10,7 @@
     surface: '#11162d', text: '#f8fafc', muted: '#aab2c8', backgroundImage: '',
     backgroundOpacity: 0.28, blur: 16, radius: 16, density: 'comfortable',
     fontScale: 1, reduceMotion: false, highContrast: false,
+    brandName: 'ZeroX Host', footerText: 'ZeroX Host © 2025 - 2026', footerUrl: '', hideFooter: false, customCss: '',
   };
   const validHex = value => /^#[0-9a-f]{6}$/i.test(value);
   const clamp = (value, min, max, fallback) => {
@@ -38,6 +39,11 @@
     result.density = ['comfortable', 'compact'].includes(source.density) ? source.density : defaults.density;
     result.reduceMotion = Boolean(source.reduceMotion);
     result.highContrast = Boolean(source.highContrast);
+    result.brandName = String(source.brandName ?? defaults.brandName).slice(0, 80);
+    result.footerText = String(source.footerText ?? defaults.footerText).slice(0, 160);
+    result.footerUrl = safeUrl(source.footerUrl);
+    result.hideFooter = Boolean(source.hideFooter);
+    result.customCss = String(source.customCss ?? '').slice(0, 20000);
     return result;
   };
   const read = () => {
@@ -55,6 +61,7 @@
     const settings = sanitise(raw);
     const root = document.documentElement;
     root.classList.toggle(ROOT_CLASS, settings.enabled);
+    root.classList.toggle('zerox-theme-disabled', !settings.enabled);
     root.classList.toggle('zerox-theme-compact', settings.enabled && settings.density === 'compact');
     root.classList.toggle('zerox-theme-reduce-motion', settings.enabled && settings.reduceMotion);
     root.classList.toggle('zerox-theme-high-contrast', settings.enabled && settings.highContrast);
@@ -69,6 +76,24 @@
       '--zerox-theme-bg-image': settings.backgroundImage ? `url("${settings.backgroundImage.replace(/["\\]/g, '')}")` : 'none',
     };
     Object.entries(variables).forEach(([key, value]) => root.style.setProperty(key, value));
+    let customStyle = document.querySelector('#zerox-theme-custom-css');
+    if (!customStyle) {
+      customStyle = document.createElement('style');
+      customStyle.id = 'zerox-theme-custom-css';
+      document.head.appendChild(customStyle);
+    }
+    customStyle.textContent = settings.enabled ? settings.customCss : '';
+    const footer = document.querySelector('footer, [class*="Footer"], #footer');
+    if (footer) {
+      footer.hidden = settings.hideFooter;
+      const target = footer.querySelector('a') || footer;
+      if (settings.footerText) target.textContent = settings.footerText;
+      if (target.tagName === 'A' && settings.footerUrl) target.href = settings.footerUrl;
+    }
+    document.querySelectorAll('.logo-lg, [data-zerox-brand-target]').forEach(target => {
+      if (settings.brandName && target.textContent !== settings.brandName) target.textContent = settings.brandName;
+    });
+    document.documentElement.dataset.zeroxBrand = settings.brandName;
     window.dispatchEvent(new CustomEvent('zerox-theme:applied', { detail: settings }));
     return settings;
   };
@@ -82,4 +107,5 @@
   };
   window.ZeroXTheme = { key: KEY, defaults: { ...defaults }, sanitise, read, apply, save, reset: () => save(defaults) };
   apply(read());
+  document.addEventListener('click', () => window.setTimeout(() => apply(read()), 120), true);
 })();

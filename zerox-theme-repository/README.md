@@ -12,6 +12,7 @@ to an empty repository. Do not copy the parent project.
 ```bash
 python3 scripts/build_theme_release.py
 python3 scripts/validate_theme.py
+node scripts/test_theme_runtime.js
 ```
 
 The generated `dist/zerox-theme.zip` is intentionally ignored by Git. The

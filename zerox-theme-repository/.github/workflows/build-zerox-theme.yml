@@ -33,6 +33,9 @@ jobs:
       - name: Validate source and release
         run: python3 scripts/validate_theme.py
 
+      - name: Test enable and save persistence
+        run: node scripts/test_theme_runtime.js
+
       - name: Verify archive checksum
         run: |
           rm -rf /tmp/zerox-theme-release
