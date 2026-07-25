@@ -3,7 +3,7 @@ info:
   identifier: "zeroxtheme"
   description: "A safe, mobile-first and administrator-customisable glass theme."
   flags: "theme"
-  version: "1.0.0"
+  version: "1.1.0"
   target: "indev"
   author: "ZeroX Host"
   icon: "icon.svg"
@@ -11,7 +11,6 @@ info:
 admin:
   view: "admin.blade.php"
   css: "admin.css"
-  javascript: "admin.js"
 dashboard:
   css: "theme.css"
   javascript: "theme.js"

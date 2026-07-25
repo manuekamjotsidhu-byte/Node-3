@@ -41,6 +41,10 @@ accessibility options, import/export, and a reset button. Settings are stored
 in the browser and applied immediately; **Download configuration** creates a
 portable JSON backup. No credentials or panel data are collected.
 
+The **Theme enabled** switch saves immediately; it does not require the Save
+button. Blueprint loads admin and dashboard JavaScript as separate bundles, so
+both bundles initialise the ZeroX Theme runtime independently.
+
 ## Compatibility guarantees
 
 - Every custom class and browser key starts with `zerox-theme-`.

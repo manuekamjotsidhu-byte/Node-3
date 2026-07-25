@@ -18,11 +18,15 @@ EPOCH = (2026, 1, 1, 0, 0, 0)
 
 
 def add_file(archive: zipfile.ZipFile, source: Path, name: str, executable: bool = False) -> None:
+    add_bytes(archive, source.read_bytes(), name, executable)
+
+
+def add_bytes(archive: zipfile.ZipFile, content: bytes, name: str, executable: bool = False) -> None:
     info = zipfile.ZipInfo(name, EPOCH)
     mode = (stat.S_IFREG | (0o755 if executable else 0o644)) << 16
     info.external_attr = mode
     info.compress_type = zipfile.ZIP_DEFLATED
-    archive.writestr(info, source.read_bytes())
+    archive.writestr(info, content)
 
 
 def build() -> Path:
@@ -32,7 +36,15 @@ def build() -> Path:
         blueprint_path = Path(temporary) / BLUEPRINT_NAME
         with zipfile.ZipFile(blueprint_path, "w", compresslevel=9) as archive:
             for source in sorted(path for path in SOURCE.rglob("*") if path.is_file()):
-                add_file(archive, source, source.relative_to(SOURCE).as_posix())
+                relative = source.relative_to(SOURCE).as_posix()
+                if relative == "admin.blade.php":
+                    view = source.read_text(encoding="utf-8")
+                    script = (SOURCE / "admin.js").read_text(encoding="utf-8")
+                    marker = "<!-- ZEROX_ADMIN_SCRIPT: replaced with the isolated admin bundle at build time. -->"
+                    assert marker in view, "Admin script build marker is missing"
+                    add_bytes(archive, view.replace(marker, f"<script>\n{script}\n</script>").encode(), relative)
+                else:
+                    add_file(archive, source, relative)
         digest = hashlib.sha256(blueprint_path.read_bytes()).hexdigest()
         checksum = Path(temporary) / "SHA256SUMS"
         checksum.write_text(f"{digest}  {BLUEPRINT_NAME}\n", encoding="utf-8")

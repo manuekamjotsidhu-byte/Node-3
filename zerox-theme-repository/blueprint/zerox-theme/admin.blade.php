@@ -29,3 +29,4 @@
     <aside class="zerox-theme-preview" aria-label="Theme preview"><div class="zerox-theme-preview__nav"><i></i><b>Your panel</b><span>● Online</span></div><div class="zerox-theme-preview__content"><p class="zerox-theme-preview__eyebrow">SERVER OVERVIEW</p><h2>Production server</h2><div class="zerox-theme-preview__stats"><div><small>CPU</small><b>42%</b></div><div><small>MEMORY</small><b>2.4 GB</b></div></div><div class="zerox-theme-preview__bar"><i></i></div><button>Manage server</button></div></aside>
   </div>
 </div>
+<!-- ZEROX_ADMIN_SCRIPT: replaced with the isolated admin bundle at build time. -->

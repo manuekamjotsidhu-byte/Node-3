@@ -31,6 +31,9 @@ with zipfile.ZipFile(release) as archive:
     assert expected_source.issubset(release_files), "Editable theme source is incomplete"
     with zipfile.ZipFile(archive.open("zerox-theme.blueprint")) as package:
         assert set(required).issubset(package.namelist())
+        packaged_admin = package.read("admin.blade.php")
+        assert b"window.ZeroXTheme" in packaged_admin, "Admin runtime was not embedded"
+        assert b"ZEROX_ADMIN_SCRIPT" not in packaged_admin, "Admin build marker was not replaced"
         packaged_text = b"\n".join(package.read(name) for name in package.namelist())
         assert b"nebula" not in packaged_text.lower(), "Legacy theme branding remains in the package"
         assert b"ZeroX Theme" in packaged_text, "ZeroX Theme branding is missing"
