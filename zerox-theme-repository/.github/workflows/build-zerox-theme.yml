@@ -1,0 +1,52 @@
+name: Build ZeroX Theme ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+    paths:
+      - "blueprint/zerox-theme/**"
+      - "packaging/install.sh"
+      - "scripts/build_theme_release.py"
+      - "scripts/validate_theme.py"
+      - ".github/workflows/build-zerox-theme.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build release ZIP
+        run: python3 scripts/build_theme_release.py
+
+      - name: Validate source and release
+        run: python3 scripts/validate_theme.py
+
+      - name: Test enable and save persistence
+        run: node scripts/test_theme_runtime.js
+
+      - name: Verify archive checksum
+        run: |
+          rm -rf /tmp/zerox-theme-release
+          unzip -q dist/zerox-theme.zip -d /tmp/zerox-theme-release
+          cd /tmp/zerox-theme-release
+          sha256sum -c SHA256SUMS
+
+      - name: Upload installable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerox-theme
+          path: dist/zerox-theme.zip
+          if-no-files-found: error
+          compression-level: 0
