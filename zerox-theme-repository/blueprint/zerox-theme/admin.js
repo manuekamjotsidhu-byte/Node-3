@@ -5,6 +5,7 @@
   // live preview always work on the extension settings page.
   if (!window.ZeroXTheme) {
     const KEY = 'zerox-theme-settings-v1';
+    const COOKIE = 'zerox_theme_settings';
     const defaults = {
       enabled: true, preset: 'amethyst', accent: '#8b5cf6', accentAlt: '#22d3ee',
       success: '#34d399', danger: '#fb7185', background: '#080b1c',
@@ -42,8 +43,15 @@
       return result;
     };
     const read = () => {
-      try { return sanitise(JSON.parse(localStorage.getItem(KEY))); }
-      catch (_) { return { ...defaults }; }
+      try {
+        const stored = localStorage.getItem(KEY);
+        if (stored) return sanitise(JSON.parse(stored));
+      } catch (_) { /* Fall through to cookie persistence. */ }
+      try {
+        const value = document.cookie.split('; ').find(item => item.startsWith(`${COOKIE}=`));
+        if (value) return sanitise(JSON.parse(decodeURIComponent(value.slice(COOKIE.length + 1))));
+      } catch (_) { /* Use defaults below. */ }
+      return { ...defaults };
     };
     const apply = raw => {
       const settings = sanitise(raw);
@@ -67,7 +75,9 @@
     };
     const save = value => {
       const settings = sanitise(value);
-      localStorage.setItem(KEY, JSON.stringify(settings));
+      const serialised = JSON.stringify(settings);
+      try { localStorage.setItem(KEY, serialised); } catch (_) { /* Cookie remains available. */ }
+      document.cookie = `${COOKIE}=${encodeURIComponent(serialised)}; path=/; max-age=31536000; SameSite=Lax`;
       apply(settings);
       return settings;
     };

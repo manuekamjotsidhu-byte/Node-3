@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1] / "blueprint" / "zerox-theme"
-required = ["conf.yml", "admin.blade.php", "theme.css", "theme.js", "admin.css", "admin.js", "public/defaults.json", "icon.svg"]
+required = ["conf.yml", "admin.blade.php", "admin.wrapper.blade.php", "theme.css", "theme.js", "admin.css", "admin.js", "public/defaults.json", "icon.svg"]
 missing = [name for name in required if not (ROOT / name).is_file()]
 assert not missing, f"Missing theme files: {', '.join(missing)}"
 defaults = json.loads((ROOT / "public/defaults.json").read_text())
@@ -35,6 +35,8 @@ with zipfile.ZipFile(release) as archive:
         assert b"window.ZeroXTheme" in packaged_admin, "Admin runtime was not embedded"
         assert b"ZEROX_ADMIN_SCRIPT" not in packaged_admin, "Admin build marker was not replaced"
         assert b"Save Theme Settings" in packaged_admin, "Admin save button is missing"
+        wrapper = package.read("admin.wrapper.blade.php")
+        assert b"/admin/nodes" in wrapper and b"/admin/extensions/zeroxtheme" in wrapper, "Admin navigation tab is missing"
         for tab in (b"appearance", b"background", b"layout", b"advanced"):
             assert b'data-zerox-tab="' + tab + b'"' in packaged_admin, f"Missing admin tab: {tab!r}"
         packaged_text = b"\n".join(package.read(name) for name in package.namelist())
