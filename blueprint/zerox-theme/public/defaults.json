@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "preset": "amethyst",
+  "accent": "#8b5cf6",
+  "accentAlt": "#22d3ee",
+  "success": "#34d399",
+  "danger": "#fb7185",
+  "background": "#080b1c",
+  "surface": "#11162d",
+  "text": "#f8fafc",
+  "muted": "#aab2c8",
+  "backgroundImage": "",
+  "backgroundOpacity": 0.28,
+  "blur": 16,
+  "radius": 16,
+  "density": "comfortable",
+  "fontScale": 1,
+  "reduceMotion": false,
+  "highContrast": false
+}

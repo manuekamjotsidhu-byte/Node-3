@@ -1,0 +1,17 @@
+info:
+  name: "ZeroX Theme"
+  identifier: "zeroxtheme"
+  description: "A safe, mobile-first and administrator-customisable glass theme."
+  flags: "theme"
+  version: "1.0.0"
+  target: "indev"
+  author: "ZeroX Host"
+  icon: "icon.svg"
+  website: ""
+admin:
+  view: "admin.blade.php"
+  css: "admin.css"
+  javascript: "admin.js"
+dashboard:
+  css: "theme.css"
+  javascript: "theme.js"
