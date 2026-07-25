@@ -80,6 +80,7 @@
     if (!form || !window.ZeroXTheme) return;
     const status = document.querySelector('#zerox-theme-status');
     const enabled = document.querySelector('#zerox-theme-enabled');
+    const dirty = document.querySelector('#zerox-theme-dirty');
     const presets = {
       amethyst: { accent: '#8b5cf6', accentAlt: '#22d3ee', background: '#080b1c', surface: '#11162d' },
       emerald: { accent: '#10b981', accentAlt: '#60a5fa', background: '#061511', surface: '#0d2420' },
@@ -107,12 +108,36 @@
       button.addEventListener('click', () => { writeForm({ ...readForm(), ...colours, preset: name }); window.ZeroXTheme.apply(readForm()); });
       document.querySelector('#zerox-theme-presets').appendChild(button);
     });
-    form.addEventListener('input', () => window.ZeroXTheme.apply(readForm()));
+    document.querySelectorAll('[data-zerox-tab]').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('[data-zerox-tab]').forEach(item => {
+          const active = item === tab;
+          item.classList.toggle('is-active', active);
+          item.setAttribute('aria-selected', String(active));
+        });
+        document.querySelectorAll('[data-zerox-panel]').forEach(panel => {
+          const active = panel.dataset.zeroxPanel === tab.dataset.zeroxTab;
+          panel.classList.toggle('is-active', active);
+          panel.hidden = !active;
+        });
+      });
+    });
+    form.addEventListener('input', () => {
+      window.ZeroXTheme.apply(readForm());
+      dirty.textContent = 'Unsaved changes';
+      dirty.classList.add('is-dirty');
+    });
     enabled.addEventListener('change', () => {
       writeForm(window.ZeroXTheme.save(readForm()));
       announce(enabled.checked ? 'ZeroX Theme enabled.' : 'ZeroX Theme disabled.');
     });
-    form.addEventListener('submit', event => { event.preventDefault(); writeForm(window.ZeroXTheme.save(readForm())); announce('Theme settings saved on this browser.'); });
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      writeForm(window.ZeroXTheme.save(readForm()));
+      dirty.textContent = 'All changes saved';
+      dirty.classList.remove('is-dirty');
+      announce('ZeroX Theme settings saved successfully.');
+    });
     document.querySelector('#zerox-theme-reset').addEventListener('click', () => { writeForm(window.ZeroXTheme.reset()); announce('Defaults restored.'); });
     document.querySelector('#zerox-theme-export').addEventListener('click', () => {
       const blob = new Blob([JSON.stringify(readForm(), null, 2)], { type: 'application/json' });

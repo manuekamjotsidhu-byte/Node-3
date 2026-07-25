@@ -34,6 +34,9 @@ with zipfile.ZipFile(release) as archive:
         packaged_admin = package.read("admin.blade.php")
         assert b"window.ZeroXTheme" in packaged_admin, "Admin runtime was not embedded"
         assert b"ZEROX_ADMIN_SCRIPT" not in packaged_admin, "Admin build marker was not replaced"
+        assert b"Save Theme Settings" in packaged_admin, "Admin save button is missing"
+        for tab in (b"appearance", b"background", b"layout", b"advanced"):
+            assert b'data-zerox-tab="' + tab + b'"' in packaged_admin, f"Missing admin tab: {tab!r}"
         packaged_text = b"\n".join(package.read(name) for name in package.namelist())
         assert b"nebula" not in packaged_text.lower(), "Legacy theme branding remains in the package"
         assert b"ZeroX Theme" in packaged_text, "ZeroX Theme branding is missing"

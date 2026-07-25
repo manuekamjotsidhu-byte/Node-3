@@ -41,6 +41,8 @@ accessibility options, import/export, and a reset button. Settings are stored
 in the browser and applied immediately; **Download configuration** creates a
 portable JSON backup. No credentials or panel data are collected.
 
+The extension appears under **Admin > Extensions > ZeroX Theme** and opens a dedicated settings page with Appearance, Background, Layout, and Advanced tabs. The sticky **Save Theme Settings** button remains available on every tab.
+
 The **Theme enabled** switch saves immediately; it does not require the Save
 button. Blueprint loads admin and dashboard JavaScript as separate bundles, so
 both bundles initialise the ZeroX Theme runtime independently.
