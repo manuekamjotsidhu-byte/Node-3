@@ -885,7 +885,7 @@ async def send_plan_log(plan: str, embed: discord.Embed) -> bool:
 
 async def send_server_event_log(record: sqlite3.Row | dict[str, Any], title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> bool:
     """Send server lifecycle/admin logs to the channel that matches the server plan."""
-    actor_line = f"\nAdmin: {actor.mention} (`{actor.id}`)" if actor else ""
+    actor_line = f"\nAdmin profile:\n{discord_profile_label(actor)}" if actor else ""
     plan = str(record_value(record, "plan", "free")).strip().lower()
     embed = branded_embed(f"Admin Log: {title}", f"{description}{actor_line}", color)
     return await send_plan_log(plan, embed)
@@ -897,7 +897,7 @@ async def send_admin_audit(title: str, description: str, *, actor: discord.abc.U
         return
     try:
         channel = client.get_channel(int(channel_id_value)) or await client.fetch_channel(int(channel_id_value))
-        actor_line = f"\nAdmin: {actor.mention} (`{actor.id}`)" if actor else ""
+        actor_line = f"\nAdmin profile:\n{discord_profile_label(actor)}" if actor else ""
         embed = branded_embed(f"🛡️ Audit • {title}", f"{description}{actor_line}", color)
         await channel.send(embed=embed)
     except Exception as error:
@@ -950,6 +950,13 @@ def format_bill_money(amount: float, currency: str) -> str:
     return f"{safe_currency} {amount:,.2f}"
 
 
+def discord_profile_label(user: discord.abc.User) -> str:
+    """Return a stable profile label instead of relying on a mention alone."""
+    display_name = clean(getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name, 100)
+    username = clean(user.name, 100)
+    return f"**{display_name}** (`@{username}`)\n{user.mention} • ID: `{user.id}`"
+
+
 def premium_bill_embed(
     *,
     user: discord.User,
@@ -978,7 +985,7 @@ def premium_bill_embed(
         0x0b132b,
     )
     embed.add_field(name="🧾 Bill ID", value=f"`{bill_id}`", inline=True)
-    embed.add_field(name="👤 Customer", value=f"{user.mention}\n`{user.id}`", inline=True)
+    embed.add_field(name="👤 Customer Profile", value=discord_profile_label(user), inline=True)
     embed.add_field(name="📦 Plan", value=plan.title(), inline=True)
     embed.add_field(name="📅 Creation Date", value=f"<t:{int(created_at.timestamp())}:F>", inline=True)
     embed.add_field(name="🗓️ Next Invoice Date", value=f"<t:{int(next_invoice_at.timestamp())}:F>\n<t:{int(next_invoice_at.timestamp())}:R>", inline=True)
@@ -1014,6 +1021,7 @@ def premium_bill_embed(
             inline=False,
         )
     embed.add_field(name="✅ Status", value="Premium bill created. Pay only through official ZeroX Host payment methods.", inline=False)
+    embed.set_thumbnail(url=user.display_avatar.url)
     return embed
 
 
@@ -1120,7 +1128,7 @@ async def send_premium_bill(
         warning_line = f"{hardware_line}\nVPS warnings: 7-day <t:{int((next_invoice_at - timedelta(days=7)).timestamp())}:F> • 1-day <t:{int((next_invoice_at - timedelta(days=1)).timestamp())}:F>"
     await send_admin_audit(
         f"Premium Bill {action.title()}",
-        f"Bill `{bill_id}` for {user.mention} (`{user.id}`)\n"
+        f"Bill `{bill_id}` for {discord_profile_label(user)}\n"
         f"Plan: **{plan.title()}**\n"
         f"Creation date: <t:{int(created_at.timestamp())}:F>\n"
         f"Next invoice date: <t:{int(next_invoice_at.timestamp())}:F> (<t:{int(next_invoice_at.timestamp())}:R>)"
@@ -1135,7 +1143,7 @@ async def send_premium_bill(
             channel = client.get_channel(int(channel_id_value)) or await client.fetch_channel(int(channel_id_value))
             admin_embed = embed.copy()
             admin_embed.title = f"Admin Copy • {embed.title} ({action.title()})"
-            admin_embed.add_field(name="🛡️ Invoice Admin", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            admin_embed.add_field(name="🛡️ Invoice Admin Profile", value=discord_profile_label(interaction.user), inline=False)
             await channel.send(embed=admin_embed)
         except Exception as error:
             print(f"Failed to send full admin invoice for bill {bill_id}: {error}")
@@ -3116,9 +3124,15 @@ async def send_vps_bill_warning(row: sqlite3.Row, lead: str) -> bool:
         f"Your VPS invoice `{row['bill_id']}` is due in **{lead}** at <t:{int(next_invoice_at.timestamp())}:F>. Please pay before the next invoice date to keep your VPS active. Amount due: **{format_bill_money(float(row['total']), row['currency'])}**.",
         0xe67e22,
     )
+    embed.add_field(name="👤 Customer Profile", value=discord_profile_label(user), inline=False)
+    embed.set_thumbnail(url=user.display_avatar.url)
     try:
         await user.send(embed=embed)
-        await send_admin_audit("VPS Invoice Reminder Sent", f"Bill `{row['bill_id']}` for {user.mention} (`{user.id}`) • Lead: **{lead}** • Next invoice: <t:{int(next_invoice_at.timestamp())}:F>", color=0xe67e22)
+        await send_admin_audit(
+            "VPS Invoice Reminder Sent",
+            f"Bill `{row['bill_id']}` for {discord_profile_label(user)}\nLead: **{lead}** • Next invoice: <t:{int(next_invoice_at.timestamp())}:F>",
+            color=0xe67e22,
+        )
         return True
     except discord.Forbidden:
         print(f"VPS bill reminder DM forbidden for user {row['discord_user_id']} on bill {row['bill_id']}.")
