@@ -180,6 +180,24 @@ def init_db() -> None:
         node_status_columns = {row[1] for row in connection.execute("PRAGMA table_info(node_status)").fetchall()}
         if "down_since" not in node_status_columns:
             connection.execute("ALTER TABLE node_status ADD COLUMN down_since TEXT")
+        bill_columns = {row[1] for row in connection.execute("PRAGMA table_info(premium_bills)").fetchall()}
+        bill_column_definitions = {
+            "price": "REAL NOT NULL DEFAULT 0",
+            "specifications": "TEXT NOT NULL DEFAULT ''",
+            "tax_percentage": "REAL NOT NULL DEFAULT 0",
+            "discount_percentage": "REAL NOT NULL DEFAULT 0",
+            "other_charges": "REAL NOT NULL DEFAULT 0",
+            "notes": "TEXT",
+            "cpu_type": "TEXT",
+            "ram_type": "TEXT",
+            "disk_type": "TEXT",
+            "updated_at": "TEXT",
+            "dm_channel_id": "TEXT",
+            "dm_message_id": "TEXT",
+        }
+        for column, definition in bill_column_definitions.items():
+            if column not in bill_columns:
+                connection.execute(f"ALTER TABLE premium_bills ADD COLUMN {column} {definition}")
         # Legacy databases may contain older link columns, but new installs use one panel only.
 
 
@@ -361,8 +379,12 @@ def save_premium_bill_record(record: dict[str, Any]) -> None:
     with db() as connection:
         connection.execute(
             """
-            INSERT OR REPLACE INTO premium_bills (bill_id, discord_user_id, plan, created_at, next_invoice_at, currency, total, warn_7d_sent, warn_1d_sent)
-            VALUES (?,?,?,?,?,?,?,?,?)
+            INSERT OR REPLACE INTO premium_bills
+            (bill_id, discord_user_id, plan, created_at, next_invoice_at, currency, total,
+             warn_7d_sent, warn_1d_sent, price, specifications, tax_percentage,
+             discount_percentage, other_charges, notes, cpu_type, ram_type, disk_type,
+             updated_at, dm_channel_id, dm_message_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 record["bill_id"],
@@ -374,8 +396,27 @@ def save_premium_bill_record(record: dict[str, Any]) -> None:
                 record["total"],
                 int(record.get("warn_7d_sent", False)),
                 int(record.get("warn_1d_sent", False)),
+                record["price"],
+                record["specifications"],
+                record["tax_percentage"],
+                record["discount_percentage"],
+                record["other_charges"],
+                record.get("notes"),
+                record.get("cpu_type"),
+                record.get("ram_type"),
+                record.get("disk_type"),
+                record.get("updated_at"),
+                record.get("dm_channel_id"),
+                record.get("dm_message_id"),
             ),
         )
+
+
+def fetch_premium_bill(bill_id: str) -> sqlite3.Row | None:
+    with db() as connection:
+        return connection.execute(
+            "SELECT * FROM premium_bills WHERE UPPER(bill_id) = UPPER(?)", (bill_id.strip(),)
+        ).fetchone()
 
 
 def fetch_due_vps_bill_warnings(now: datetime) -> list[sqlite3.Row]:
@@ -988,10 +1029,11 @@ async def send_premium_bill(
     other_charges: float,
     currency: str,
     notes: str | None,
-    billing_seconds: int,
+    billing_seconds: int | None,
     cpu_type: str | None = None,
     ram_type: str | None = None,
     disk_type: str | None = None,
+    existing_bill: sqlite3.Row | None = None,
 ) -> None:
     if price < 0 or other_charges < 0:
         raise RuntimeError("Price and other charges cannot be negative.")
@@ -999,9 +1041,13 @@ async def send_premium_bill(
         raise RuntimeError("Tax and discount percentages cannot be negative.")
     if discount_percentage > 100:
         raise RuntimeError("Discount percentage cannot be more than 100%.")
-    created_at = utc_now()
-    next_invoice_at = created_at + timedelta(seconds=billing_seconds)
-    bill_id = f"ZX-{created_at.strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
+    now = utc_now()
+    created_at = datetime.fromisoformat(existing_bill["created_at"]) if existing_bill else now
+    if existing_bill and billing_seconds is None:
+        next_invoice_at = datetime.fromisoformat(existing_bill["next_invoice_at"])
+    else:
+        next_invoice_at = now + timedelta(seconds=billing_seconds or 0)
+    bill_id = existing_bill["bill_id"] if existing_bill else f"ZX-{created_at.strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
     embed = premium_bill_embed(
         user=user,
         plan=plan,
@@ -1023,7 +1069,7 @@ async def send_premium_bill(
     taxable_subtotal = max(price - discount_amount + other_charges, 0)
     tax_amount = taxable_subtotal * (tax_percentage / 100)
     total = taxable_subtotal + tax_amount
-    save_premium_bill_record({
+    record = {
         "bill_id": bill_id,
         "discord_user_id": str(user.id),
         "plan": plan,
@@ -1031,29 +1077,68 @@ async def send_premium_bill(
         "next_invoice_at": next_invoice_at.isoformat(),
         "currency": currency.upper(),
         "total": total,
-    })
+        "price": price,
+        "specifications": specifications,
+        "tax_percentage": tax_percentage,
+        "discount_percentage": discount_percentage,
+        "other_charges": other_charges,
+        "notes": notes,
+        "cpu_type": cpu_type,
+        "ram_type": ram_type,
+        "disk_type": disk_type,
+        "updated_at": now.isoformat() if existing_bill else None,
+        "warn_7d_sent": existing_bill["warn_7d_sent"] if existing_bill and billing_seconds is None else False,
+        "warn_1d_sent": existing_bill["warn_1d_sent"] if existing_bill and billing_seconds is None else False,
+        "dm_channel_id": existing_bill["dm_channel_id"] if existing_bill else None,
+        "dm_message_id": existing_bill["dm_message_id"] if existing_bill else None,
+    }
     dm_status = "sent"
     try:
-        await user.send(embed=embed)
+        if existing_bill and existing_bill["dm_channel_id"] and existing_bill["dm_message_id"]:
+            channel = client.get_channel(int(existing_bill["dm_channel_id"])) or await client.fetch_channel(int(existing_bill["dm_channel_id"]))
+            message = await channel.fetch_message(int(existing_bill["dm_message_id"]))
+            await message.edit(embed=embed)
+            dm_status = "original DM edited"
+        else:
+            message = await user.send(embed=embed)
+            record["dm_channel_id"] = str(message.channel.id)
+            record["dm_message_id"] = str(message.id)
     except discord.Forbidden:
         dm_status = "blocked by the user"
+    except (discord.NotFound, discord.HTTPException):
+        message = await user.send(embed=embed)
+        record["dm_channel_id"] = str(message.channel.id)
+        record["dm_message_id"] = str(message.id)
+        dm_status = "replacement DM sent"
+    save_premium_bill_record(record)
     await interaction.followup.send(embed=embed, ephemeral=True)
-    await interaction.followup.send(f"Bill `{bill_id}` created for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
+    action = "updated" if existing_bill else "created"
+    await interaction.followup.send(f"Bill `{bill_id}` {action} for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
     warning_line = ""
     if plan.strip().lower() == "vps":
         hardware_line = f"\nVPS hardware: CPU **{clean(cpu_type or 'Not specified', 120)}** • RAM **{clean(ram_type or 'Not specified', 40)}** • Disk **{clean(disk_type or 'Not specified', 80)}**"
         warning_line = f"{hardware_line}\nVPS warnings: 7-day <t:{int((next_invoice_at - timedelta(days=7)).timestamp())}:F> • 1-day <t:{int((next_invoice_at - timedelta(days=1)).timestamp())}:F>"
     await send_admin_audit(
-        "Premium Bill Created",
+        f"Premium Bill {action.title()}",
         f"Bill `{bill_id}` for {user.mention} (`{user.id}`)\n"
         f"Plan: **{plan.title()}**\n"
         f"Creation date: <t:{int(created_at.timestamp())}:F>\n"
         f"Next invoice date: <t:{int(next_invoice_at.timestamp())}:F> (<t:{int(next_invoice_at.timestamp())}:R>)"
         f"{warning_line}\n"
-        "Total shown in bill embed.",
+        f"Total: **{format_bill_money(total, currency)}**. The complete invoice is attached below.",
         actor=interaction.user,
         color=0xf1c40f,
     )
+    channel_id_value = config.get("admin_log_channel_id") or config.get("paid_log_channel_id", ADMIN_LOG_CHANNEL_ID)
+    if channel_id_value:
+        try:
+            channel = client.get_channel(int(channel_id_value)) or await client.fetch_channel(int(channel_id_value))
+            admin_embed = embed.copy()
+            admin_embed.title = f"Admin Copy • {embed.title} ({action.title()})"
+            admin_embed.add_field(name="🛡️ Invoice Admin", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
+            await channel.send(embed=admin_embed)
+        except Exception as error:
+            print(f"Failed to send full admin invoice for bill {bill_id}: {error}")
 
 
 def parse_bill_other_details(value: str) -> tuple[float, str | None]:
@@ -1624,7 +1709,7 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
     discount_percentage = discord.ui.TextInput(label="Discount percentage", placeholder="0", required=False, default="0")
     other_details = discord.ui.TextInput(label="Other charges and notes", placeholder="Other charges: 0 | Notes: Pay via official ticket/invoice", required=False, style=discord.TextStyle.paragraph)
 
-    def __init__(self, user: discord.User, plan: str, currency: str, billing_seconds: int, cpu_type: str | None, ram_type: str | None, disk_type: str | None) -> None:
+    def __init__(self, user: discord.User, plan: str, currency: str, billing_seconds: int | None, cpu_type: str | None, ram_type: str | None, disk_type: str | None, existing_bill: sqlite3.Row | None = None) -> None:
         super().__init__()
         self.user = user
         self.plan = plan
@@ -1633,6 +1718,17 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
         self.cpu_type = cpu_type
         self.ram_type = ram_type
         self.disk_type = disk_type
+        self.existing_bill = existing_bill
+        if existing_bill:
+            self.title = f"Edit Invoice {existing_bill['bill_id']}"[:45]
+            self.price.default = str(existing_bill["price"])
+            self.specifications.default = existing_bill["specifications"]
+            self.tax_percentage.default = str(existing_bill["tax_percentage"])
+            self.discount_percentage.default = str(existing_bill["discount_percentage"])
+            details = f"Other charges: {existing_bill['other_charges']}"
+            if existing_bill["notes"]:
+                details += f" | {existing_bill['notes']}"
+            self.other_details.default = details
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -1658,6 +1754,7 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
             cpu_type=self.cpu_type,
             ram_type=self.ram_type,
             disk_type=self.disk_type,
+            existing_bill=self.existing_bill,
         )
 
 
@@ -1785,7 +1882,7 @@ async def about(interaction: discord.Interaction) -> None:
 
 
 
-@tree.command(name="bill", description="Admin: create a premium bill for VPS or Minecraft hosting")
+@tree.command(name="bill", description="Admin: create a premium hosting invoice")
 @admin_only()
 @app_commands.describe(
     user="Customer who should receive the bill",
@@ -1797,7 +1894,12 @@ async def about(interaction: discord.Interaction) -> None:
     disk_type="VPS disk type, for example NVMe SSD or SATA SSD",
 )
 @app_commands.choices(
-    plan=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="minecraft")],
+    plan=[
+        app_commands.Choice(name="VPS", value="vps"),
+        app_commands.Choice(name="Minecraft", value="minecraft"),
+        app_commands.Choice(name="Web Hosting", value="web-hosting"),
+        app_commands.Choice(name="Bot Hosting", value="bot-hosting"),
+    ],
     ram_type=[app_commands.Choice(name="DDR4", value="DDR4"), app_commands.Choice(name="DDR5", value="DDR5")],
 )
 async def bill(
@@ -1823,6 +1925,63 @@ async def bill(
             cpu_type,
             ram_type,
             disk_type,
+        )
+    )
+
+
+@tree.command(name="edit-bill", description="Admin: edit and resend an existing premium invoice")
+@admin_only()
+@app_commands.describe(
+    bill_id="Invoice ID shown on the original bill",
+    plan="Replacement plan; leave empty to keep the current plan",
+    currency="Replacement currency; leave empty to keep it",
+    time="New period from now, such as 30d; leave empty to keep the invoice date",
+    cpu_type="Replacement VPS CPU type",
+    ram_type="Replacement VPS RAM type",
+    disk_type="Replacement VPS disk type",
+)
+@app_commands.choices(
+    plan=[
+        app_commands.Choice(name="VPS", value="vps"),
+        app_commands.Choice(name="Minecraft", value="minecraft"),
+        app_commands.Choice(name="Web Hosting", value="web-hosting"),
+        app_commands.Choice(name="Bot Hosting", value="bot-hosting"),
+    ],
+    ram_type=[app_commands.Choice(name="DDR4", value="DDR4"), app_commands.Choice(name="DDR5", value="DDR5")],
+)
+async def edit_bill(
+    interaction: discord.Interaction,
+    bill_id: str,
+    plan: app_commands.Choice[str] | None = None,
+    currency: str | None = None,
+    time: str | None = None,
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
+) -> None:
+    row = fetch_premium_bill(bill_id)
+    if not row:
+        raise RuntimeError(f"Invoice `{clean(bill_id, 80)}` was not found.")
+    billing_seconds = None
+    if time:
+        try:
+            billing_seconds = parse_duration(time)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+    try:
+        user = await client.fetch_user(int(row["discord_user_id"]))
+    except Exception as error:
+        raise RuntimeError("The invoice customer could not be loaded from Discord.") from error
+    await interaction.response.send_modal(
+        BillModal(
+            user,
+            plan.value if plan else row["plan"],
+            currency or row["currency"],
+            billing_seconds,
+            cpu_type if cpu_type is not None else row["cpu_type"],
+            ram_type if ram_type is not None else row["ram_type"],
+            disk_type if disk_type is not None else row["disk_type"],
+            existing_bill=row,
         )
     )
 
