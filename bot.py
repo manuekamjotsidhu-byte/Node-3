@@ -419,6 +419,15 @@ def fetch_premium_bill(bill_id: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def delete_premium_bill(bill_id: str) -> bool:
+    """Permanently remove one invoice and return whether it existed."""
+    with db() as connection:
+        cursor = connection.execute(
+            "DELETE FROM premium_bills WHERE UPPER(bill_id) = UPPER(?)", (bill_id.strip(),)
+        )
+        return cursor.rowcount > 0
+
+
 def fetch_due_vps_bill_warnings(now: datetime) -> list[sqlite3.Row]:
     with db() as connection:
         return connection.execute(
@@ -1991,6 +2000,67 @@ async def edit_bill(
             disk_type if disk_type is not None else row["disk_type"],
             existing_bill=row,
         )
+    )
+
+
+@tree.command(name="delete-bill", description="Admin: permanently remove a premium invoice")
+@admin_only()
+@app_commands.describe(
+    bill_id="Invoice ID to remove",
+    confirm="Must be True to permanently remove the invoice",
+)
+async def delete_bill(interaction: discord.Interaction, bill_id: str, confirm: bool = False) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = fetch_premium_bill(bill_id)
+    if not row:
+        raise RuntimeError(f"Invoice `{clean(bill_id, 80)}` was not found.")
+    if not confirm:
+        await interaction.followup.send(
+            f"Invoice `{row['bill_id']}` was **not removed**. Run `/delete-bill` again with `confirm:True`.",
+            ephemeral=True,
+        )
+        return
+
+    customer_label = f"Discord user ID: `{row['discord_user_id']}`"
+    try:
+        customer = await client.fetch_user(int(row["discord_user_id"]))
+        customer_label = discord_profile_label(customer)
+    except Exception:
+        customer = None
+
+    dm_status = "no saved invoice DM"
+    if row["dm_channel_id"] and row["dm_message_id"]:
+        try:
+            channel = client.get_channel(int(row["dm_channel_id"])) or await client.fetch_channel(int(row["dm_channel_id"]))
+            message = await channel.fetch_message(int(row["dm_message_id"]))
+            await message.delete()
+            dm_status = "original customer DM deleted"
+        except discord.NotFound:
+            dm_status = "customer DM was already missing"
+        except discord.Forbidden:
+            dm_status = "customer DM could not be deleted (forbidden)"
+        except discord.HTTPException:
+            dm_status = "customer DM could not be deleted (Discord error)"
+
+    if not delete_premium_bill(row["bill_id"]):
+        raise RuntimeError("The invoice was removed by another operation before deletion completed.")
+
+    await interaction.followup.send(
+        f"Invoice `{row['bill_id']}` was permanently removed. Customer message: **{dm_status}**.",
+        ephemeral=True,
+    )
+    await send_admin_audit(
+        "Premium Bill Deleted",
+        f"Bill: `{row['bill_id']}`\n"
+        f"Customer: {customer_label}\n"
+        f"Plan: **{str(row['plan']).replace('-', ' ').title()}**\n"
+        f"Total: **{format_bill_money(float(row['total']), row['currency'])}**\n"
+        f"Created: <t:{int(datetime.fromisoformat(row['created_at']).timestamp())}:F>\n"
+        f"Next invoice was: <t:{int(datetime.fromisoformat(row['next_invoice_at']).timestamp())}:F>\n"
+        f"Customer message: **{dm_status}**\n"
+        "The database record was permanently deleted and no further VPS invoice reminders will be sent.",
+        actor=interaction.user,
+        color=0xe74c3c,
     )
 
 
