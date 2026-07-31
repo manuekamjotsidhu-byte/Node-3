@@ -88,6 +88,29 @@ def panel_server_is_suspended(panel_server: dict[str, Any]) -> bool:
     )
 
 
+def panel_server_suspension_state(panel_server: dict[str, Any]) -> bool | None:
+    """Return panel suspension state, or None when the response does not expose it."""
+    if any(key in panel_server for key in ("suspended", "is_suspended", "suspended_at")):
+        return panel_server_is_suspended(panel_server)
+    status_values = {
+        str(panel_server.get("status", "")).strip().lower(),
+        str(panel_server.get("state", "")).strip().lower(),
+        str((panel_server.get("container") or {}).get("status", "")).strip().lower(),
+    }
+    if "suspended" in status_values:
+        return True
+    return None
+
+
+def set_server_suspended_state(server_id: str, suspended: bool) -> None:
+    """Keep SQLite and the legacy JSON mirror in sync after a panel action."""
+    with db() as connection:
+        connection.execute("UPDATE servers SET suspended=? WHERE server_id=?", (int(suspended), str(server_id)))
+    if str(server_id) in database.get("servers", {}):
+        database["servers"][str(server_id)]["suspended"] = bool(suspended)
+        save_database()
+
+
 def db() -> sqlite3.Connection:
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(SQLITE_PATH)
@@ -258,14 +281,14 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         "databases": int(feature_limits.get("databases") or 0),
         "allocations": int(feature_limits.get("allocations") or 0),
         "backups": int(feature_limits.get("backups") or 0),
-        "suspended": int(panel_server_is_suspended(panel_server)),
+        "suspended": panel_server_suspension_state(panel_server),
         "deleted": 0,
     }
     with db() as connection:
         connection.execute(
             """
             UPDATE servers
-            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=?, deleted=?
+            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=COALESCE(?, suspended), deleted=?
             WHERE server_id=?
             """,
             (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["suspended"], updates["deleted"], str(server_id)),
@@ -1797,8 +1820,7 @@ class SuspendSelect(discord.ui.View):
             await interaction.response.send_message(embed=branded_embed("Missing Server", "That tracked server was not found anymore.", 0xff4d4d), ephemeral=True)
             return
         await (await ready_application_client_for(row)).suspend_server(server_id)
-        with db() as connection:
-            connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
+        set_server_suspended_state(server_id, True)
         await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
 
 
@@ -2431,11 +2453,7 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
     # guarantees that stale local suspension state cannot leave a renewed service offline.
     await panel.unsuspend_server(server)
     if tracked_row:
-        with db() as connection:
-            connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
-        if str(server) in database.get("servers", {}):
-            database["servers"][str(server)]["suspended"] = False
-            save_database()
+        set_server_suspended_state(server, False)
     resume_note = "Unsuspended and resumed" if was_suspended else "Confirmed active on the panel"
     row = await ensure_server_access(interaction, server, allow_admin=True)
     discord_user_id = record_value(row, "discord_user_id")
@@ -2539,8 +2557,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
             if row["plan"] == "paid" or is_whitelisted(row["server_id"]):
                 continue
             await (await ready_application_client_for(row)).suspend_server(row["server_id"])
-            with db() as connection:
-                connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (row["server_id"],))
+            set_server_suspended_state(row["server_id"], True)
             suspended += 1
         await interaction.followup.send(embed=branded_embed("Bulk Suspend Complete", f"Suspended **{suspended}** non-paid, non-whitelisted server(s)."), ephemeral=True)
         return
@@ -2548,8 +2565,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
     if server:
         row = await ensure_server_access(interaction, server, allow_admin=True)
         await (await ready_application_client_for(row)).suspend_server(server)
-        with db() as connection:
-            connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
+        set_server_suspended_state(server, True)
         await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended **{record_value(row, 'name', server)}**."), ephemeral=True)
         await send_server_event_log(row, "Server Suspended", f"Suspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe67e22)
         return
@@ -2568,8 +2584,7 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await ensure_server_access(interaction, server, allow_admin=True)
     await (await ready_application_client_for(row)).unsuspend_server(server)
-    with db() as connection:
-        connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
+    set_server_suspended_state(server, False)
     await interaction.followup.send(embed=branded_embed("Server Unsuspended", f"Unsuspended server `{server}`."), ephemeral=True)
     await send_server_event_log(row, "Server Unsuspended", f"Unsuspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0x2ecc71)
 
@@ -3245,12 +3260,32 @@ async def suspend_expired_servers() -> None:
         try:
             if not record["suspended"]:
                 await send_due_suspension_warnings(record, now)
-                if not record["autosuspend_enabled"] or expires_at > now:
+                # Re-read immediately before the panel action. A /renew command may
+                # have changed this record while warning DMs were being sent.
+                current = fetch_server(server_id)
+                if not current or current["deleted"]:
                     continue
-                await (await ready_application_client_for(record)).suspend_server(server_id)
-                with db() as connection:
-                    connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
-                await send_lifecycle_dm(record, "suspended", expires_at)
+                current_expiry = datetime.fromisoformat(current["expires_at"])
+                if current["suspended"] or not current["autosuspend_enabled"] or current_expiry > utc_now():
+                    continue
+                panel = await ready_application_client_for(current)
+                panel_server = await panel.get_server(server_id)
+                panel_state = panel_server_suspension_state(panel_server)
+                if panel_state is True:
+                    set_server_suspended_state(server_id, True)
+                    continue
+                await panel.suspend_server(server_id)
+
+                # A renewal can race with the HTTP suspend request. If its new date
+                # is now in the future, immediately restore the panel and local state.
+                latest = fetch_server(server_id)
+                if latest and (not latest["autosuspend_enabled"] or datetime.fromisoformat(latest["expires_at"]) > utc_now()):
+                    await panel.unsuspend_server(server_id)
+                    set_server_suspended_state(server_id, False)
+                    print(f"Reversed stale suspension for renewed server {server_id}.")
+                    continue
+                set_server_suspended_state(server_id, True)
+                await send_lifecycle_dm(current, "suspended", current_expiry)
                 continue
 
             if delete_at - now <= timedelta(days=1) and now < delete_at and not notification_sent(server_id, "delete_1d"):
