@@ -61,7 +61,7 @@ python bot.py
 - `/console` - users send a console command to their own linked server.
 - `/rename` - users rename their own linked server.
 - `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.
-- `/renew` - guild admin-only renewal command with admin server autocomplete; tracked servers update the local DB, and panel-only servers still sync Saga/panel expiration by a time such as `30d`.
+- `/renew` - guild admin-only renewal command with admin server autocomplete; tracked servers update the local DB, panel-only servers still sync Saga/panel expiration by a time such as `30d`, and every successful renewal explicitly unsuspends/resumes the server on the panel.
 - `/delete` - guild admin-only command to delete one specific tracked server with `confirm:True`.
 - `/deletesuspended` - guild admin-only cleanup command that fetches live server details from the panel, detects suspended servers from panel flags/status values, and deletes suspended `free`, `paid`, or `all` servers after confirmation.
 - `/resize` - guild admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.

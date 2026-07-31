@@ -2419,22 +2419,30 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
     new_expiry = base + timedelta(seconds=seconds)
     if tracked_row:
         with db() as connection:
-            connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1, autosuspend_seconds=? WHERE server_id=?", (new_expiry.isoformat(), seconds, server))
+            connection.execute("UPDATE servers SET expires_at=?, autosuspend_enabled=1, autosuspend_seconds=? WHERE server_id=?", (new_expiry.isoformat(), seconds, server))
         if str(server) in database.get("servers", {}):
-            database["servers"][str(server)].update({"expires_at": new_expiry.isoformat(), "suspended": False, "autosuspend_enabled": True, "autosuspend_seconds": seconds})
+            database["servers"][str(server)].update({"expires_at": new_expiry.isoformat(), "autosuspend_enabled": True, "autosuspend_seconds": seconds})
             save_database()
         clear_server_notifications(server)
-    saga_synced = await (await ready_application_client_for(row)).set_saga_auto_suspend(server, new_expiry)
-    try:
-        row = await ensure_server_access(interaction, server, allow_admin=True)
-        await (await ready_application_client_for(row)).unsuspend_server(server)
-    except RuntimeError:
-        pass
+    panel = await ready_application_client_for(row)
+    saga_synced = await panel.set_saga_auto_suspend(server, new_expiry)
+    was_suspended = server_is_suspended(row)
+    # The panel endpoint is safe for active servers too. Calling it on every renewal
+    # guarantees that stale local suspension state cannot leave a renewed service offline.
+    await panel.unsuspend_server(server)
+    if tracked_row:
+        with db() as connection:
+            connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
+        if str(server) in database.get("servers", {}):
+            database["servers"][str(server)]["suspended"] = False
+            save_database()
+    resume_note = "Unsuspended and resumed" if was_suspended else "Confirmed active on the panel"
+    row = await ensure_server_access(interaction, server, allow_admin=True)
     discord_user_id = record_value(row, "discord_user_id")
     if discord_user_id:
         try:
             user = await client.fetch_user(int(discord_user_id))
-            await user.send(embed=branded_embed("Service Renewed", f"Your server **{record_value(row, 'name', server)}** was renewed until <t:{int(new_expiry.timestamp())}:F>."))
+            await user.send(embed=branded_embed("Service Renewed", f"Your server **{record_value(row, 'name', server)}** was renewed until <t:{int(new_expiry.timestamp())}:F> and is now active."))
         except Exception:
             pass
     warning_note = "No renewal warning due"
@@ -2445,8 +2453,8 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
             if sent_warnings:
                 warning_note = "Sent " + ", ".join(expiration_warning_lead(notification_type) for notification_type in sent_warnings) + " renewal warning(s)"
     tracking_note = "Local DB updated" if tracked_row else "Panel/Saga updated only (server is not locally tracked)"
-    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
-    await send_server_event_log(row, "Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
+    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nService status: **{resume_note}**\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
+    await send_server_event_log(row, "Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nService status: **{resume_note}**\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
 
 
 @tree.command(name="delete", description="Admin delete one server")
