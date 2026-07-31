@@ -237,6 +237,38 @@ class TicketBot(commands.Bot):
             log.warning("Joined unsupported guild %s; leaving", guild.id)
             await guild.leave()
 
+    async def on_member_remove(self, member: discord.Member):
+        if member.guild.id != ALLOWED_GUILD_ID:
+            return
+
+        actor = member.guild.me or self.user
+        if actor is None:
+            log.warning("Could not delete tickets for departed member %s: bot user is unavailable", member.id)
+            return
+
+        reason = f"Ticket opener left the server ({member} / {member.id})."
+        tickets = self.store.rows(
+            "SELECT * FROM tickets WHERE guild_id=? AND opener_id=? AND status!='deleted'",
+            (member.guild.id, member.id),
+        )
+        for ticket in tickets:
+            channel = member.guild.get_channel(ticket["channel_id"])
+            if not isinstance(channel, discord.TextChannel):
+                self.store.exec(
+                    "UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=?, close_reason=? WHERE ticket_id=?",
+                    (actor.id, iso(), reason, ticket["ticket_id"]),
+                )
+                await self.log_event(
+                    "Departed member ticket cleaned",
+                    "The ticket opener left the server and the ticket channel was already missing.",
+                    self.store.row("SELECT * FROM tickets WHERE ticket_id=?", (ticket["ticket_id"],)),
+                )
+                continue
+
+            deleted = await self.delete_ticket(channel, actor, auto=True, reason=reason)
+            if not deleted:
+                log.warning("Could not delete ticket %s after opener %s left", ticket["ticket_id"], member.id)
+
     def allowed_guild(self, guild: Optional[discord.Guild]) -> bool:
         return bool(guild and guild.id == ALLOWED_GUILD_ID)
 
@@ -640,18 +672,27 @@ class TicketBot(commands.Bot):
             log.warning("ticket reopen failed for channel %s: %s", channel.id, e)
             return False
 
-    async def delete_ticket(self, channel: discord.TextChannel, actor: discord.abc.User, auto=False):
+    async def delete_ticket(self, channel: discord.TextChannel, actor: discord.abc.User, auto=False, reason: Optional[str] = None):
         ticket = self.ticket_by_channel(channel.id)
         if not ticket: return False
         old_status = ticket["status"]
         try:
             transcript = await self.transcript_file(channel, ticket)
-            self.store.exec("UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=? WHERE ticket_id=?", (actor.id, iso(), ticket["ticket_id"]))
+            self.store.exec(
+                "UPDATE tickets SET status='deleted', deleted_by=?, deleted_at=?, close_reason=COALESCE(?, close_reason) WHERE ticket_id=?",
+                (actor.id, iso(), reason, ticket["ticket_id"]),
+            )
             updated = self.store.row("SELECT * FROM tickets WHERE ticket_id=?", (ticket["ticket_id"],))
             attach_file = None if ticket["transcript_status"] == "uploaded" and ticket["transcript_reference"] else transcript
-            log_ok = await self.log_event("Ticket auto-deleted" if auto else "Ticket deleted", f"Channel: #{channel.name}", updated, attach_file)
+            log_description = f"Channel: #{channel.name}"
+            if reason:
+                log_description += f"\nReason: {reason}"
+            log_ok = await self.log_event("Ticket auto-deleted" if auto else "Ticket deleted", log_description, updated, attach_file)
             if self.cfg["transcripts"].get("mandatory") and not log_ok:
-                self.store.exec("UPDATE tickets SET status=?, deleted_by=NULL, deleted_at=NULL WHERE ticket_id=?", (old_status, ticket["ticket_id"]))
+                self.store.exec(
+                    "UPDATE tickets SET status=?, deleted_by=NULL, deleted_at=NULL, close_reason=? WHERE ticket_id=?",
+                    (old_status, ticket["close_reason"], ticket["ticket_id"]),
+                )
                 return False
             if attach_file:
                 self.store.exec("UPDATE tickets SET transcript_status='uploaded', transcript_reference=? WHERE ticket_id=?", (iso(), ticket["ticket_id"]))
