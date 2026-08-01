@@ -136,6 +136,7 @@ def init_db() -> None:
             panel_user_id INTEGER NOT NULL,
             panel_email TEXT NOT NULL,
             ram INTEGER NOT NULL,
+            swap INTEGER NOT NULL DEFAULT 0,
             disk INTEGER NOT NULL,
             cpu INTEGER NOT NULL,
             nest_id INTEGER NOT NULL,
@@ -200,6 +201,8 @@ def init_db() -> None:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_enabled INTEGER NOT NULL DEFAULT 1")
         if "autosuspend_seconds" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_seconds INTEGER")
+        if "swap" not in columns:
+            connection.execute("ALTER TABLE servers ADD COLUMN swap INTEGER NOT NULL DEFAULT 0")
         node_status_columns = {row[1] for row in connection.execute("PRAGMA table_info(node_status)").fetchall()}
         if "down_since" not in node_status_columns:
             connection.execute("ALTER TABLE node_status ADD COLUMN down_since TEXT")
@@ -227,9 +230,9 @@ def init_db() -> None:
 def upsert_server_record(record: dict[str, Any]) -> None:
     with db() as connection:
         connection.execute("""
-        INSERT OR REPLACE INTO servers (server_id, identifier, uuid, name, plan, discord_user_id, panel_user_id, panel_email, ram, disk, cpu, nest_id, nest_name, egg_id, egg_name, node_id, node_name, databases, allocations, backups, created_at, expires_at, suspended, deleted, autosuspend_enabled, autosuspend_seconds)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (record["server_id"], record.get("identifier"), record.get("uuid"), record["name"], record["plan"], record["discord_user_id"], record["panel_user_id"], record["panel_email"], record["ram"], record["disk"], record["cpu"], record["nest_id"], record["nest_name"], record["egg_id"], record["egg_name"], record["node_id"], record["node_name"], record["databases"], record["allocations"], record["backups"], record["created_at"], record["expires_at"], int(record.get("suspended", False)), int(record.get("deleted", False)), int(record.get("autosuspend_enabled", True)), record.get("autosuspend_seconds")))
+        INSERT OR REPLACE INTO servers (server_id, identifier, uuid, name, plan, discord_user_id, panel_user_id, panel_email, ram, swap, disk, cpu, nest_id, nest_name, egg_id, egg_name, node_id, node_name, databases, allocations, backups, created_at, expires_at, suspended, deleted, autosuspend_enabled, autosuspend_seconds)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (record["server_id"], record.get("identifier"), record.get("uuid"), record["name"], record["plan"], record["discord_user_id"], record["panel_user_id"], record["panel_email"], record["ram"], record.get("swap", 0), record["disk"], record["cpu"], record["nest_id"], record["nest_name"], record["egg_id"], record["egg_name"], record["node_id"], record["node_name"], record["databases"], record["allocations"], record["backups"], record["created_at"], record["expires_at"], int(record.get("suspended", False)), int(record.get("deleted", False)), int(record.get("autosuspend_enabled", True)), record.get("autosuspend_seconds")))
 
 
 def fetch_server(server_id: str) -> sqlite3.Row | None:
@@ -276,6 +279,7 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         "panel_user_id": int(panel_server.get("user") or 0),
         "panel_email": panel_email,
         "ram": int(limits.get("memory") or 0),
+        "swap": int(limits.get("swap") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
         "databases": int(feature_limits.get("databases") or 0),
@@ -288,10 +292,10 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         connection.execute(
             """
             UPDATE servers
-            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=COALESCE(?, suspended), deleted=?
+            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, swap=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=COALESCE(?, suspended), deleted=?
             WHERE server_id=?
             """,
-            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["suspended"], updates["deleted"], str(server_id)),
+            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["swap"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["suspended"], updates["deleted"], str(server_id)),
         )
     if str(server_id) in database.get("servers", {}):
         mirror_updates = {key: value for key, value in updates.items() if value is not None}
@@ -512,7 +516,7 @@ def server_admin_details(record: sqlite3.Row | dict[str, Any], *, user: discord.
         f"Node: **{clean(str(record_value(record, 'node_name', 'Unknown')), 80)}** (`{record_value(record, 'node_id', 'unknown')}`)\n"
         f"Nest: **{clean(str(record_value(record, 'nest_name', 'Unknown')), 80)}** (`{record_value(record, 'nest_id', 'unknown')}`)\n"
         f"Egg: **{clean(str(record_value(record, 'egg_name', 'Unknown')), 80)}** (`{record_value(record, 'egg_id', 'unknown')}`)\n"
-        f"Specs: RAM `{record_value(record, 'ram', 0)} MB` / Disk `{record_value(record, 'disk', 0)} MB` / CPU `{record_value(record, 'cpu', 0)}%`\n"
+        f"Specs: RAM `{record_value(record, 'ram', 0)} MB` / Swap `{record_value(record, 'swap', 0)} MB` / Disk `{record_value(record, 'disk', 0)} MB` / CPU `{record_value(record, 'cpu', 0)}%`\n"
         f"Extras: DB `{record_value(record, 'databases', 0)}` / Alloc `{record_value(record, 'allocations', 0)}` / Backups `{record_value(record, 'backups', 0)}`\n"
         f"State: suspended=`{bool(record_value(record, 'suspended', False))}` deleted=`{bool(record_value(record, 'deleted', False))}` autosuspend=`{bool(record_value(record, 'autosuspend_enabled', True))}`"
     )
@@ -656,7 +660,7 @@ class PterodactylClient:
         data = await self.request("PATCH", f"servers/{server_id}/startup", payload)
         return data.get("attributes", {})
 
-    async def create_server(self, *, panel_user_id: int, name: str, ram: int, disk: int, cpu: int, node_id: int, nest_id: int, egg_id: int, databases: int, allocations: int, backups: int) -> dict[str, Any]:
+    async def create_server(self, *, panel_user_id: int, name: str, ram: int, swap: int, disk: int, cpu: int, node_id: int, nest_id: int, egg_id: int, databases: int, allocations: int, backups: int) -> dict[str, Any]:
         egg = await self.get_egg(nest_id, egg_id)
         docker_image = self.egg_docker_image(egg)
         startup = egg.get("startup")
@@ -670,7 +674,7 @@ class PterodactylClient:
             "docker_image": docker_image,
             "startup": startup,
             "environment": await self.egg_environment(nest_id, egg_id),
-            "limits": {"memory": ram, "swap": 0, "disk": disk, "io": 500, "cpu": cpu},
+            "limits": {"memory": ram, "swap": swap, "disk": disk, "io": 500, "cpu": cpu},
             "feature_limits": {"databases": databases, "allocations": allocations, "backups": backups},
             "allocation": {"default": allocation_id},
             "start_on_completion": True,
@@ -953,14 +957,14 @@ def about_embed() -> discord.Embed:
     return embed
 
 
-def specs_embed(plan: str, name: str, ram: int, disk: int, cpu: int, node_name: str, nest: str, egg: str, expires_at: datetime, databases: int, allocations: int, backups: int) -> discord.Embed:
+def specs_embed(plan: str, name: str, ram: int, swap: int, disk: int, cpu: int, node_name: str, nest: str, egg: str, expires_at: datetime, databases: int, allocations: int, backups: int) -> discord.Embed:
     panel_url = config.get("panel_url", PANEL_URL)
     embed = branded_embed(f"Your {BRAND} {plan.title()} Server Is Ready", f"Panel: **{panel_url.rstrip('/')}**")
     embed.add_field(name="🖥️ Server", value=name, inline=True)
     embed.add_field(name="🪺 Nest", value=nest, inline=True)
     embed.add_field(name="🥚 Egg", value=egg, inline=True)
     embed.add_field(name="🌐 Node", value=node_name, inline=True)
-    embed.add_field(name="⚙️ Specs", value=f"RAM: **{ram} MB**\nDisk: **{disk} MB**\nCPU: **{cpu}%**", inline=True)
+    embed.add_field(name="⚙️ Specs", value=f"RAM: **{ram} MB**\nSwap: **{swap} MB**\nDisk: **{disk} MB**\nCPU: **{cpu}%**", inline=True)
     embed.add_field(name="📦 Extras", value=f"DB: **{databases}**\nAlloc: **{allocations}**\nBackups: **{backups}**", inline=True)
     embed.add_field(name="⏳ Expires", value=f"<t:{int(expires_at.timestamp())}:F>", inline=False)
     return embed
@@ -1290,6 +1294,7 @@ def panel_server_record(server: dict[str, Any], plan: str = "panel") -> dict[str
         "panel_user_id": server.get("user") or 0,
         "panel_email": f"{panel_label_for_plan(plan)} panel-created/unlinked",
         "ram": int(limits.get("memory") or 0),
+        "swap": int(limits.get("swap") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
         "status": server.get("status") or server.get("state") or (server.get("container") or {}).get("status"),
@@ -1824,7 +1829,19 @@ class SuspendSelect(discord.ui.View):
         await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
 
 
-async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int, allocations: int, backups: int) -> None:
+def minecraft_swap_mb(plan: str, ram_mb: int, nest_name: str, egg_name: str, requested_swap_gb: int | None) -> int:
+    """Calculate deterministic swap: explicit value, or plan-based Minecraft defaults."""
+    if requested_swap_gb is not None:
+        if requested_swap_gb < 0:
+            raise RuntimeError("Swap cannot be negative. Use `0` to disable swap.")
+        return requested_swap_gb * 1024
+    is_minecraft = "minecraft" in f"{nest_name} {egg_name}".lower()
+    if not is_minecraft:
+        return 0
+    return ram_mb * 2 if plan == "free" else ram_mb
+
+
+async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int, allocations: int, backups: int, swap: int | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
     if ram <= 0 or disk <= 0 or cpu <= 0:
         raise RuntimeError("RAM, disk, and CPU must be positive numbers.")
@@ -1837,6 +1854,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     node_name = node.split(":", 1)[1] if ":" in node else f"Node {node_id}"
     nest_name = nest.split(":", 1)[1] if ":" in nest else f"Nest {nest_id}"
     egg_name = egg.split(":", 1)[1] if ":" in egg else f"Egg {egg_id}"
+    swap_mb = minecraft_swap_mb(plan, ram_mb, nest_name, egg_name, swap)
     if nest_id <= 0 or egg_id <= 0:
         await interaction.followup.send(embed=branded_embed("Nest And Egg Required", "Select a real nest first, then select an egg from that nest.", 0xff4d4d), ephemeral=True)
         return
@@ -1847,7 +1865,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     panel_email = link["email"]
     panel_user = {"id": link["panel_user_id"]}
     expires_at = utc_now() + timedelta(seconds=duration_seconds)
-    server = await panel.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
+    server = await panel.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, swap=swap_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
     server_id = str(server["id"])
     saga_synced = await panel.set_saga_auto_suspend(server_id, expires_at)
     record = {
@@ -1860,6 +1878,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         "uuid": server.get("uuid"),
         "identifier": server.get("identifier"),
         "ram": ram_mb,
+        "swap": swap_mb,
         "disk": disk_mb,
         "cpu": cpu,
         "nest_id": nest_id,
@@ -1888,7 +1907,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         with db() as connection:
             connection.execute("INSERT OR IGNORE INTO whitelist(server_id) VALUES (?)", (server_id,))
 
-    dm_embed = specs_embed(plan, name, ram_mb, disk_mb, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
+    dm_embed = specs_embed(plan, name, ram_mb, swap_mb, disk_mb, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
     try:
         await user.send(embed=dm_embed)
         await user.send(embed=trustpilot_embed())
@@ -1898,7 +1917,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     created = branded_embed("Server Created", f"**{name}** was created for {user.mention}.", 0x2ecc71)
     created.add_field(name="Server", value=f"ID: `{server_id}`\nUUID: `{server.get('uuid', 'unknown')}`", inline=False)
     created.add_field(name="Owner", value=f"Discord: {user.mention}\nEmail: `{panel_email}`", inline=True)
-    created.add_field(name="Specs", value=f"RAM: **{ram_mb:,} MB** ({ram} GB)\nDisk: **{disk_mb:,} MB** ({disk} GB)\nCPU: **{cpu}%**", inline=True)
+    created.add_field(name="Specs", value=f"RAM: **{ram_mb:,} MB** ({ram} GB)\nSwap: **{swap_mb:,} MB** ({swap_mb / 1024:g} GB)\nDisk: **{disk_mb:,} MB** ({disk} GB)\nCPU: **{cpu}%**", inline=True)
     created.add_field(name="Deployment", value=f"Node: **{node_name}**\nNest: **{nest_name}**\nEgg: **{egg_name}**", inline=False)
     created.add_field(name="Extras", value=f"Databases: **{databases}**\nAllocations: **{allocations}**\nBackups: **{backups}**", inline=True)
     created.add_field(name="Expiration", value=f"<t:{int(expires_at.timestamp())}:F>\n<t:{int(expires_at.timestamp())}:R>", inline=True)
@@ -2089,17 +2108,17 @@ async def delete_bill(interaction: discord.Interaction, bill_id: str, confirm: b
 @tree.command(name="create-free", description="Create free server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-@app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
-async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
-    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
+@app_commands.describe(ram="RAM in GB (sent as GB x 1024 MB)", swap="Swap in GB; Minecraft defaults to 2x RAM when omitted", disk="Disk in GB (sent as GB x 1024 MB)", time="Duration like 30d, 12h, or 1d6h")
+async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0, swap: int | None = None) -> None:
+    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups, swap)
 
 
 @tree.command(name="create-paid", description="Create paid server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-@app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
-async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
-    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
+@app_commands.describe(ram="RAM in GB (sent as GB x 1024 MB)", swap="Swap in GB; Minecraft defaults to the RAM specification when omitted", disk="Disk in GB (sent as GB x 1024 MB)", time="Duration like 30d, 12h, or 1d6h")
+async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int = 1, allocations: int = 1, backups: int = 1, swap: int | None = None) -> None:
+    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups, swap)
 
 
 @tree.command(name="link", description="Link panel email")
