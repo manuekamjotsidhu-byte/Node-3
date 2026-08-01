@@ -13,13 +13,13 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 - All account, server, and management actions use the single configured Pterodactyl panel at `https://gp.zeroxhost.space`; `/admin createuser` can create and link panel accounts there.
 - Only configured owners/admin roles can create, purge, whitelist, or view management data. Admin commands are guild-only and are intentionally hidden/blocked in DMs; DMs only expose user-safe commands for linked servers.
 - Admins select a deployment node by name/ID with slash-command autocomplete.
-- Admins create either `/create-free` or `/create-paid` servers on the same panel with custom `time`, nest, egg, node, RAM/Disk entered in GB, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link` or `/admin createuser`.
-- Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`; general admin audit logs use `admin_log_channel_id` and fall back to the paid log channel.
+- Admins create either `/create-free` or `/create-paid` servers on the same panel with custom `time`, nest, egg, node, RAM/Swap/Disk entered in GB, CPU, databases, allocations, and backups; the Discord user must already be linked with `/link` or `/admin createuser`. Minecraft swap is deterministic when omitted: free plans receive high swap at 2x RAM, while paid plans receive swap equal to their RAM specification; admins can explicitly set `swap` to override either default.
+- Paid server creations are logged to channel `1504092779700289536` unless overridden in `config.json`; general admin audit logs use `admin_log_channel_id` and fall back to the paid log channel. New invoice, reminder, and admin-action logs include the Discord display name, username, mention, and user ID so the profile remains identifiable even when Discord cannot resolve an old mention.
 - `/purge` deletes tracked free servers only; paid and whitelisted servers are skipped.
-- Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link.
+- Created users receive styled ZeroX Host DM embeds with specs, panel URL, node, extras, expiration, and a Trustpilot review link. Premium bills support VPS, Minecraft, web hosting, and bot hosting, and include creation/next-invoice dates, a full price summary, VPS CPU/RAM/disk types, and VPS 7-day/1-day renewal warnings. The complete invoice is also sent to the admin log.
 - Tracked server details are refreshed from the live Pterodactyl panel before user lists and management actions, and a 60-second background sync refetches panel nodes, nests, eggs, servers, users, and updates tracked server names/specs/suspension/deletion status from panel activity.
 - Saga Auto Suspension can be synced during create, renew, and `/autosuspend` changes by configuring `saga_auto_suspend_enabled` and the panel field name in `saga_auto_suspend_field` (fallbacks try `suspended_at`, `expiration_date`, and `expires_at`).
-- Expired tracked servers are automatically suspended by the background task. Paid users receive renewal reminders 7 days and 24 hours before suspension; free users receive the 24-hour reminder. Everyone receives a deletion warning 24 hours before cleanup, and suspended servers are deleted after 7 days.
+- Expired tracked servers are automatically suspended by the background task. Panel suspension state, SQLite, and the legacy JSON mirror are kept synchronized; missing panel status fields no longer overwrite known local state, and a renewal racing with automatic suspension is detected and immediately resumed instead of being repeatedly suspended. Paid users receive renewal reminders 7 days and 24 hours before suspension; free users receive the 24-hour reminder. Everyone receives a deletion warning 24 hours before cleanup, and suspended servers are deleted after 7 days.
 
 ## Files
 
@@ -30,7 +30,7 @@ Inspired by the Vortex Ptero Manager workflow, but rebuilt as one `bot.py` with 
 
 ## Setup
 
-Commands are synced globally for the guild-installed app, user-install command copies are disabled to prevent Discord from showing duplicate slash commands, and the bot clears configured-guild command copies such as duplicate `/unlink` entries. If a new command does not appear immediately after an update, restart the bot once and wait for Discord global command propagation.
+Commands are synced globally for the guild-installed app, user-install command copies are disabled to prevent Discord from showing duplicate slash commands, and the bot actively clears configured-guild command copies instead of copying globals into the guild. If a new command does not appear immediately after an update, restart the bot once and wait for Discord global command propagation.
 
 
 ```bash
@@ -45,8 +45,11 @@ python bot.py
 ## Slash commands
 
 - `/about` - polished feature overview for the ZeroX Host Pterodactyl Manager, including user management, server management, logging, receipts/DMs, node monitoring, expirations, and permissions.
-- `/create-free` - admin-only free-plan server creation on the single configured panel. Its node, nest, and egg autocomplete values are loaded from `https://gp.zeroxhost.space`, and it requires the user to have a linked panel account.
-- `/create-paid` - admin-only paid server creation with `time` duration, RAM/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging.
+- `/bill` - admin-only premium VPS, Minecraft, web-hosting, or bot-hosting invoice command. Admins provide the customer, plan, currency, and billing period; the modal captures price/specs/tax/discount/notes. Bills DM the customer and send the complete invoice to the admin log, including creation date, next invoice date, all price calculations, and VPS CPU/RAM/disk details (including DDR4/DDR5 RAM choice) and warning dates.
+- `/edit-bill` - admin-only invoice editor. It loads a saved invoice into a prefilled modal, preserves unspecified values, optionally changes its plan/currency/next billing period/VPS hardware, updates the original customer DM when possible, and sends the complete revised invoice to the admin log.
+- `/delete-bill` - admin-only permanent invoice removal with an explicit `confirm:True` safeguard. It removes the saved invoice and future VPS reminders, attempts to delete the original customer invoice DM, and records a deletion audit containing the customer, plan, total, and invoice dates.
+- `/create-free` - admin-only free-plan server creation on the single configured panel. Its node, nest, and egg autocomplete values are loaded from `https://gp.zeroxhost.space`, and it requires the user to have a linked panel account. Minecraft containers default to swap equal to 2x their RAM unless `swap` is explicitly supplied in GB.
+- `/create-paid` - admin-only paid server creation with `time` duration, RAM/Swap/Disk in GB, nest/egg/spec customization, automatic whitelist, and paid logging. Minecraft containers default to swap equal to their configured RAM unless `swap` is explicitly supplied.
 - `/admin list` - admin-only paginated embed list fetched live from the Pterodactyl panel, showing each server UUID, panel email, and linked Discord user when available.
 - `/admin createuser` - admin-only panel account creation and Discord linking on `https://gp.zeroxhost.space`. It requests the target Discord user, email, username, first/last name, and temporary password, then DMs polished credentials.
 - `/admin manage`, `/admin console`, `/admin rename` - admin-only versions that can target any tracked server **and panel-created servers that are not in the local DB yet**; normal `/manage`, `/console`, `/rename`, `/power`, and `/reinstall` also show admin-wide server autocomplete when used by admins in the guild, while regular users only see their own servers.
@@ -58,7 +61,7 @@ python bot.py
 - `/console` - users send a console command to their own linked server.
 - `/rename` - users rename their own linked server.
 - `/schedule-restart` - users schedule a restart for one selected server and a time such as `12h` or `1d`; guild admins may use `all_servers:True` to schedule all tracked servers.
-- `/renew` - guild admin-only renewal command with admin server autocomplete; tracked servers update the local DB, and panel-only servers still sync Saga/panel expiration by a time such as `30d`.
+- `/renew` - guild admin-only renewal command with admin server autocomplete; tracked servers update the local DB, panel-only servers still sync Saga/panel expiration by a time such as `30d`, and every successful renewal explicitly unsuspends/resumes the server on the panel.
 - `/delete` - guild admin-only command to delete one specific tracked server with `confirm:True`.
 - `/deletesuspended` - guild admin-only cleanup command that fetches live server details from the panel, detects suspended servers from panel flags/status values, and deletes suspended `free`, `paid`, or `all` servers after confirmation.
 - `/resize` - guild admin-only resize modal GUI for RAM, disk, CPU, databases, allocations, and backups.

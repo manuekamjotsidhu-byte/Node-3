@@ -88,6 +88,29 @@ def panel_server_is_suspended(panel_server: dict[str, Any]) -> bool:
     )
 
 
+def panel_server_suspension_state(panel_server: dict[str, Any]) -> bool | None:
+    """Return panel suspension state, or None when the response does not expose it."""
+    if any(key in panel_server for key in ("suspended", "is_suspended", "suspended_at")):
+        return panel_server_is_suspended(panel_server)
+    status_values = {
+        str(panel_server.get("status", "")).strip().lower(),
+        str(panel_server.get("state", "")).strip().lower(),
+        str((panel_server.get("container") or {}).get("status", "")).strip().lower(),
+    }
+    if "suspended" in status_values:
+        return True
+    return None
+
+
+def set_server_suspended_state(server_id: str, suspended: bool) -> None:
+    """Keep SQLite and the legacy JSON mirror in sync after a panel action."""
+    with db() as connection:
+        connection.execute("UPDATE servers SET suspended=? WHERE server_id=?", (int(suspended), str(server_id)))
+    if str(server_id) in database.get("servers", {}):
+        database["servers"][str(server_id)]["suspended"] = bool(suspended)
+        save_database()
+
+
 def db() -> sqlite3.Connection:
     SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(SQLITE_PATH)
@@ -113,6 +136,7 @@ def init_db() -> None:
             panel_user_id INTEGER NOT NULL,
             panel_email TEXT NOT NULL,
             ram INTEGER NOT NULL,
+            swap INTEGER NOT NULL DEFAULT 0,
             disk INTEGER NOT NULL,
             cpu INTEGER NOT NULL,
             nest_id INTEGER NOT NULL,
@@ -160,24 +184,55 @@ def init_db() -> None:
             updated_at TEXT NOT NULL,
             down_since TEXT
         );
+        CREATE TABLE IF NOT EXISTS premium_bills (
+            bill_id TEXT PRIMARY KEY,
+            discord_user_id TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            next_invoice_at TEXT NOT NULL,
+            currency TEXT NOT NULL,
+            total REAL NOT NULL,
+            warn_7d_sent INTEGER NOT NULL DEFAULT 0,
+            warn_1d_sent INTEGER NOT NULL DEFAULT 0
+        );
         """)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(servers)").fetchall()}
         if "autosuspend_enabled" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_enabled INTEGER NOT NULL DEFAULT 1")
         if "autosuspend_seconds" not in columns:
             connection.execute("ALTER TABLE servers ADD COLUMN autosuspend_seconds INTEGER")
+        if "swap" not in columns:
+            connection.execute("ALTER TABLE servers ADD COLUMN swap INTEGER NOT NULL DEFAULT 0")
         node_status_columns = {row[1] for row in connection.execute("PRAGMA table_info(node_status)").fetchall()}
         if "down_since" not in node_status_columns:
             connection.execute("ALTER TABLE node_status ADD COLUMN down_since TEXT")
+        bill_columns = {row[1] for row in connection.execute("PRAGMA table_info(premium_bills)").fetchall()}
+        bill_column_definitions = {
+            "price": "REAL NOT NULL DEFAULT 0",
+            "specifications": "TEXT NOT NULL DEFAULT ''",
+            "tax_percentage": "REAL NOT NULL DEFAULT 0",
+            "discount_percentage": "REAL NOT NULL DEFAULT 0",
+            "other_charges": "REAL NOT NULL DEFAULT 0",
+            "notes": "TEXT",
+            "cpu_type": "TEXT",
+            "ram_type": "TEXT",
+            "disk_type": "TEXT",
+            "updated_at": "TEXT",
+            "dm_channel_id": "TEXT",
+            "dm_message_id": "TEXT",
+        }
+        for column, definition in bill_column_definitions.items():
+            if column not in bill_columns:
+                connection.execute(f"ALTER TABLE premium_bills ADD COLUMN {column} {definition}")
         # Legacy databases may contain older link columns, but new installs use one panel only.
 
 
 def upsert_server_record(record: dict[str, Any]) -> None:
     with db() as connection:
         connection.execute("""
-        INSERT OR REPLACE INTO servers (server_id, identifier, uuid, name, plan, discord_user_id, panel_user_id, panel_email, ram, disk, cpu, nest_id, nest_name, egg_id, egg_name, node_id, node_name, databases, allocations, backups, created_at, expires_at, suspended, deleted, autosuspend_enabled, autosuspend_seconds)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (record["server_id"], record.get("identifier"), record.get("uuid"), record["name"], record["plan"], record["discord_user_id"], record["panel_user_id"], record["panel_email"], record["ram"], record["disk"], record["cpu"], record["nest_id"], record["nest_name"], record["egg_id"], record["egg_name"], record["node_id"], record["node_name"], record["databases"], record["allocations"], record["backups"], record["created_at"], record["expires_at"], int(record.get("suspended", False)), int(record.get("deleted", False)), int(record.get("autosuspend_enabled", True)), record.get("autosuspend_seconds")))
+        INSERT OR REPLACE INTO servers (server_id, identifier, uuid, name, plan, discord_user_id, panel_user_id, panel_email, ram, swap, disk, cpu, nest_id, nest_name, egg_id, egg_name, node_id, node_name, databases, allocations, backups, created_at, expires_at, suspended, deleted, autosuspend_enabled, autosuspend_seconds)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (record["server_id"], record.get("identifier"), record.get("uuid"), record["name"], record["plan"], record["discord_user_id"], record["panel_user_id"], record["panel_email"], record["ram"], record.get("swap", 0), record["disk"], record["cpu"], record["nest_id"], record["nest_name"], record["egg_id"], record["egg_name"], record["node_id"], record["node_name"], record["databases"], record["allocations"], record["backups"], record["created_at"], record["expires_at"], int(record.get("suspended", False)), int(record.get("deleted", False)), int(record.get("autosuspend_enabled", True)), record.get("autosuspend_seconds")))
 
 
 def fetch_server(server_id: str) -> sqlite3.Row | None:
@@ -224,22 +279,23 @@ def update_tracked_server_from_panel(server_id: str, panel_server: dict[str, Any
         "panel_user_id": int(panel_server.get("user") or 0),
         "panel_email": panel_email,
         "ram": int(limits.get("memory") or 0),
+        "swap": int(limits.get("swap") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
         "databases": int(feature_limits.get("databases") or 0),
         "allocations": int(feature_limits.get("allocations") or 0),
         "backups": int(feature_limits.get("backups") or 0),
-        "suspended": int(panel_server_is_suspended(panel_server)),
+        "suspended": panel_server_suspension_state(panel_server),
         "deleted": 0,
     }
     with db() as connection:
         connection.execute(
             """
             UPDATE servers
-            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=?, deleted=?
+            SET identifier=?, uuid=?, name=?, panel_user_id=?, panel_email=COALESCE(?, panel_email), ram=?, swap=?, disk=?, cpu=?, databases=?, allocations=?, backups=?, suspended=COALESCE(?, suspended), deleted=?
             WHERE server_id=?
             """,
-            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["suspended"], updates["deleted"], str(server_id)),
+            (updates["identifier"], updates["uuid"], updates["name"], updates["panel_user_id"], updates["panel_email"], updates["ram"], updates["swap"], updates["disk"], updates["cpu"], updates["databases"], updates["allocations"], updates["backups"], updates["suspended"], updates["deleted"], str(server_id)),
         )
     if str(server_id) in database.get("servers", {}):
         mirror_updates = {key: value for key, value in updates.items() if value is not None}
@@ -346,6 +402,79 @@ def clear_server_notifications(server_id: str) -> None:
         connection.execute("DELETE FROM server_notifications WHERE server_id=?", (server_id,))
 
 
+def save_premium_bill_record(record: dict[str, Any]) -> None:
+    with db() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO premium_bills
+            (bill_id, discord_user_id, plan, created_at, next_invoice_at, currency, total,
+             warn_7d_sent, warn_1d_sent, price, specifications, tax_percentage,
+             discount_percentage, other_charges, notes, cpu_type, ram_type, disk_type,
+             updated_at, dm_channel_id, dm_message_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                record["bill_id"],
+                record["discord_user_id"],
+                record["plan"],
+                record["created_at"],
+                record["next_invoice_at"],
+                record["currency"],
+                record["total"],
+                int(record.get("warn_7d_sent", False)),
+                int(record.get("warn_1d_sent", False)),
+                record["price"],
+                record["specifications"],
+                record["tax_percentage"],
+                record["discount_percentage"],
+                record["other_charges"],
+                record.get("notes"),
+                record.get("cpu_type"),
+                record.get("ram_type"),
+                record.get("disk_type"),
+                record.get("updated_at"),
+                record.get("dm_channel_id"),
+                record.get("dm_message_id"),
+            ),
+        )
+
+
+def fetch_premium_bill(bill_id: str) -> sqlite3.Row | None:
+    with db() as connection:
+        return connection.execute(
+            "SELECT * FROM premium_bills WHERE UPPER(bill_id) = UPPER(?)", (bill_id.strip(),)
+        ).fetchone()
+
+
+def delete_premium_bill(bill_id: str) -> bool:
+    """Permanently remove one invoice and return whether it existed."""
+    with db() as connection:
+        cursor = connection.execute(
+            "DELETE FROM premium_bills WHERE UPPER(bill_id) = UPPER(?)", (bill_id.strip(),)
+        )
+        return cursor.rowcount > 0
+
+
+def fetch_due_vps_bill_warnings(now: datetime) -> list[sqlite3.Row]:
+    with db() as connection:
+        return connection.execute(
+            """
+            SELECT * FROM premium_bills
+            WHERE LOWER(plan) = 'vps'
+              AND ((warn_7d_sent = 0 AND next_invoice_at <= ?)
+                OR (warn_1d_sent = 0 AND next_invoice_at <= ?))
+            ORDER BY next_invoice_at ASC
+            """,
+            ((now + timedelta(days=7)).isoformat(), (now + timedelta(days=1)).isoformat()),
+        ).fetchall()
+
+
+def mark_premium_bill_warning_sent(bill_id: str, column: str) -> None:
+    if column not in {"warn_7d_sent", "warn_1d_sent"}:
+        raise ValueError("Invalid bill warning column.")
+    with db() as connection:
+        connection.execute(f"UPDATE premium_bills SET {column}=1 WHERE bill_id=?", (bill_id,))
+
 
 
 def discord_owner_label(record: sqlite3.Row | dict[str, Any], user: discord.User | None = None) -> str:
@@ -387,7 +516,7 @@ def server_admin_details(record: sqlite3.Row | dict[str, Any], *, user: discord.
         f"Node: **{clean(str(record_value(record, 'node_name', 'Unknown')), 80)}** (`{record_value(record, 'node_id', 'unknown')}`)\n"
         f"Nest: **{clean(str(record_value(record, 'nest_name', 'Unknown')), 80)}** (`{record_value(record, 'nest_id', 'unknown')}`)\n"
         f"Egg: **{clean(str(record_value(record, 'egg_name', 'Unknown')), 80)}** (`{record_value(record, 'egg_id', 'unknown')}`)\n"
-        f"Specs: RAM `{record_value(record, 'ram', 0)} MB` / Disk `{record_value(record, 'disk', 0)} MB` / CPU `{record_value(record, 'cpu', 0)}%`\n"
+        f"Specs: RAM `{record_value(record, 'ram', 0)} MB` / Swap `{record_value(record, 'swap', 0)} MB` / Disk `{record_value(record, 'disk', 0)} MB` / CPU `{record_value(record, 'cpu', 0)}%`\n"
         f"Extras: DB `{record_value(record, 'databases', 0)}` / Alloc `{record_value(record, 'allocations', 0)}` / Backups `{record_value(record, 'backups', 0)}`\n"
         f"State: suspended=`{bool(record_value(record, 'suspended', False))}` deleted=`{bool(record_value(record, 'deleted', False))}` autosuspend=`{bool(record_value(record, 'autosuspend_enabled', True))}`"
     )
@@ -531,7 +660,7 @@ class PterodactylClient:
         data = await self.request("PATCH", f"servers/{server_id}/startup", payload)
         return data.get("attributes", {})
 
-    async def create_server(self, *, panel_user_id: int, name: str, ram: int, disk: int, cpu: int, node_id: int, nest_id: int, egg_id: int, databases: int, allocations: int, backups: int) -> dict[str, Any]:
+    async def create_server(self, *, panel_user_id: int, name: str, ram: int, swap: int, disk: int, cpu: int, node_id: int, nest_id: int, egg_id: int, databases: int, allocations: int, backups: int) -> dict[str, Any]:
         egg = await self.get_egg(nest_id, egg_id)
         docker_image = self.egg_docker_image(egg)
         startup = egg.get("startup")
@@ -545,7 +674,7 @@ class PterodactylClient:
             "docker_image": docker_image,
             "startup": startup,
             "environment": await self.egg_environment(nest_id, egg_id),
-            "limits": {"memory": ram, "swap": 0, "disk": disk, "io": 500, "cpu": cpu},
+            "limits": {"memory": ram, "swap": swap, "disk": disk, "io": 500, "cpu": cpu},
             "feature_limits": {"databases": databases, "allocations": allocations, "backups": backups},
             "allocation": {"default": allocation_id},
             "start_on_completion": True,
@@ -792,7 +921,7 @@ async def send_plan_log(plan: str, embed: discord.Embed) -> bool:
 
 async def send_server_event_log(record: sqlite3.Row | dict[str, Any], title: str, description: str, *, actor: discord.abc.User | None = None, color: int = 0x7c3aed) -> bool:
     """Send server lifecycle/admin logs to the channel that matches the server plan."""
-    actor_line = f"\nAdmin: {actor.mention} (`{actor.id}`)" if actor else ""
+    actor_line = f"\nAdmin profile:\n{discord_profile_label(actor)}" if actor else ""
     plan = str(record_value(record, "plan", "free")).strip().lower()
     embed = branded_embed(f"Admin Log: {title}", f"{description}{actor_line}", color)
     return await send_plan_log(plan, embed)
@@ -804,7 +933,7 @@ async def send_admin_audit(title: str, description: str, *, actor: discord.abc.U
         return
     try:
         channel = client.get_channel(int(channel_id_value)) or await client.fetch_channel(int(channel_id_value))
-        actor_line = f"\nAdmin: {actor.mention} (`{actor.id}`)" if actor else ""
+        actor_line = f"\nAdmin profile:\n{discord_profile_label(actor)}" if actor else ""
         embed = branded_embed(f"🛡️ Audit • {title}", f"{description}{actor_line}", color)
         await channel.send(embed=embed)
     except Exception as error:
@@ -828,14 +957,14 @@ def about_embed() -> discord.Embed:
     return embed
 
 
-def specs_embed(plan: str, name: str, ram: int, disk: int, cpu: int, node_name: str, nest: str, egg: str, expires_at: datetime, databases: int, allocations: int, backups: int) -> discord.Embed:
+def specs_embed(plan: str, name: str, ram: int, swap: int, disk: int, cpu: int, node_name: str, nest: str, egg: str, expires_at: datetime, databases: int, allocations: int, backups: int) -> discord.Embed:
     panel_url = config.get("panel_url", PANEL_URL)
     embed = branded_embed(f"Your {BRAND} {plan.title()} Server Is Ready", f"Panel: **{panel_url.rstrip('/')}**")
     embed.add_field(name="🖥️ Server", value=name, inline=True)
     embed.add_field(name="🪺 Nest", value=nest, inline=True)
     embed.add_field(name="🥚 Egg", value=egg, inline=True)
     embed.add_field(name="🌐 Node", value=node_name, inline=True)
-    embed.add_field(name="⚙️ Specs", value=f"RAM: **{ram} MB**\nDisk: **{disk} MB**\nCPU: **{cpu}%**", inline=True)
+    embed.add_field(name="⚙️ Specs", value=f"RAM: **{ram} MB**\nSwap: **{swap} MB**\nDisk: **{disk} MB**\nCPU: **{cpu}%**", inline=True)
     embed.add_field(name="📦 Extras", value=f"DB: **{databases}**\nAlloc: **{allocations}**\nBackups: **{backups}**", inline=True)
     embed.add_field(name="⏳ Expires", value=f"<t:{int(expires_at.timestamp())}:F>", inline=False)
     return embed
@@ -857,6 +986,13 @@ def format_bill_money(amount: float, currency: str) -> str:
     return f"{safe_currency} {amount:,.2f}"
 
 
+def discord_profile_label(user: discord.abc.User) -> str:
+    """Return a stable profile label instead of relying on a mention alone."""
+    display_name = clean(getattr(user, "display_name", None) or getattr(user, "global_name", None) or user.name, 100)
+    username = clean(user.name, 100)
+    return f"**{display_name}** (`@{username}`)\n{user.mention} • ID: `{user.id}`"
+
+
 def premium_bill_embed(
     *,
     user: discord.User,
@@ -869,6 +1005,11 @@ def premium_bill_embed(
     currency: str,
     notes: str | None,
     bill_id: str,
+    created_at: datetime,
+    next_invoice_at: datetime,
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
 ) -> discord.Embed:
     discount_amount = price * (discount_percentage / 100)
     taxable_subtotal = max(price - discount_amount + other_charges, 0)
@@ -880,8 +1021,10 @@ def premium_bill_embed(
         0x0b132b,
     )
     embed.add_field(name="🧾 Bill ID", value=f"`{bill_id}`", inline=True)
-    embed.add_field(name="👤 Customer", value=f"{user.mention}\n`{user.id}`", inline=True)
+    embed.add_field(name="👤 Customer Profile", value=discord_profile_label(user), inline=True)
     embed.add_field(name="📦 Plan", value=plan.title(), inline=True)
+    embed.add_field(name="📅 Creation Date", value=f"<t:{int(created_at.timestamp())}:F>", inline=True)
+    embed.add_field(name="🗓️ Next Invoice Date", value=f"<t:{int(next_invoice_at.timestamp())}:F>\n<t:{int(next_invoice_at.timestamp())}:R>", inline=True)
     embed.add_field(name="⚙️ Specifications", value=clean(specifications, 1000) or "Not specified", inline=False)
     embed.add_field(
         name="💰 Price Summary",
@@ -896,7 +1039,25 @@ def premium_bill_embed(
     )
     if notes and notes.strip():
         embed.add_field(name="📝 Notes / Payment Details", value=clean(notes, 1000), inline=False)
+    if plan.strip().lower() == "vps":
+        embed.add_field(
+            name="🧩 VPS Hardware Types",
+            value=(
+                f"CPU: **{clean(cpu_type or 'Not specified', 120)}**\n"
+                f"RAM: **{clean(ram_type or 'Not specified', 40)}**\n"
+                f"Disk: **{clean(disk_type or 'Not specified', 80)}**"
+            ),
+            inline=False,
+        )
+        warn_7d = next_invoice_at - timedelta(days=7)
+        warn_1d = next_invoice_at - timedelta(days=1)
+        embed.add_field(
+            name="⚠️ VPS Renewal Warnings",
+            value=f"7-day warning: <t:{int(warn_7d.timestamp())}:F>\n1-day warning: <t:{int(warn_1d.timestamp())}:F>",
+            inline=False,
+        )
     embed.add_field(name="✅ Status", value="Premium bill created. Pay only through official ZeroX Host payment methods.", inline=False)
+    embed.set_thumbnail(url=user.display_avatar.url)
     return embed
 
 
@@ -912,6 +1073,11 @@ async def send_premium_bill(
     other_charges: float,
     currency: str,
     notes: str | None,
+    billing_seconds: int | None,
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
+    existing_bill: sqlite3.Row | None = None,
 ) -> None:
     if price < 0 or other_charges < 0:
         raise RuntimeError("Price and other charges cannot be negative.")
@@ -919,7 +1085,13 @@ async def send_premium_bill(
         raise RuntimeError("Tax and discount percentages cannot be negative.")
     if discount_percentage > 100:
         raise RuntimeError("Discount percentage cannot be more than 100%.")
-    bill_id = f"ZX-{utc_now().strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
+    now = utc_now()
+    created_at = datetime.fromisoformat(existing_bill["created_at"]) if existing_bill else now
+    if existing_bill and billing_seconds is None:
+        next_invoice_at = datetime.fromisoformat(existing_bill["next_invoice_at"])
+    else:
+        next_invoice_at = now + timedelta(seconds=billing_seconds or 0)
+    bill_id = existing_bill["bill_id"] if existing_bill else f"ZX-{created_at.strftime('%Y%m%d%H%M%S')}-{user.id % 10000:04d}"
     embed = premium_bill_embed(
         user=user,
         plan=plan,
@@ -931,15 +1103,86 @@ async def send_premium_bill(
         currency=currency,
         notes=notes,
         bill_id=bill_id,
+        created_at=created_at,
+        next_invoice_at=next_invoice_at,
+        cpu_type=cpu_type,
+        ram_type=ram_type,
+        disk_type=disk_type,
     )
+    discount_amount = price * (discount_percentage / 100)
+    taxable_subtotal = max(price - discount_amount + other_charges, 0)
+    tax_amount = taxable_subtotal * (tax_percentage / 100)
+    total = taxable_subtotal + tax_amount
+    record = {
+        "bill_id": bill_id,
+        "discord_user_id": str(user.id),
+        "plan": plan,
+        "created_at": created_at.isoformat(),
+        "next_invoice_at": next_invoice_at.isoformat(),
+        "currency": currency.upper(),
+        "total": total,
+        "price": price,
+        "specifications": specifications,
+        "tax_percentage": tax_percentage,
+        "discount_percentage": discount_percentage,
+        "other_charges": other_charges,
+        "notes": notes,
+        "cpu_type": cpu_type,
+        "ram_type": ram_type,
+        "disk_type": disk_type,
+        "updated_at": now.isoformat() if existing_bill else None,
+        "warn_7d_sent": existing_bill["warn_7d_sent"] if existing_bill and billing_seconds is None else False,
+        "warn_1d_sent": existing_bill["warn_1d_sent"] if existing_bill and billing_seconds is None else False,
+        "dm_channel_id": existing_bill["dm_channel_id"] if existing_bill else None,
+        "dm_message_id": existing_bill["dm_message_id"] if existing_bill else None,
+    }
     dm_status = "sent"
     try:
-        await user.send(embed=embed)
+        if existing_bill and existing_bill["dm_channel_id"] and existing_bill["dm_message_id"]:
+            channel = client.get_channel(int(existing_bill["dm_channel_id"])) or await client.fetch_channel(int(existing_bill["dm_channel_id"]))
+            message = await channel.fetch_message(int(existing_bill["dm_message_id"]))
+            await message.edit(embed=embed)
+            dm_status = "original DM edited"
+        else:
+            message = await user.send(embed=embed)
+            record["dm_channel_id"] = str(message.channel.id)
+            record["dm_message_id"] = str(message.id)
     except discord.Forbidden:
         dm_status = "blocked by the user"
+    except (discord.NotFound, discord.HTTPException):
+        message = await user.send(embed=embed)
+        record["dm_channel_id"] = str(message.channel.id)
+        record["dm_message_id"] = str(message.id)
+        dm_status = "replacement DM sent"
+    save_premium_bill_record(record)
     await interaction.followup.send(embed=embed, ephemeral=True)
-    await interaction.followup.send(f"Bill `{bill_id}` created for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
-    await send_admin_audit("Premium Bill Created", f"Bill `{bill_id}` for {user.mention} (`{user.id}`) • Plan: **{plan.title()}** • Total shown in bill embed.", actor=interaction.user, color=0xf1c40f)
+    action = "updated" if existing_bill else "created"
+    await interaction.followup.send(f"Bill `{bill_id}` {action} for {user.mention}. Customer DM: **{dm_status}**.", ephemeral=True)
+    warning_line = ""
+    if plan.strip().lower() == "vps":
+        hardware_line = f"\nVPS hardware: CPU **{clean(cpu_type or 'Not specified', 120)}** • RAM **{clean(ram_type or 'Not specified', 40)}** • Disk **{clean(disk_type or 'Not specified', 80)}**"
+        warning_line = f"{hardware_line}\nVPS warnings: 7-day <t:{int((next_invoice_at - timedelta(days=7)).timestamp())}:F> • 1-day <t:{int((next_invoice_at - timedelta(days=1)).timestamp())}:F>"
+    await send_admin_audit(
+        f"Premium Bill {action.title()}",
+        f"Bill `{bill_id}` for {discord_profile_label(user)}\n"
+        f"Plan: **{plan.title()}**\n"
+        f"Creation date: <t:{int(created_at.timestamp())}:F>\n"
+        f"Next invoice date: <t:{int(next_invoice_at.timestamp())}:F> (<t:{int(next_invoice_at.timestamp())}:R>)"
+        f"{warning_line}\n"
+        f"Total: **{format_bill_money(total, currency)}**. The complete invoice is attached below.",
+        actor=interaction.user,
+        color=0xf1c40f,
+    )
+    channel_id_value = config.get("admin_log_channel_id") or config.get("paid_log_channel_id", ADMIN_LOG_CHANNEL_ID)
+    if channel_id_value:
+        try:
+            channel = client.get_channel(int(channel_id_value)) or await client.fetch_channel(int(channel_id_value))
+            admin_embed = embed.copy()
+            admin_embed.title = f"Admin Copy • {embed.title} ({action.title()})"
+            admin_embed.add_field(name="🛡️ Invoice Admin Profile", value=discord_profile_label(interaction.user), inline=False)
+            await channel.send(embed=admin_embed)
+        except Exception as error:
+            print(f"Failed to send full admin invoice for bill {bill_id}: {error}")
 
 
 def parse_bill_other_details(value: str) -> tuple[float, str | None]:
@@ -1051,6 +1294,7 @@ def panel_server_record(server: dict[str, Any], plan: str = "panel") -> dict[str
         "panel_user_id": server.get("user") or 0,
         "panel_email": f"{panel_label_for_plan(plan)} panel-created/unlinked",
         "ram": int(limits.get("memory") or 0),
+        "swap": int(limits.get("swap") or 0),
         "disk": int(limits.get("disk") or 0),
         "cpu": int(limits.get("cpu") or 0),
         "status": server.get("status") or server.get("state") or (server.get("container") or {}).get("status"),
@@ -1510,11 +1754,26 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
     discount_percentage = discord.ui.TextInput(label="Discount percentage", placeholder="0", required=False, default="0")
     other_details = discord.ui.TextInput(label="Other charges and notes", placeholder="Other charges: 0 | Notes: Pay via official ticket/invoice", required=False, style=discord.TextStyle.paragraph)
 
-    def __init__(self, user: discord.User, plan: str, currency: str) -> None:
+    def __init__(self, user: discord.User, plan: str, currency: str, billing_seconds: int | None, cpu_type: str | None, ram_type: str | None, disk_type: str | None, existing_bill: sqlite3.Row | None = None) -> None:
         super().__init__()
         self.user = user
         self.plan = plan
         self.currency = currency
+        self.billing_seconds = billing_seconds
+        self.cpu_type = cpu_type
+        self.ram_type = ram_type
+        self.disk_type = disk_type
+        self.existing_bill = existing_bill
+        if existing_bill:
+            self.title = f"Edit Invoice {existing_bill['bill_id']}"[:45]
+            self.price.default = str(existing_bill["price"])
+            self.specifications.default = existing_bill["specifications"]
+            self.tax_percentage.default = str(existing_bill["tax_percentage"])
+            self.discount_percentage.default = str(existing_bill["discount_percentage"])
+            details = f"Other charges: {existing_bill['other_charges']}"
+            if existing_bill["notes"]:
+                details += f" | {existing_bill['notes']}"
+            self.other_details.default = details
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -1536,6 +1795,11 @@ class BillModal(discord.ui.Modal, title="Create Premium Bill"):
             other_charges=other_charges,
             currency=self.currency,
             notes=notes,
+            billing_seconds=self.billing_seconds,
+            cpu_type=self.cpu_type,
+            ram_type=self.ram_type,
+            disk_type=self.disk_type,
+            existing_bill=self.existing_bill,
         )
 
 
@@ -1561,12 +1825,23 @@ class SuspendSelect(discord.ui.View):
             await interaction.response.send_message(embed=branded_embed("Missing Server", "That tracked server was not found anymore.", 0xff4d4d), ephemeral=True)
             return
         await (await ready_application_client_for(row)).suspend_server(server_id)
-        with db() as connection:
-            connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
+        set_server_suspended_state(server_id, True)
         await interaction.response.edit_message(embed=branded_embed("Server Suspended", f"Suspended **{row['name']}** (`{server_id}`)."), view=None)
 
 
-async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int, allocations: int, backups: int) -> None:
+def minecraft_swap_mb(plan: str, ram_mb: int, nest_name: str, egg_name: str, requested_swap_gb: int | None) -> int:
+    """Calculate deterministic swap: explicit value, or plan-based Minecraft defaults."""
+    if requested_swap_gb is not None:
+        if requested_swap_gb < 0:
+            raise RuntimeError("Swap cannot be negative. Use `0` to disable swap.")
+        return requested_swap_gb * 1024
+    is_minecraft = "minecraft" in f"{nest_name} {egg_name}".lower()
+    if not is_minecraft:
+        return 0
+    return ram_mb * 2 if plan == "free" else ram_mb
+
+
+async def create_plan(interaction: discord.Interaction, plan: str, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int, allocations: int, backups: int, swap: int | None = None) -> None:
     await interaction.response.defer(ephemeral=True)
     if ram <= 0 or disk <= 0 or cpu <= 0:
         raise RuntimeError("RAM, disk, and CPU must be positive numbers.")
@@ -1579,6 +1854,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     node_name = node.split(":", 1)[1] if ":" in node else f"Node {node_id}"
     nest_name = nest.split(":", 1)[1] if ":" in nest else f"Nest {nest_id}"
     egg_name = egg.split(":", 1)[1] if ":" in egg else f"Egg {egg_id}"
+    swap_mb = minecraft_swap_mb(plan, ram_mb, nest_name, egg_name, swap)
     if nest_id <= 0 or egg_id <= 0:
         await interaction.followup.send(embed=branded_embed("Nest And Egg Required", "Select a real nest first, then select an egg from that nest.", 0xff4d4d), ephemeral=True)
         return
@@ -1589,7 +1865,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     panel_email = link["email"]
     panel_user = {"id": link["panel_user_id"]}
     expires_at = utc_now() + timedelta(seconds=duration_seconds)
-    server = await panel.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
+    server = await panel.create_server(panel_user_id=panel_user["id"], name=name, ram=ram_mb, swap=swap_mb, disk=disk_mb, cpu=cpu, node_id=node_id, nest_id=nest_id, egg_id=egg_id, databases=databases, allocations=allocations, backups=backups)
     server_id = str(server["id"])
     saga_synced = await panel.set_saga_auto_suspend(server_id, expires_at)
     record = {
@@ -1602,6 +1878,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         "uuid": server.get("uuid"),
         "identifier": server.get("identifier"),
         "ram": ram_mb,
+        "swap": swap_mb,
         "disk": disk_mb,
         "cpu": cpu,
         "nest_id": nest_id,
@@ -1630,7 +1907,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
         with db() as connection:
             connection.execute("INSERT OR IGNORE INTO whitelist(server_id) VALUES (?)", (server_id,))
 
-    dm_embed = specs_embed(plan, name, ram_mb, disk_mb, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
+    dm_embed = specs_embed(plan, name, ram_mb, swap_mb, disk_mb, cpu, node_name, nest_name, egg_name, expires_at, databases, allocations, backups)
     try:
         await user.send(embed=dm_embed)
         await user.send(embed=trustpilot_embed())
@@ -1640,7 +1917,7 @@ async def create_plan(interaction: discord.Interaction, plan: str, user: discord
     created = branded_embed("Server Created", f"**{name}** was created for {user.mention}.", 0x2ecc71)
     created.add_field(name="Server", value=f"ID: `{server_id}`\nUUID: `{server.get('uuid', 'unknown')}`", inline=False)
     created.add_field(name="Owner", value=f"Discord: {user.mention}\nEmail: `{panel_email}`", inline=True)
-    created.add_field(name="Specs", value=f"RAM: **{ram_mb:,} MB** ({ram} GB)\nDisk: **{disk_mb:,} MB** ({disk} GB)\nCPU: **{cpu}%**", inline=True)
+    created.add_field(name="Specs", value=f"RAM: **{ram_mb:,} MB** ({ram} GB)\nSwap: **{swap_mb:,} MB** ({swap_mb / 1024:g} GB)\nDisk: **{disk_mb:,} MB** ({disk} GB)\nCPU: **{cpu}%**", inline=True)
     created.add_field(name="Deployment", value=f"Node: **{node_name}**\nNest: **{nest_name}**\nEgg: **{egg_name}**", inline=False)
     created.add_field(name="Extras", value=f"Databases: **{databases}**\nAllocations: **{allocations}**\nBackups: **{backups}**", inline=True)
     created.add_field(name="Expiration", value=f"<t:{int(expires_at.timestamp())}:F>\n<t:{int(expires_at.timestamp())}:R>", inline=True)
@@ -1663,37 +1940,185 @@ async def about(interaction: discord.Interaction) -> None:
 
 
 
-@tree.command(name="bill", description="Admin: create a premium bill for VPS or Minecraft hosting")
+@tree.command(name="bill", description="Admin: create a premium hosting invoice")
 @admin_only()
 @app_commands.describe(
     user="Customer who should receive the bill",
     plan="Premium plan type for this bill",
     currency="Currency code, for example USD, INR, EUR",
+    time="Billing period until the next invoice, for example 30d, 12h, or 1d6h",
+    cpu_type="VPS CPU type, for example Ryzen 9 or Xeon",
+    ram_type="VPS RAM type",
+    disk_type="VPS disk type, for example NVMe SSD or SATA SSD",
 )
-@app_commands.choices(plan=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="minecraft")])
+@app_commands.choices(
+    plan=[
+        app_commands.Choice(name="VPS", value="vps"),
+        app_commands.Choice(name="Minecraft", value="minecraft"),
+        app_commands.Choice(name="Web Hosting", value="web-hosting"),
+        app_commands.Choice(name="Bot Hosting", value="bot-hosting"),
+    ],
+    ram_type=[app_commands.Choice(name="DDR4", value="DDR4"), app_commands.Choice(name="DDR5", value="DDR5")],
+)
 async def bill(
     interaction: discord.Interaction,
     user: discord.User,
     plan: app_commands.Choice[str],
     currency: str = "USD",
+    time: str = "30d",
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
 ) -> None:
-    await interaction.response.send_modal(BillModal(user, plan.value, currency))
+    try:
+        billing_seconds = parse_duration(time)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    await interaction.response.send_modal(
+        BillModal(
+            user,
+            plan.value,
+            currency,
+            billing_seconds,
+            cpu_type,
+            ram_type,
+            disk_type,
+        )
+    )
+
+
+@tree.command(name="edit-bill", description="Admin: edit and resend an existing premium invoice")
+@admin_only()
+@app_commands.describe(
+    bill_id="Invoice ID shown on the original bill",
+    plan="Replacement plan; leave empty to keep the current plan",
+    currency="Replacement currency; leave empty to keep it",
+    time="New period from now, such as 30d; leave empty to keep the invoice date",
+    cpu_type="Replacement VPS CPU type",
+    ram_type="Replacement VPS RAM type",
+    disk_type="Replacement VPS disk type",
+)
+@app_commands.choices(
+    plan=[
+        app_commands.Choice(name="VPS", value="vps"),
+        app_commands.Choice(name="Minecraft", value="minecraft"),
+        app_commands.Choice(name="Web Hosting", value="web-hosting"),
+        app_commands.Choice(name="Bot Hosting", value="bot-hosting"),
+    ],
+    ram_type=[app_commands.Choice(name="DDR4", value="DDR4"), app_commands.Choice(name="DDR5", value="DDR5")],
+)
+async def edit_bill(
+    interaction: discord.Interaction,
+    bill_id: str,
+    plan: app_commands.Choice[str] | None = None,
+    currency: str | None = None,
+    time: str | None = None,
+    cpu_type: str | None = None,
+    ram_type: str | None = None,
+    disk_type: str | None = None,
+) -> None:
+    row = fetch_premium_bill(bill_id)
+    if not row:
+        raise RuntimeError(f"Invoice `{clean(bill_id, 80)}` was not found.")
+    billing_seconds = None
+    if time:
+        try:
+            billing_seconds = parse_duration(time)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+    try:
+        user = await client.fetch_user(int(row["discord_user_id"]))
+    except Exception as error:
+        raise RuntimeError("The invoice customer could not be loaded from Discord.") from error
+    await interaction.response.send_modal(
+        BillModal(
+            user,
+            plan.value if plan else row["plan"],
+            currency or row["currency"],
+            billing_seconds,
+            cpu_type if cpu_type is not None else row["cpu_type"],
+            ram_type if ram_type is not None else row["ram_type"],
+            disk_type if disk_type is not None else row["disk_type"],
+            existing_bill=row,
+        )
+    )
+
+
+@tree.command(name="delete-bill", description="Admin: permanently remove a premium invoice")
+@admin_only()
+@app_commands.describe(
+    bill_id="Invoice ID to remove",
+    confirm="Must be True to permanently remove the invoice",
+)
+async def delete_bill(interaction: discord.Interaction, bill_id: str, confirm: bool = False) -> None:
+    await interaction.response.defer(ephemeral=True)
+    row = fetch_premium_bill(bill_id)
+    if not row:
+        raise RuntimeError(f"Invoice `{clean(bill_id, 80)}` was not found.")
+    if not confirm:
+        await interaction.followup.send(
+            f"Invoice `{row['bill_id']}` was **not removed**. Run `/delete-bill` again with `confirm:True`.",
+            ephemeral=True,
+        )
+        return
+
+    customer_label = f"Discord user ID: `{row['discord_user_id']}`"
+    try:
+        customer = await client.fetch_user(int(row["discord_user_id"]))
+        customer_label = discord_profile_label(customer)
+    except Exception:
+        customer = None
+
+    dm_status = "no saved invoice DM"
+    if row["dm_channel_id"] and row["dm_message_id"]:
+        try:
+            channel = client.get_channel(int(row["dm_channel_id"])) or await client.fetch_channel(int(row["dm_channel_id"]))
+            message = await channel.fetch_message(int(row["dm_message_id"]))
+            await message.delete()
+            dm_status = "original customer DM deleted"
+        except discord.NotFound:
+            dm_status = "customer DM was already missing"
+        except discord.Forbidden:
+            dm_status = "customer DM could not be deleted (forbidden)"
+        except discord.HTTPException:
+            dm_status = "customer DM could not be deleted (Discord error)"
+
+    if not delete_premium_bill(row["bill_id"]):
+        raise RuntimeError("The invoice was removed by another operation before deletion completed.")
+
+    await interaction.followup.send(
+        f"Invoice `{row['bill_id']}` was permanently removed. Customer message: **{dm_status}**.",
+        ephemeral=True,
+    )
+    await send_admin_audit(
+        "Premium Bill Deleted",
+        f"Bill: `{row['bill_id']}`\n"
+        f"Customer: {customer_label}\n"
+        f"Plan: **{str(row['plan']).replace('-', ' ').title()}**\n"
+        f"Total: **{format_bill_money(float(row['total']), row['currency'])}**\n"
+        f"Created: <t:{int(datetime.fromisoformat(row['created_at']).timestamp())}:F>\n"
+        f"Next invoice was: <t:{int(datetime.fromisoformat(row['next_invoice_at']).timestamp())}:F>\n"
+        f"Customer message: **{dm_status}**\n"
+        "The database record was permanently deleted and no further VPS invoice reminders will be sent.",
+        actor=interaction.user,
+        color=0xe74c3c,
+    )
 
 
 @tree.command(name="create-free", description="Create free server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-@app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
-async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0) -> None:
-    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
+@app_commands.describe(ram="RAM in GB (sent as GB x 1024 MB)", swap="Swap in GB; Minecraft defaults to 2x RAM when omitted", disk="Disk in GB (sent as GB x 1024 MB)", time="Duration like 30d, 12h, or 1d6h")
+async def create_free(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str = "30d", databases: int = 0, allocations: int = 1, backups: int = 0, swap: int | None = None) -> None:
+    await create_plan(interaction, "free", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups, swap)
 
 
 @tree.command(name="create-paid", description="Create paid server")
 @admin_only()
 @app_commands.autocomplete(nest=nest_autocomplete, egg=egg_autocomplete, node=node_autocomplete)
-@app_commands.describe(ram="RAM in GB (the bot sends GB x 1024 MB to Pterodactyl)", disk="Disk in GB (the bot sends GB x 1024 MB to Pterodactyl)", time="Duration like 30d, 12h, or 1d6h")
-async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int = 1, allocations: int = 1, backups: int = 1) -> None:
-    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups)
+@app_commands.describe(ram="RAM in GB (sent as GB x 1024 MB)", swap="Swap in GB; Minecraft defaults to the RAM specification when omitted", disk="Disk in GB (sent as GB x 1024 MB)", time="Duration like 30d, 12h, or 1d6h")
+async def create_paid(interaction: discord.Interaction, user: discord.User, name: str, ram: int, disk: int, cpu: int, nest: str, egg: str, node: str, time: str, databases: int = 1, allocations: int = 1, backups: int = 1, swap: int | None = None) -> None:
+    await create_plan(interaction, "paid", user, name, ram, disk, cpu, nest, egg, node, time, databases, allocations, backups, swap)
 
 
 @tree.command(name="link", description="Link panel email")
@@ -2035,22 +2460,26 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
     new_expiry = base + timedelta(seconds=seconds)
     if tracked_row:
         with db() as connection:
-            connection.execute("UPDATE servers SET expires_at=?, suspended=0, autosuspend_enabled=1, autosuspend_seconds=? WHERE server_id=?", (new_expiry.isoformat(), seconds, server))
+            connection.execute("UPDATE servers SET expires_at=?, autosuspend_enabled=1, autosuspend_seconds=? WHERE server_id=?", (new_expiry.isoformat(), seconds, server))
         if str(server) in database.get("servers", {}):
-            database["servers"][str(server)].update({"expires_at": new_expiry.isoformat(), "suspended": False, "autosuspend_enabled": True, "autosuspend_seconds": seconds})
+            database["servers"][str(server)].update({"expires_at": new_expiry.isoformat(), "autosuspend_enabled": True, "autosuspend_seconds": seconds})
             save_database()
         clear_server_notifications(server)
-    saga_synced = await (await ready_application_client_for(row)).set_saga_auto_suspend(server, new_expiry)
-    try:
-        row = await ensure_server_access(interaction, server, allow_admin=True)
-        await (await ready_application_client_for(row)).unsuspend_server(server)
-    except RuntimeError:
-        pass
+    panel = await ready_application_client_for(row)
+    saga_synced = await panel.set_saga_auto_suspend(server, new_expiry)
+    was_suspended = server_is_suspended(row)
+    # The panel endpoint is safe for active servers too. Calling it on every renewal
+    # guarantees that stale local suspension state cannot leave a renewed service offline.
+    await panel.unsuspend_server(server)
+    if tracked_row:
+        set_server_suspended_state(server, False)
+    resume_note = "Unsuspended and resumed" if was_suspended else "Confirmed active on the panel"
+    row = await ensure_server_access(interaction, server, allow_admin=True)
     discord_user_id = record_value(row, "discord_user_id")
     if discord_user_id:
         try:
             user = await client.fetch_user(int(discord_user_id))
-            await user.send(embed=branded_embed("Service Renewed", f"Your server **{record_value(row, 'name', server)}** was renewed until <t:{int(new_expiry.timestamp())}:F>."))
+            await user.send(embed=branded_embed("Service Renewed", f"Your server **{record_value(row, 'name', server)}** was renewed until <t:{int(new_expiry.timestamp())}:F> and is now active."))
         except Exception:
             pass
     warning_note = "No renewal warning due"
@@ -2061,8 +2490,8 @@ async def renew(interaction: discord.Interaction, server: str, time: str) -> Non
             if sent_warnings:
                 warning_note = "Sent " + ", ".join(expiration_warning_lead(notification_type) for notification_type in sent_warnings) + " renewal warning(s)"
     tracking_note = "Local DB updated" if tracked_row else "Panel/Saga updated only (server is not locally tracked)"
-    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
-    await send_server_event_log(row, "Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
+    await interaction.followup.send(embed=branded_embed("Server Renewed", f"**{record_value(row, 'name', server)}** renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nService status: **{resume_note}**\nTracking: **{tracking_note}**\nWarnings: **{warning_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**"), ephemeral=True)
+    await send_server_event_log(row, "Server Renewed", f"**{record_value(row, 'name', server)}** (`{server}`) renewed by **{time}**.\nNext expiry: <t:{int(new_expiry.timestamp())}:F>\nService status: **{resume_note}**\nTracking: **{tracking_note}**\nSaga auto suspension: **{'synced' if saga_synced else 'not synced'}**", actor=interaction.user, color=0x00d4ff)
 
 
 @tree.command(name="delete", description="Admin delete one server")
@@ -2147,8 +2576,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
             if row["plan"] == "paid" or is_whitelisted(row["server_id"]):
                 continue
             await (await ready_application_client_for(row)).suspend_server(row["server_id"])
-            with db() as connection:
-                connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (row["server_id"],))
+            set_server_suspended_state(row["server_id"], True)
             suspended += 1
         await interaction.followup.send(embed=branded_embed("Bulk Suspend Complete", f"Suspended **{suspended}** non-paid, non-whitelisted server(s)."), ephemeral=True)
         return
@@ -2156,8 +2584,7 @@ async def suspend(interaction: discord.Interaction, server: str | None = None, u
     if server:
         row = await ensure_server_access(interaction, server, allow_admin=True)
         await (await ready_application_client_for(row)).suspend_server(server)
-        with db() as connection:
-            connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server,))
+        set_server_suspended_state(server, True)
         await interaction.followup.send(embed=branded_embed("Server Suspended", f"Suspended **{record_value(row, 'name', server)}**."), ephemeral=True)
         await send_server_event_log(row, "Server Suspended", f"Suspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0xe67e22)
         return
@@ -2176,8 +2603,7 @@ async def unsuspend(interaction: discord.Interaction, server: str) -> None:
     await interaction.response.defer(ephemeral=True)
     row = await ensure_server_access(interaction, server, allow_admin=True)
     await (await ready_application_client_for(row)).unsuspend_server(server)
-    with db() as connection:
-        connection.execute("UPDATE servers SET suspended=0 WHERE server_id=?", (server,))
+    set_server_suspended_state(server, False)
     await interaction.followup.send(embed=branded_embed("Server Unsuspended", f"Unsuspended server `{server}`."), ephemeral=True)
     await send_server_event_log(row, "Server Unsuspended", f"Unsuspended **{record_value(row, 'name', server)}** (`{server}`).", actor=interaction.user, color=0x2ecc71)
 
@@ -2798,6 +3224,51 @@ async def sync_panel_activity() -> None:
             print(f"Failed to refresh tracked server {server_id}: {error}")
     print(f"Panel sync refreshed {len(nodes)} nodes, {len(nests)} nests, {sum(len(eggs) for eggs in ptero.egg_cache.values())} eggs, {len(panel_servers)} servers, and {len(live_user_ids)} users.")
 
+async def send_vps_bill_warning(row: sqlite3.Row, lead: str) -> bool:
+    next_invoice_at = datetime.fromisoformat(row["next_invoice_at"])
+    try:
+        user = await client.fetch_user(int(row["discord_user_id"]))
+    except Exception as error:
+        print(f"Failed to fetch VPS bill user for bill {row['bill_id']}: {error}")
+        return False
+    embed = branded_embed(
+        "VPS Invoice Reminder",
+        f"Your VPS invoice `{row['bill_id']}` is due in **{lead}** at <t:{int(next_invoice_at.timestamp())}:F>. Please pay before the next invoice date to keep your VPS active. Amount due: **{format_bill_money(float(row['total']), row['currency'])}**.",
+        0xe67e22,
+    )
+    embed.add_field(name="👤 Customer Profile", value=discord_profile_label(user), inline=False)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    try:
+        await user.send(embed=embed)
+        await send_admin_audit(
+            "VPS Invoice Reminder Sent",
+            f"Bill `{row['bill_id']}` for {discord_profile_label(user)}\nLead: **{lead}** • Next invoice: <t:{int(next_invoice_at.timestamp())}:F>",
+            color=0xe67e22,
+        )
+        return True
+    except discord.Forbidden:
+        print(f"VPS bill reminder DM forbidden for user {row['discord_user_id']} on bill {row['bill_id']}.")
+    except Exception as error:
+        print(f"Failed to send VPS bill reminder for bill {row['bill_id']}: {error}")
+    return False
+
+
+@tasks.loop(minutes=1)
+async def send_vps_bill_reminders() -> None:
+    now = utc_now()
+    for row in fetch_due_vps_bill_warnings(now):
+        try:
+            next_invoice_at = datetime.fromisoformat(row["next_invoice_at"])
+            if not row["warn_7d_sent"] and now >= next_invoice_at - timedelta(days=7):
+                if await send_vps_bill_warning(row, "7 days"):
+                    mark_premium_bill_warning_sent(row["bill_id"], "warn_7d_sent")
+            if not row["warn_1d_sent"] and now >= next_invoice_at - timedelta(days=1):
+                if await send_vps_bill_warning(row, "24 hours"):
+                    mark_premium_bill_warning_sent(row["bill_id"], "warn_1d_sent")
+        except Exception as error:
+            print(f"Failed VPS bill reminder processing for bill {row['bill_id']}: {error}")
+
+
 @tasks.loop(minutes=1)
 async def suspend_expired_servers() -> None:
     now = utc_now()
@@ -2808,12 +3279,32 @@ async def suspend_expired_servers() -> None:
         try:
             if not record["suspended"]:
                 await send_due_suspension_warnings(record, now)
-                if not record["autosuspend_enabled"] or expires_at > now:
+                # Re-read immediately before the panel action. A /renew command may
+                # have changed this record while warning DMs were being sent.
+                current = fetch_server(server_id)
+                if not current or current["deleted"]:
                     continue
-                await (await ready_application_client_for(record)).suspend_server(server_id)
-                with db() as connection:
-                    connection.execute("UPDATE servers SET suspended=1 WHERE server_id=?", (server_id,))
-                await send_lifecycle_dm(record, "suspended", expires_at)
+                current_expiry = datetime.fromisoformat(current["expires_at"])
+                if current["suspended"] or not current["autosuspend_enabled"] or current_expiry > utc_now():
+                    continue
+                panel = await ready_application_client_for(current)
+                panel_server = await panel.get_server(server_id)
+                panel_state = panel_server_suspension_state(panel_server)
+                if panel_state is True:
+                    set_server_suspended_state(server_id, True)
+                    continue
+                await panel.suspend_server(server_id)
+
+                # A renewal can race with the HTTP suspend request. If its new date
+                # is now in the future, immediately restore the panel and local state.
+                latest = fetch_server(server_id)
+                if latest and (not latest["autosuspend_enabled"] or datetime.fromisoformat(latest["expires_at"]) > utc_now()):
+                    await panel.unsuspend_server(server_id)
+                    set_server_suspended_state(server_id, False)
+                    print(f"Reversed stale suspension for renewed server {server_id}.")
+                    continue
+                set_server_suspended_state(server_id, True)
+                await send_lifecycle_dm(current, "suspended", current_expiry)
                 continue
 
             if delete_at - now <= timedelta(days=1) and now < delete_at and not notification_sent(server_id, "delete_1d"):
@@ -2962,13 +3453,18 @@ async def on_ready() -> None:
     global_commands = await tree.sync()
     guild_id = config.get("guild_id")
     if guild_id:
+        # Do not copy globals into the guild: registering both global commands
+        # and guild command copies makes Discord show duplicate slash commands.
+        # Sync an empty guild command set so any older guild copies are removed
+        # while the global command definitions remain available in the guild.
         guild = discord.Object(id=int(guild_id))
-        tree.copy_global_to(guild=guild)
-        guild_commands = await tree.sync(guild=guild)
-        command_names = ", ".join(sorted(command.name for command in guild_commands))
-        print(f"Synced {len(global_commands)} global/DM commands and {len(guild_commands)} instant guild commands: {command_names}")
+        tree.clear_commands(guild=guild)
+        removed_guild_commands = await tree.sync(guild=guild)
+        print(f"Synced {len(global_commands)} global commands and cleared guild command copies ({len(removed_guild_commands)} remaining).")
     else:
-        print(f"Synced {len(global_commands)} global/DM commands.")
+        print(f"Synced {len(global_commands)} global commands.")
+    if not send_vps_bill_reminders.is_running():
+        send_vps_bill_reminders.start()
     if not suspend_expired_servers.is_running():
         suspend_expired_servers.start()
     if not run_autobackups.is_running():
